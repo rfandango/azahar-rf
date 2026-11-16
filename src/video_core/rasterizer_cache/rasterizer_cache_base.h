@@ -236,18 +236,26 @@ private:
     u8 sample_count;
     FramebufferParams fb_params;
 
-    /// A render target that the guest shrinks to half size with a display transfer
+    /// A render target that the guest has shrunk to half size with a display transfer
     struct DownscaledTarget {
         PAddr addr;
         u32 width;
         u32 height;
         PixelFormat pixel_format;
+        // The scale the target is rendered at, until its uses say otherwise
         bool half_x;
         bool half_y;
+        // What has been done with the target since it was last drawn to
+        bool shrunk_x;
+        bool shrunk_xy;
+        bool used_at_full_size;
     };
+    DownscaledTarget* FindDownscaledTarget(const SurfaceParams& params);
     /// Remembers how the source of a display transfer was scaled
     void NoteDisplayTransferSource(const SurfaceParams& src_params, bool half_x, bool half_y);
-    /// Gives a render target, and the depth buffer used with it, the reduced scale it needs
+    /// Remembers that the contents of a surface were used in a way that shows them at full size
+    void NoteFullSizeUse(const SurfaceParams& params);
+    /// Gives a render target, and the depth buffer used with it, the reduced scale it can have
     void ApplyDownscaledTargetScale(SurfaceParams& color_params, SurfaceParams& depth_params);
 
     std::vector<DownscaledTarget> downscaled_targets;

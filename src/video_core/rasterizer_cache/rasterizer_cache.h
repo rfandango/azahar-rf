@@ -237,6 +237,7 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
     }
 
     const SurfaceParams src_info = slot_surfaces[src_surface_id];
+    NoteFullSizeUse(src_info);
     const u32 copy_width = src_info.Scaling().GuestX(src_rect.GetWidth());
     const u32 copy_height = src_info.Scaling().GuestY(src_rect.GetHeight());
     if (output_gap != 0 &&
@@ -498,6 +499,14 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
         return;
     }
 
+    // Another surface takes its contents from this one. Unless that is the same guest surface
+    // at a different scale, the contents are used for something other than being shrunk.
+    if (src_surface.addr != dst_surface.addr || src_surface.width != dst_surface.width ||
+        src_surface.height != dst_surface.height ||
+        src_surface.pixel_format != dst_surface.pixel_format) {
+        NoteFullSizeUse(src_surface);
+    }
+
     const u32 src_scale = src_surface.res_scale;
     const u32 dst_scale = dst_surface.res_scale;
     const u32 src_sample_count = src_surface.sample_count;
@@ -641,6 +650,7 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
         initial_flags |= SurfaceFlagBits::ShadowSource;
     }
     params.UpdateParams();
+    NoteFullSizeUse(params);
 
     const u32 min_width = info.width >> max_level;
     const u32 min_height = info.height >> max_level;
@@ -865,39 +875,50 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
 }
 
 template <class T>
+typename RasterizerCache<T>::DownscaledTarget* RasterizerCache<T>::FindDownscaledTarget(
+    const SurfaceParams& params) {
+    const auto it = std::ranges::find_if(downscaled_targets, [&](const DownscaledTarget& target) {
+        return target.addr == params.addr && target.width == params.width &&
+               target.height == params.height && target.pixel_format == params.pixel_format;
+    });
+    return it != downscaled_targets.end() ? &*it : nullptr;
+}
+
+template <class T>
 void RasterizerCache<T>::NoteDisplayTransferSource(const SurfaceParams& src_params, bool half_x,
                                                    bool half_y) {
-    const auto it = std::ranges::find_if(downscaled_targets, [&](const DownscaledTarget& target) {
-        return target.addr == src_params.addr && target.width == src_params.width &&
-               target.height == src_params.height && target.pixel_format == src_params.pixel_format;
-    });
+    DownscaledTarget* target = FindDownscaledTarget(src_params);
     if (!half_x && !half_y) {
-        // Displayed at full size (again): back to the full scale.
-        if (it != downscaled_targets.end()) {
-            downscaled_targets.erase(it);
+        if (target) {
+            target->used_at_full_size = true;
         }
         return;
     }
-    if (it != downscaled_targets.end()) {
-        it->half_x = half_x;
-        it->half_y = half_y;
+    if (!target) {
+        // Games have a handful of render targets at most. Should one keep making up new ones,
+        // forget the oldest.
+        static constexpr std::size_t MAX_DOWNSCALED_TARGETS = 8;
+        if (downscaled_targets.size() == MAX_DOWNSCALED_TARGETS) {
+            downscaled_targets.erase(downscaled_targets.begin());
+        }
+        target = &downscaled_targets.emplace_back(DownscaledTarget{
+            .addr = src_params.addr,
+            .width = src_params.width,
+            .height = src_params.height,
+            .pixel_format = src_params.pixel_format,
+        });
+    }
+    (half_y ? target->shrunk_xy : target->shrunk_x) = true;
+}
+
+template <class T>
+void RasterizerCache<T>::NoteFullSizeUse(const SurfaceParams& params) {
+    if (downscaled_targets.empty()) {
         return;
     }
-
-    // Games have a handful of render targets at most. Should one keep making up new ones, forget
-    // the oldest.
-    static constexpr std::size_t MAX_DOWNSCALED_TARGETS = 8;
-    if (downscaled_targets.size() == MAX_DOWNSCALED_TARGETS) {
-        downscaled_targets.erase(downscaled_targets.begin());
+    if (DownscaledTarget* target = FindDownscaledTarget(params)) {
+        target->used_at_full_size = true;
     }
-    downscaled_targets.push_back({
-        .addr = src_params.addr,
-        .width = src_params.width,
-        .height = src_params.height,
-        .pixel_format = src_params.pixel_format,
-        .half_x = half_x,
-        .half_y = half_y,
-    });
 }
 
 template <class T>
@@ -907,22 +928,31 @@ void RasterizerCache<T>::ApplyDownscaledTargetScale(SurfaceParams& color_params,
     // shrinks with a nearest-neighbour blit, so at the full resolution scale half (or three
     // quarters) of the pixels rendered to such a target are thrown away. Rendering at half the
     // scale in the directions that get halved puts the same number of samples on screen for a
-    // fraction of the work. With no upscaling the target keeps its native size.
-    if (downscaled_targets.empty() || resolution_scale_factor < 2 || sample_count != 1 ||
-        !runtime.SupportsHalfScaleTargets() ||
+    // fraction of the work.
+    if (downscaled_targets.empty()) {
+        return;
+    }
+    DownscaledTarget* target = FindDownscaledTarget(color_params);
+    if (!target) {
+        return;
+    }
+    if (target->shrunk_x || target->shrunk_xy || target->used_at_full_size) {
+        // First draw since the target was last used, which shows what this draw will be used
+        // for. Anything that showed the contents at full size (a plain display transfer, a
+        // texture, a copy) means the target is not only an oversized version of what gets
+        // displayed, and it keeps the full scale.
+        target->half_x = !target->used_at_full_size;
+        target->half_y = !target->used_at_full_size && !target->shrunk_x;
+        target->shrunk_x = target->shrunk_xy = target->used_at_full_size = false;
+    }
+
+    // With no upscaling the target keeps its native size.
+    if (resolution_scale_factor < 2 || sample_count != 1 || !runtime.SupportsHalfScaleTargets() ||
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyFullScaleTargets)) {
         return;
     }
-    const auto it = std::ranges::find_if(downscaled_targets, [&](const DownscaledTarget& target) {
-        return target.addr == color_params.addr && target.width == color_params.width &&
-               target.height == color_params.height &&
-               target.pixel_format == color_params.pixel_format;
-    });
-    if (it == downscaled_targets.end()) {
-        return;
-    }
-    color_params.half_scale_x = depth_params.half_scale_x = it->half_x;
-    color_params.half_scale_y = depth_params.half_scale_y = it->half_y;
+    color_params.half_scale_x = depth_params.half_scale_x = target->half_x;
+    color_params.half_scale_y = depth_params.half_scale_y = target->half_y;
 }
 
 template <class T>
