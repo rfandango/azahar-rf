@@ -5,12 +5,14 @@
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/loader/loader.h"
 #include "video_core/debug_utils/debug_utils.h"
+#include "video_core/frame_state_dump.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_debugger.h"
 #include "video_core/gpu_impl.h"
@@ -343,6 +345,9 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     if (screen_id == 0) {
         MicroProfileFlip();
         impl->system.perf_stats->EndGameFrame();
+        // Steps once per guest frame (top screen buffer swap).
+        CITRA_TRACE_SET_COUNTER("azahar.game_frame", impl->system.perf_stats->GetGameFrameCount());
+        CITRA_FRAME_DUMP("bufferswap top (guest frame end)");
         right_eye_disabler->ReportEndFrame();
     }
 }
@@ -470,6 +475,8 @@ void GPU::SubmitCmdList(u32 index) {
     }
 
     MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
+    CITRA_TRACE_SCOPE("GPU::CommandList");
+    CITRA_TRACE_COUNT(CommandLists);
 
     // Forward command list processing to the PICA core.
     const PAddr addr = config.GetPhysicalAddress(index);
@@ -485,8 +492,10 @@ void GPU::SubmitCmdList(u32 index) {
         return;
     }
 
+    CITRA_FRAME_DUMP("cmdlist @{:08X} size {}", addr, size);
     impl->pica.ProcessCmdList(addr, size,
                               !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
+    CITRA_FRAME_DUMP("cmdlist end");
     config.trigger[index] = 0;
 }
 
@@ -497,8 +506,13 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
         return;
     }
 
+    CITRA_TRACE_SCOPE("GPU::MemoryFill");
+
     // Perform memory fill.
+    CITRA_FRAME_DUMP("fill {}", config.DebugName());
     if (!impl->rasterizer->AccelerateFill(config)) {
+        CITRA_TRACE_SCOPE("GPU::MemoryFill (software fallback)");
+        CITRA_FRAME_DUMP("  fill: SOFTWARE fallback");
         impl->sw_blitter->MemoryFill(config);
     }
 
@@ -531,6 +545,7 @@ void GPU::MemoryTransfer() {
     }
 
     MICROPROFILE_SCOPE(GPU_DisplayTransfer);
+    CITRA_TRACE_SCOPE(config.is_texture_copy ? "GPU::TextureCopy" : "GPU::DisplayTransfer");
 
     // Notify debugger about the display transfer.
     if (impl->debug_context) {
@@ -540,16 +555,37 @@ void GPU::MemoryTransfer() {
     u64 delay{};
     // Perform memory transfer
     if (config.is_texture_copy) {
+        CITRA_TRACE_SCOPE_FMT(
+            "texcopy {:08X}->{:08X} size {} in {}+{} out {}+{}", config.GetPhysicalInputAddress(),
+            config.GetPhysicalOutputAddress(), config.texture_copy.size,
+            config.texture_copy.input_width * 16, config.texture_copy.input_gap * 16,
+            config.texture_copy.output_width * 16, config.texture_copy.output_gap * 16);
+        CITRA_FRAME_DUMP("texcopy {:08X}->{:08X} size {} in {}+{} out {}+{}",
+                         config.GetPhysicalInputAddress(), config.GetPhysicalOutputAddress(),
+                         config.texture_copy.size, config.texture_copy.input_width * 16,
+                         config.texture_copy.input_gap * 16, config.texture_copy.output_width * 16,
+                         config.texture_copy.output_gap * 16);
         if (!impl->rasterizer->AccelerateTextureCopy(config)) {
+            CITRA_TRACE_SCOPE("GPU::TextureCopy (software fallback)");
+            CITRA_FRAME_DUMP("  texcopy: SOFTWARE fallback");
             impl->sw_blitter->TextureCopy(config);
         }
+        CITRA_FRAME_DUMP("texcopy end");
         delay = DelayGenerator::CalculateDelayNanoseconds(
             DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
             config.texture_copy.size);
     } else {
         if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                            config.input_height)) {
+            CITRA_FRAME_DUMP("transfer {} in {}x{} fmt {} out {}x{} fmt {} flags {:08X}",
+                             config.DebugName(), config.input_width.Value(),
+                             config.input_height.Value(),
+                             static_cast<u32>(config.input_format.Value()),
+                             config.output_width.Value(), config.output_height.Value(),
+                             static_cast<u32>(config.output_format.Value()), config.flags);
             if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
+                CITRA_TRACE_SCOPE("GPU::DisplayTransfer (software fallback)");
+                CITRA_FRAME_DUMP("  transfer: SOFTWARE fallback");
                 impl->sw_blitter->DisplayTransfer(config);
             }
         }
@@ -569,7 +605,10 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
 
     // Present renderered frame.
-    impl->renderer->SwapBuffers();
+    {
+        CITRA_TRACE_SCOPE("VBlank::SwapBuffers");
+        impl->renderer->SwapBuffers();
+    }
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);

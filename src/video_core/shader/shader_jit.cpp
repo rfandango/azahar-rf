@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/hash.h"
 #include "common/microprofile.h"
+#include "common/trace_markers.h"
 #include "video_core/shader/shader.h"
 #include "video_core/shader/shader_jit.h"
 #if CITRA_ARCH(arm64)
@@ -35,6 +36,8 @@ void JitEngine::SetupBatch(ShaderSetup& setup, u32 entry_point) {
     if (iter != cache.end()) {
         setup.cached_shader = iter->second.get();
     } else {
+        CITRA_TRACE_SCOPE("ShaderJit::Compile");
+        CITRA_TRACE_COUNT(ShaderJitCompiles);
         auto shader = std::make_unique<JitShader>();
         shader->Compile(&setup.GetProgramCode(), &setup.GetSwizzleData());
         setup.cached_shader = shader.get();

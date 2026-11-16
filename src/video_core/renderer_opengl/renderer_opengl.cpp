@@ -116,10 +116,10 @@ void RendererOpenGL::SwapBuffers() {
     }
 
 #ifdef ANDROID
-    // On Android, if secondary_window is defined at all,
-    // it means we have a second display
+    // The secondary window always exists on Android. Without a second screen it sits on a
+    // hidden display, where drawing every frame would be wasted work.
     if (secondary_window) {
-        if (present_to_screen) {
+        if (present_to_screen && secondary_window->IsVisible()) {
             const auto& secondary_layout = secondary_window->GetFramebufferLayout();
             RenderToMailbox(secondary_layout, secondary_window->mailbox, false);
         }

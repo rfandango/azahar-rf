@@ -7,9 +7,11 @@
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/memory.h"
 #include "video_core/debug_utils/debug_utils.h"
+#include "video_core/frame_state_dump.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/rasterizer_interface.h"
@@ -1007,6 +1009,8 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    CITRA_TRACE_COUNT(SwVertices);
+
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
@@ -1046,11 +1050,30 @@ void PicaCore::DrawImmediate() {
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
+    CITRA_TRACE_SCOPE_DETAIL("PICA::DrawArrays");
 
     // Track vertex in the debug recorder.
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::IncomingPrimitiveBatch, nullptr);
     }
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    // Measurement aids: drop whole classes of draws to see what they cost or hide.
+    if (const u32 experiments = Common::TraceMarkers::Experiments(); experiments != 0)
+        [[unlikely]] {
+        const auto& output_merger = regs.internal.framebuffer.output_merger;
+        const bool lit = !regs.internal.lighting.disable;
+        const bool flat = !lit && !output_merger.depth_test_enable;
+        const bool effect = !lit && !flat && !output_merger.depth_write_enable;
+        const bool solid = !lit && !flat && !effect;
+        if ((lit && (experiments & Common::TraceMarkers::SkipLitDraws)) ||
+            (flat && (experiments & Common::TraceMarkers::SkipFlatDraws)) ||
+            (effect && (experiments & Common::TraceMarkers::SkipEffectDraws)) ||
+            (solid && (experiments & Common::TraceMarkers::SkipUnlitSolidDraws))) {
+            return;
+        }
+    }
+#endif
 
     const bool accelerate_draw = [this] {
         // Geometry shaders cannot be accelerated due to register preservation.
@@ -1078,13 +1101,28 @@ void PicaCore::DrawArrays(bool is_indexed) {
     delay_generator.AddVertices(regs.internal.pipeline.num_vertices,
                                 regs.internal.pipeline.triangle_topology);
 
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    if (VideoCore::FrameStateDump::IsActive()) [[unlikely]] {
+        VideoCore::FrameStateDump::Draw(regs.internal, accelerate_draw, is_indexed,
+                                        vs_setup.GetProgramCodeHash());
+    }
+#endif
+
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
+        CITRA_TRACE_COUNT(HwDraws);
         return;
     }
 
+    CITRA_FRAME_DUMP("  draw: vertex shading on the CPU");
+    CITRA_TRACE_COUNT(SwDraws);
+    CITRA_TRACE_COUNT_N(SwVertices, regs.internal.pipeline.num_vertices);
+
     // We cannot accelerate the draw, so load and execute the vertex shader for each vertex.
-    LoadVertices(is_indexed);
+    {
+        CITRA_TRACE_SCOPE_DETAIL("PICA::SoftwareVertexShading");
+        LoadVertices(is_indexed);
+    }
 
     // Draw emitted triangles.
     rasterizer->DrawTriangles();

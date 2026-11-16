@@ -74,6 +74,16 @@ public:
         modification_tick++;
     }
 
+    void MarkValid(const SurfaceRegions& regions) {
+        invalid_regions -= regions;
+        modification_tick++;
+    }
+
+    void MarkInvalid(const SurfaceRegions& regions) {
+        invalid_regions += regions;
+        modification_tick++;
+    }
+
     bool IsFullyInvalid() const {
         auto interval = GetInterval();
         return *invalid_regions.equal_range(interval).first == interval;

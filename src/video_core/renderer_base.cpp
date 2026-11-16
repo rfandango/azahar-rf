@@ -3,11 +3,13 @@
 // Refer to the LICENSE.txt file included.
 
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "core/hle/service/hid/hid.h"
 #include "core/tracer/recorder.h"
 #include "video_core/debug_utils/debug_utils.h"
+#include "video_core/frame_state_dump.h"
 #include "video_core/renderer_base.h"
 
 namespace VideoCore {
@@ -46,6 +48,12 @@ void RendererBase::UpdateCurrentFramebufferLayout(bool is_portrait_mode) {
 }
 
 void RendererBase::EndFrame() {
+    // One "EmuFrame" async slice per emulated VBlank period, excluding GPU throttling and frame
+    // limiting below.
+    CITRA_TRACE_ASYNC_END("EmuFrame", current_frame);
+    CITRA_TRACE_END_FRAME();
+    CITRA_FRAME_DUMP_VBLANK();
+
     current_frame++;
 
     system.perf_stats->EndSystemFrame();
@@ -59,11 +67,15 @@ void RendererBase::EndFrame() {
     if (game_frames != limited_game_frames) {
         limited_game_frames = game_frames;
         if (Settings::values.use_limit_frames_ahead_of_gpu.GetValue()) {
+            CITRA_TRACE_SCOPE("LimitFramesAheadOfGpu");
             LimitFramesAheadOfGpu();
         }
     }
 
-    system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
+    {
+        CITRA_TRACE_SCOPE("FrameLimiter");
+        system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
+    }
 
     // On fast enough devices, the time limiter sleep spans most of the 16ms period
     // between VBlank events. If an input event lands in that period, then the change
@@ -76,6 +88,7 @@ void RendererBase::EndFrame() {
     }
 
     system.perf_stats->BeginSystemFrame();
+    CITRA_TRACE_ASYNC_BEGIN("EmuFrame", current_frame);
 }
 
 bool RendererBase::IsScreenshotPending() const {

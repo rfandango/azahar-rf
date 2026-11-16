@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -54,11 +55,30 @@ struct Subroutine {
     }
 };
 
+using KnownBools = Pica::ShaderSetup::BoolSpecialization;
+
+/// Returns whether a CALLU calls, an IFU runs its first branch or a JMPU jumps, when that is
+/// known during translation because the bool uniform that the instruction tests is.
+static std::optional<bool> ResolveBoolTest(Instruction instr, KnownBools known_bools) {
+    const OpCode::Id opcode = instr.opcode.Value();
+    if (opcode != OpCode::Id::CALLU && opcode != OpCode::Id::IFU && opcode != OpCode::Id::JMPU) {
+        return std::nullopt;
+    }
+    const u32 bit = 1u << instr.flow_control.bool_uniform_id;
+    if (!(known_bools.mask & bit)) {
+        return std::nullopt;
+    }
+    const bool value = (known_bools.values & bit) != 0;
+    // JMPU jumps on a false uniform when the lowest bit of num_instructions is set.
+    const bool inverted = opcode == OpCode::Id::JMPU && (instr.flow_control.num_instructions & 1);
+    return value != inverted;
+}
+
 /// Analyzes shader code and produces a set of subroutines.
 class ControlFlowAnalyzer {
 public:
-    ControlFlowAnalyzer(const ProgramCode& program_code, u32 main_offset)
-        : program_code(program_code) {
+    ControlFlowAnalyzer(const ProgramCode& program_code, u32 main_offset, KnownBools known_bools)
+        : program_code(program_code), known_bools(known_bools) {
 
         // Recursively finds all subroutines.
         const Subroutine& program_main = AddSubroutine(main_offset, PROGRAM_END);
@@ -72,6 +92,7 @@ public:
 
 private:
     const ProgramCode& program_code;
+    const KnownBools known_bools;
     std::set<Subroutine> subroutines;
     std::map<std::pair<u32, u32>, ExitMethod> exit_method_map;
 
@@ -138,6 +159,13 @@ private:
             }
             case OpCode::Id::JMPC:
             case OpCode::Id::JMPU: {
+                if (const auto jumps = ResolveBoolTest(instr, known_bools)) {
+                    if (!*jumps) {
+                        break;
+                    }
+                    labels.insert(instr.flow_control.dest_offset);
+                    return exit_method = Scan(instr.flow_control.dest_offset, end, labels);
+                }
                 labels.insert(instr.flow_control.dest_offset);
                 ExitMethod no_jmp = Scan(offset + 1, end, labels);
                 ExitMethod jmp = Scan(instr.flow_control.dest_offset, end, labels);
@@ -161,15 +189,39 @@ private:
             }
             case OpCode::Id::CALLC:
             case OpCode::Id::CALLU: {
+                const auto calls = ResolveBoolTest(instr, known_bools);
+                if (calls && !*calls) {
+                    break;
+                }
                 auto& call = AddSubroutine(instr.flow_control.dest_offset,
                                            instr.flow_control.dest_offset +
                                                instr.flow_control.num_instructions);
+                if (calls && call.exit_method == ExitMethod::AlwaysEnd) {
+                    return exit_method = ExitMethod::AlwaysEnd;
+                }
                 ExitMethod after_call = Scan(offset + 1, end, labels);
+                if (calls) {
+                    return exit_method = SeriesExit(call.exit_method, after_call);
+                }
                 return exit_method = SeriesExit(
                            ParallelExit(call.exit_method, ExitMethod::AlwaysReturn), after_call);
             }
             case OpCode::Id::IFU:
             case OpCode::Id::IFC: {
+                if (const auto first_branch = ResolveBoolTest(instr, known_bools)) {
+                    const u32 else_offset = instr.flow_control.dest_offset;
+                    const u32 endif_offset = else_offset + instr.flow_control.num_instructions;
+                    ExitMethod branch = ExitMethod::AlwaysReturn;
+                    if (*first_branch) {
+                        branch = AddSubroutine(offset + 1, else_offset).exit_method;
+                    } else if (else_offset != endif_offset) {
+                        branch = AddSubroutine(else_offset, endif_offset).exit_method;
+                    }
+                    if (branch == ExitMethod::AlwaysEnd) {
+                        return exit_method = ExitMethod::AlwaysEnd;
+                    }
+                    return exit_method = SeriesExit(branch, Scan(endif_offset, end, labels));
+                }
                 auto& if_sub = AddSubroutine(offset + 1, instr.flow_control.dest_offset);
                 ExitMethod else_method;
                 if (instr.flow_control.num_instructions != 0) {
@@ -267,10 +319,10 @@ public:
     GLSLGenerator(const std::set<Subroutine>& subroutines, const ProgramCode& program_code,
                   const SwizzleData& swizzle_data, u32 main_offset,
                   const RegGetter& inputreg_getter, const RegGetter& outputreg_getter,
-                  bool sanitize_mul)
+                  bool sanitize_mul, KnownBools known_bools)
         : subroutines(subroutines), program_code(program_code), swizzle_data(swizzle_data),
           main_offset(main_offset), inputreg_getter(inputreg_getter),
-          outputreg_getter(outputreg_getter), sanitize_mul(sanitize_mul) {
+          outputreg_getter(outputreg_getter), sanitize_mul(sanitize_mul), known_bools(known_bools) {
 
         Generate();
     }
@@ -668,6 +720,16 @@ private:
 
             case OpCode::Id::JMPC:
             case OpCode::Id::JMPU: {
+                if (const auto jumps = ResolveBoolTest(instr, known_bools)) {
+                    if (*jumps) {
+                        shader.AddLine("{{ jmp_to = {}u; break; }}",
+                                       instr.flow_control.dest_offset.Value());
+                        // Nothing that follows runs, up to the next label.
+                        offset = PROGRAM_END - 1;
+                    }
+                    break;
+                }
+
                 std::string condition;
                 if (instr.opcode.Value() == OpCode::Id::JMPC) {
                     condition = EvaluateCondition(instr.flow_control);
@@ -689,10 +751,15 @@ private:
             case OpCode::Id::CALL:
             case OpCode::Id::CALLC:
             case OpCode::Id::CALLU: {
+                const auto calls = ResolveBoolTest(instr, known_bools);
+                if (calls && !*calls) {
+                    break;
+                }
+
                 std::string condition;
                 if (instr.opcode.Value() == OpCode::Id::CALLC) {
                     condition = EvaluateCondition(instr.flow_control);
-                } else if (instr.opcode.Value() == OpCode::Id::CALLU) {
+                } else if (instr.opcode.Value() == OpCode::Id::CALLU && !calls) {
                     condition = GetUniformBool(instr.flow_control.bool_uniform_id);
                 }
 
@@ -708,7 +775,7 @@ private:
                                                    instr.flow_control.num_instructions);
 
                 CallSubroutine(call_sub);
-                if (instr.opcode.Value() == OpCode::Id::CALL &&
+                if ((instr.opcode.Value() == OpCode::Id::CALL || calls) &&
                     call_sub.exit_method == ExitMethod::AlwaysEnd) {
                     offset = PROGRAM_END - 1;
                 }
@@ -735,6 +802,23 @@ private:
                 const u32 else_offset = instr.flow_control.dest_offset;
                 const u32 endif_offset =
                     instr.flow_control.dest_offset + instr.flow_control.num_instructions;
+
+                if (const auto first_branch = ResolveBoolTest(instr, known_bools)) {
+                    offset = endif_offset - 1;
+                    if (*first_branch || else_offset != endif_offset) {
+                        auto& branch_sub = *first_branch ? GetSubroutine(if_offset, else_offset)
+                                                         : GetSubroutine(else_offset, endif_offset);
+                        shader.AddLine("{{");
+                        ++shader.scope;
+                        CallSubroutine(branch_sub);
+                        --shader.scope;
+                        shader.AddLine("}}");
+                        if (branch_sub.exit_method == ExitMethod::AlwaysEnd) {
+                            offset = PROGRAM_END - 1;
+                        }
+                    }
+                    break;
+                }
 
                 shader.AddLine("if ({}) {{", condition);
                 ++shader.scope;
@@ -924,18 +1008,21 @@ private:
     const RegGetter& inputreg_getter;
     const RegGetter& outputreg_getter;
     const bool sanitize_mul;
+    const KnownBools known_bools;
 
     ShaderWriter shader;
 };
 
 std::string DecompileProgram(const ProgramCode& program_code, const SwizzleData& swizzle_data,
                              u32 main_offset, const RegGetter& inputreg_getter,
-                             const RegGetter& outputreg_getter, bool sanitize_mul) {
+                             const RegGetter& outputreg_getter, bool sanitize_mul,
+                             Pica::ShaderSetup::BoolSpecialization known_bools) {
 
     try {
-        auto subroutines = ControlFlowAnalyzer(program_code, main_offset).MoveSubroutines();
+        auto subroutines =
+            ControlFlowAnalyzer(program_code, main_offset, known_bools).MoveSubroutines();
         GLSLGenerator generator(subroutines, program_code, swizzle_data, main_offset,
-                                inputreg_getter, outputreg_getter, sanitize_mul);
+                                inputreg_getter, outputreg_getter, sanitize_mul, known_bools);
         return generator.MoveShaderCode();
     } catch (const DecompileFail& exception) {
         LOG_INFO(HW_GPU, "Shader decompilation failed: {}", exception.what());

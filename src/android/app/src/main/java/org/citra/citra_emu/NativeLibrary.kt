@@ -184,6 +184,13 @@ object NativeLibrary {
     external fun secondarySurfaceDestroyed()
 
     /**
+     * Tells the core whether the secondary surface is on a display that can be seen, as opposed
+     * to the hidden display that holds it while there is no second screen. The core does not
+     * render to a secondary surface that is not shown.
+     */
+    external fun secondaryDisplayShown(shown: Boolean)
+
+    /**
      * Unpauses emulation from a paused state.
      */
     external fun unPauseEmulation()

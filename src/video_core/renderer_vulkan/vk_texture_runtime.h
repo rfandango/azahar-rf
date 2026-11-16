@@ -167,6 +167,11 @@ public:
     /// Returns true if the provided pixel format needs convertion
     bool NeedsConversion(const Surface& surface) const;
 
+    /// Returns true if surfaces may have half the resolution scale along an axis
+    bool SupportsHalfScaleTargets() const noexcept {
+        return true;
+    }
+
 private:
     /// Clears a partial texture rect using a clear rectangle
     void ClearTextureWithRenderpass(Surface& surface, const VideoCore::TextureClear& clear);
@@ -316,7 +321,7 @@ public:
           formats(std::exchange(
               other.formats, {VideoCore::PixelFormat::Invalid, VideoCore::PixelFormat::Invalid})),
           width(std::exchange(other.width, 0)), height(std::exchange(other.height, 0)),
-          res_scale(std::exchange(other.res_scale, 1)),
+          scale(std::exchange(other.scale, {})),
           sample_count(std::exchange(other.sample_count, 1)) {}
 
     Framebuffer& operator=(Framebuffer&& other) noexcept {
@@ -331,7 +336,7 @@ public:
                                 {VideoCore::PixelFormat::Invalid, VideoCore::PixelFormat::Invalid});
         width = std::exchange(other.width, 0);
         height = std::exchange(other.height, 0);
-        res_scale = std::exchange(other.res_scale, 1);
+        scale = std::exchange(other.scale, {});
         sample_count = std::exchange(other.sample_count, 1);
 
         return *this;
@@ -362,7 +367,12 @@ public:
     }
 
     u32 Scale() const noexcept {
-        return res_scale;
+        return scale.res_scale;
+    }
+
+    /// Host pixels per guest pixel of the attachments, along each axis
+    VideoCore::SurfaceScale Scaling() const noexcept {
+        return scale;
     }
 
     u8 Samples() const noexcept {
@@ -383,7 +393,7 @@ private:
         VideoCore::PixelFormat::Invalid, VideoCore::PixelFormat::Invalid};
     u32 width{};
     u32 height{};
-    u32 res_scale{1};
+    VideoCore::SurfaceScale scale{};
     u8 sample_count{1};
 };
 

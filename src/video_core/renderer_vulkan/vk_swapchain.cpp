@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
@@ -96,6 +97,7 @@ bool Swapchain::AcquireNextImage() {
     }
 
     MICROPROFILE_SCOPE(Vulkan_Acquire);
+    CITRA_TRACE_SCOPE("vkAcquireNextImageKHR");
     const vk::Device device = instance.GetDevice();
     const vk::Result result =
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
@@ -128,6 +130,7 @@ void Swapchain::Present() {
     };
 
     MICROPROFILE_SCOPE(Vulkan_Present);
+    CITRA_TRACE_SCOPE("vkQueuePresentKHR");
     try {
         [[maybe_unused]] vk::Result result = instance.GetPresentQueue().presentKHR(present_info);
     } catch (vk::OutOfDateKHRError&) {

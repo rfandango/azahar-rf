@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <optional>
 #include "common/hash.h"
 #include "video_core/pica/regs_internal.h"
 #include "video_core/shader/generator/profile.h"
@@ -62,6 +63,18 @@ struct BlendConfig {
 };
 static_assert(std::has_unique_object_representations_v<BlendConfig>);
 
+/// Viewport depth bounds that reproduce the PICA depth mapping of a Z-buffered draw.
+struct ViewportDepthRange {
+    float min_depth;
+    float max_depth;
+};
+
+/// PICA maps depth as z/w * scale + offset. With Z-buffering that is linear in the rasterized
+/// depth, so the viewport transform can do it whenever both ends land in [0, 1]. Fragment
+/// shaders then leave depth alone, which keeps early depth testing. W-buffering and other ranges
+/// return nullopt and keep the per-fragment depth write.
+std::optional<ViewportDepthRange> GetViewportDepthRange(const Pica::RasterizerRegs& regs);
+
 struct FramebufferConfig {
     explicit FramebufferConfig(const Pica::RegsInternal& regs);
 
@@ -73,6 +86,9 @@ struct FramebufferConfig {
         BitField<6, 4, Pica::FramebufferRegs::LogicOp> logic_op;
         BitField<10, 1, u32> shadow_rendering;
         BitField<11, 1, u32> alphablend_enable;
+        /// The renderer maps depth through the viewport (see GetViewportDepthRange), so the
+        /// shader must not write depth itself. Set by renderers that support it.
+        BitField<12, 1, u32> depth_from_viewport;
     };
     BlendConfig requested_rgb_blend{};
     BlendConfig requested_alpha_blend{};
@@ -94,8 +110,8 @@ struct FramebufferConfig {
             // fields
             FIELD_HASH(alpha_test_func), FIELD_HASH(scissor_test_mode), FIELD_HASH(depthmap_enable),
             FIELD_HASH(logic_op), FIELD_HASH(shadow_rendering), FIELD_HASH(alphablend_enable),
-            FIELD_HASH(requested_rgb_blend), FIELD_HASH(requested_alpha_blend),
-            FIELD_HASH(requested_logic_op),
+            FIELD_HASH(depth_from_viewport), FIELD_HASH(requested_rgb_blend),
+            FIELD_HASH(requested_alpha_blend), FIELD_HASH(requested_logic_op),
 
             // nested layout
             BlendConfig::StructHash());

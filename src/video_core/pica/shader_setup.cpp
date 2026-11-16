@@ -2,8 +2,10 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <algorithm>
 #include <limits>
 #include <utility>
+#include <nihstro/shader_bytecode.h>
 #include "common/assert.h"
 #include "common/bit_set.h"
 #include "common/hash.h"
@@ -121,6 +123,42 @@ u64 ShaderSetup::GetProgramCodeHash() {
         program_code_hash_dirty = false;
     }
     return program_code_hash;
+}
+
+ShaderSetup::BoolSpecialization ShaderSetup::GetBoolSpecialization(u16 bool_uniforms) {
+    using nihstro::OpCode;
+
+    const u64 program_hash = GetProgramCodeHash();
+    if (!tested_bools_valid || tested_bools_program_hash != program_hash) {
+        tested_bools = 0;
+        for (u32 offset = 0; offset < biggest_program_size; ++offset) {
+            const nihstro::Instruction instr = {program_code[offset]};
+            switch (instr.opcode.Value()) {
+            case OpCode::Id::CALLU:
+            case OpCode::Id::IFU:
+            case OpCode::Id::JMPU:
+                tested_bools |= 1 << instr.flow_control.bool_uniform_id;
+                break;
+            default:
+                break;
+            }
+        }
+        specialized_bools.clear();
+        tested_bools_program_hash = program_hash;
+        tested_bools_valid = true;
+    }
+
+    if (tested_bools == 0) {
+        return {};
+    }
+    const u16 values = bool_uniforms & tested_bools;
+    if (std::ranges::find(specialized_bools, values) == specialized_bools.end()) {
+        if (specialized_bools.size() == specialized_bools.capacity()) {
+            return {};
+        }
+        specialized_bools.push_back(values);
+    }
+    return {tested_bools, values};
 }
 
 u64 ShaderSetup::GetSwizzleDataHash() {

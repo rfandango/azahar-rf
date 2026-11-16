@@ -143,6 +143,21 @@ private:
     u32 uniform_size_aligned_vs;
     u32 uniform_size_aligned_fs;
     bool async_shaders{false};
+
+    /// Guest render target and attachments of the previous draw, used to keep attachments bound
+    /// across consecutive draws that toggle colour or depth use (see Draw).
+    struct BoundTarget {
+        PAddr color_addr{};
+        PAddr depth_addr{};
+        u32 width{};
+        u32 height{};
+        u32 color_format{};
+        u32 depth_format{};
+        bool color{};
+        bool depth{};
+        bool valid{};
+    };
+    BoundTarget bound_target{};
 };
 
 } // namespace Vulkan

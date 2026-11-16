@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <tuple>
 #include <utility>
@@ -260,6 +261,19 @@ public:
     }
 
     /**
+     * Whether what is presented to this window can be seen. A frontend may keep a window around
+     * that is currently shown nowhere (Android does for its secondary display); renderers do not
+     * draw to such a window.
+     */
+    bool IsVisible() const {
+        return is_visible.load(std::memory_order_relaxed);
+    }
+
+    void SetVisible(bool visible) {
+        is_visible.store(visible, std::memory_order_relaxed);
+    }
+
+    /**
      * Requests for a frontend to setup a framebuffer.
      */
     virtual void SetupFramebuffer() {}
@@ -342,6 +356,8 @@ private:
     WindowConfig active_config{}; ///< Internal active configuration
 
     std::shared_ptr<TouchState> touch_state;
+
+    std::atomic_bool is_visible{true};
 
     /**
      * Clip the provided coordinates to be inside the touchscreen area.

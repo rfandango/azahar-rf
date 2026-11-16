@@ -57,6 +57,11 @@ public:
     /// Returns true if the provided pixel format cannot be used natively by the runtime.
     bool NeedsConversion(const Surface& surface) const;
 
+    /// Returns true if surfaces may have half the resolution scale along an axis
+    bool SupportsHalfScaleTargets() const noexcept {
+        return false;
+    }
+
     /// Maps an internal staging buffer of the provided size of pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
 
@@ -181,6 +186,11 @@ public:
 
     [[nodiscard]] u32 Scale() const noexcept {
         return res_scale;
+    }
+
+    /// Host pixels per guest pixel of the attachments, along each axis
+    [[nodiscard]] VideoCore::SurfaceScale Scaling() const noexcept {
+        return {res_scale};
     }
 
     [[nodiscard]] u32 Samples() const noexcept {

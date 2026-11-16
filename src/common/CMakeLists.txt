@@ -97,6 +97,8 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     threadsafe_queue.h
     timer.cpp
     timer.h
+    trace_markers.cpp
+    trace_markers.h
     unique_function.h
     unroll.h
     vector_math.h
@@ -137,6 +139,11 @@ if (ANDROID AND NOT ENABLE_LIBRETRO)
     android_utils.cpp
     android_utils.h
   )
+endif()
+
+# ATrace (used by trace_markers.cpp) lives in libandroid
+if (ANDROID AND ENABLE_PROFILING)
+  target_link_libraries(citra_common PRIVATE android)
 endif()
 
 if (MSVC)

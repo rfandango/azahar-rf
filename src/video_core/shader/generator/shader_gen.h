@@ -100,6 +100,10 @@ struct PicaVSConfigState {
     void Init(const Pica::RegsInternal& regs, Pica::ShaderSetup& setup);
 
     u8 lighting_disable;
+    /// Bool uniforms with their value compiled into the shader instead of read at run time,
+    /// and those values. See Pica::ShaderSetup::GetBoolSpecialization.
+    u16 bool_uniform_mask;
+    u16 bool_uniform_values;
     u64 program_hash;
     u64 swizzle_hash;
     u32 main_offset;
@@ -130,7 +134,8 @@ struct PicaVSConfigState {
                                    LAYOUT_HASH,
 
                                    // fields
-                                   FIELD_HASH(lighting_disable), FIELD_HASH(program_hash),
+                                   FIELD_HASH(lighting_disable), FIELD_HASH(bool_uniform_mask),
+                                   FIELD_HASH(bool_uniform_values), FIELD_HASH(program_hash),
                                    FIELD_HASH(swizzle_hash), FIELD_HASH(main_offset),
                                    FIELD_HASH(num_outputs), FIELD_HASH(output_map),
                                    FIELD_HASH(used_input_vertex_attributes),

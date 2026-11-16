@@ -5,6 +5,7 @@
 #pragma once
 
 #include <optional>
+#include <boost/container/static_vector.hpp>
 #include "common/vector_math.h"
 #include "video_core/pica/packed_attribute.h"
 #include "video_core/pica_types.h"
@@ -84,6 +85,25 @@ public:
     u64 GetSwizzleDataHash();
 
     void DoProgramCodeFixup();
+
+    /// Bool uniforms that a host shader can treat as constants: bit i of mask says that bool
+    /// uniform i has the value in bit i of values whenever the shader is used.
+    struct BoolSpecialization {
+        u16 mask;
+        u16 values;
+    };
+
+    /**
+     * Returns the bool uniforms that a host shader translated from the current program should
+     * have compiled in, given the current value of all bool uniforms.
+     *
+     * Programs test bool uniforms to select code paths (CALLU, IFU, JMPU), typically with one
+     * set of values per material. A host shader that knows the values only contains the paths
+     * taken, which host shader compilers deal with far better than with a translation of every
+     * path in the program. The price is one host shader per set of values, so only a limited
+     * number of sets is specialized per program. Draws with other values get an empty mask.
+     */
+    BoolSpecialization GetBoolSpecialization(u16 bool_uniforms);
 
     inline void UpdateProgramCode(size_t offset, u32 value) {
         u32& inst = program_code[offset];
@@ -173,6 +193,15 @@ private:
     u32 biggest_swizzle_size = 0;
     u64 program_code_hash{0};
     u64 swizzle_data_hash{0};
+
+    /// Most sets of bool uniform values that host shaders are specialized for, per program
+    static constexpr std::size_t MAX_BOOL_SPECIALIZATIONS = 32;
+
+    // Derived from the program code, and therefore not part of the serialized state.
+    bool tested_bools_valid{false};
+    u64 tested_bools_program_hash{0};
+    u16 tested_bools{0};
+    boost::container::static_vector<u16, MAX_BOOL_SPECIALIZATIONS> specialized_bools;
 
     // ProgramCode program_code_fixup{};
     // bool program_code_pending_fixup{true};

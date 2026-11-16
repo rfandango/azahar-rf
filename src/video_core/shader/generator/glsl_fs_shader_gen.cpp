@@ -183,7 +183,9 @@ vec4 secondary_fragment_color = vec4(0.0);
     if (config.framebuffer.shadow_rendering) {
         WriteShadow();
     } else {
-        out += "gl_FragDepth = depth;\n";
+        if (!config.framebuffer.depth_from_viewport) {
+            out += "gl_FragDepth = depth;\n";
+        }
         // Round the final fragment color to maintain the PICA's 8 bits of precision
         out += "combiner_output = byteround(combiner_output);\n";
         WriteBlending();
@@ -204,6 +206,11 @@ void FragmentModule::WriteDepth() {
     // original range of [-1, 0]. If the depth range is [0, 1], so all we need to do is
     // un-negate the value to range [-1, 0]. Once we have z_over_w, we can do our own transformation
     // according to PICA specification.
+    if (config.framebuffer.depth_from_viewport) {
+        // The viewport depth range already applied the PICA depth mapping.
+        out += "float depth = gl_FragCoord.z;\n";
+        return;
+    }
     if (profile.has_minus_one_to_one_range) {
         out += "float z_over_w = -2.0 * gl_FragCoord.z + 1.0;\n";
     } else {

@@ -21,6 +21,7 @@
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
 #include "video_core/custom_textures/material.h"
+#include "video_core/frame_state_dump.h"
 #include "video_core/rasterizer_cache/texture_codec.h"
 #include "video_core/rasterizer_cache/utils.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
@@ -986,10 +987,11 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
             .src_level = upload.texture_level,
             .dst_level = upload.texture_level,
             .src_rect = upload.texture_rect,
-            .dst_rect = upload.texture_rect * res_scale,
+            .dst_rect = Scaling().Rect(upload.texture_rect),
         };
-        if ((type != SurfaceType::Color && type != SurfaceType::Texture) ||
-            !runtime.blit_helper.Filter(*this, blit)) {
+        // The texture filters assume the same scale in both directions.
+        if ((type != SurfaceType::Color && type != SurfaceType::Texture) || half_scale_x ||
+            half_scale_y || !runtime.blit_helper.Filter(*this, blit)) {
             BlitScale(blit, true);
         }
     }
@@ -1086,7 +1088,7 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
         const VideoCore::TextureBlit blit = {
             .src_level = download.texture_level,
             .dst_level = download.texture_level,
-            .src_rect = download.texture_rect * res_scale,
+            .src_rect = Scaling().Rect(download.texture_rect),
             .dst_rect = download.texture_rect,
         };
 
@@ -1271,6 +1273,8 @@ vk::ImageView Surface::CopyImageView() noexcept {
         copy_layout = vk::ImageLayout::eUndefined;
     }
 
+    CITRA_FRAME_DUMP("  vk full-surface copy {}x{} levels {} @{:08X} (ends the render pass)",
+                     GetScaledWidth(), GetScaledHeight(), levels, addr);
     runtime.renderpass_cache.EndRendering();
 
     const RecordParams params = {
@@ -1541,7 +1545,7 @@ void Surface::BlitScale(const VideoCore::TextureBlit& blit, bool up_scale) {
 Framebuffer::Framebuffer(TextureRuntime& runtime, const VideoCore::FramebufferParams& params,
                          Surface* color, Surface* depth)
     : VideoCore::FramebufferParams{params}, instance{runtime.GetInstance()},
-      res_scale{color ? color->res_scale : (depth ? depth->res_scale : 1u)},
+      scale{color ? color->Scaling() : (depth ? depth->Scaling() : VideoCore::SurfaceScale{})},
       sample_count{color ? color->sample_count : (depth ? depth->sample_count : u8(1u))} {
     auto& renderpass_cache = runtime.GetRenderpassCache();
     if (shadow_rendering && !color) {

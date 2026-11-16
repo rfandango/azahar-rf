@@ -11,6 +11,7 @@
 #include "common/microprofile.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/exception_handler.h"
 #include "core/core.h"
@@ -2450,6 +2451,7 @@ void SVC::CallSVC(u32 immediate) {
     LOG_TRACE(Kernel_SVC, "calling {}", info->name);
     if (info) {
         if (info->func) {
+            CITRA_TRACE_SCOPE_DETAIL(info->name);
             system.GetRunningCore().GetTimer().AddTicks(info->cycles);
             (this->*(info->func))();
         } else {

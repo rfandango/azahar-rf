@@ -10,6 +10,7 @@
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/loader/loader.h"
 #include "video_core/pica/shader_setup.h"
@@ -427,14 +428,16 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
                       current_depth_stencil = current_info.state.depth_stencil,
                       rasterization = info.state.rasterization,
                       depth_stencil = info.state.depth_stencil](vk::CommandBuffer cmdbuf) {
-        if (dynamic.viewport != current_dynamic.viewport || is_dirty) {
+        if (dynamic.viewport != current_dynamic.viewport ||
+            dynamic.depth_min != current_dynamic.depth_min ||
+            dynamic.depth_max != current_dynamic.depth_max || is_dirty) {
             const vk::Viewport vk_viewport = {
                 .x = static_cast<f32>(dynamic.viewport.left),
                 .y = static_cast<f32>(dynamic.viewport.top),
                 .width = static_cast<f32>(dynamic.viewport.GetWidth()),
                 .height = static_cast<f32>(dynamic.viewport.GetHeight()),
-                .minDepth = 0.f,
-                .maxDepth = 1.f,
+                .minDepth = dynamic.depth_min,
+                .maxDepth = dynamic.depth_max,
             };
             cmdbuf.setViewport(0, vk_viewport);
         }
@@ -523,6 +526,7 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
 
         if (pipeline_dirty) {
             if (!pipeline->IsDone()) {
+                CITRA_TRACE_SCOPE("Vulkan::WaitPipeline");
                 pipeline->WaitDone();
             }
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -613,9 +617,10 @@ void PipelineCache::UseTrivialGeometryShader() {
 }
 
 void PipelineCache::UseFragmentShader(const Pica::RegsInternal& regs,
-                                      const Pica::Shader::UserConfig& user) {
+                                      const Pica::Shader::UserConfig& user,
+                                      bool depth_from_viewport) {
 
-    auto res = curr_disk_cache->UseFragmentShader(regs, user);
+    auto res = curr_disk_cache->UseFragmentShader(regs, user, depth_from_viewport);
 
     if (res.has_value()) {
         current_shaders[ProgramType::FS] = (*res).second;

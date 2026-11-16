@@ -158,6 +158,27 @@ android {
             }
         }
 
+        // Release-equivalent build for performance profiling (simpleperf, Perfetto, AGI).
+        // Same optimization flags and R8 setup as release, but profileable from the shell and
+        // built with frame pointers and trace markers (-DENABLE_PROFILING=ON).
+        // Attaches 'profile' suffix to version and package name, allowing installation alongside
+        // the release and debug builds. See tools/android-profiling/README.md.
+        register("profile") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".profile"
+            versionNameSuffix = "-profile"
+            signingConfig = signingConfigs.getByName("debug")
+            isDebuggable = false
+            isJniDebuggable = false
+            isProfileable = true
+            matchingFallbacks += listOf("release")
+            externalNativeBuild {
+                cmake {
+                    arguments("-DENABLE_PROFILING=ON")
+                }
+            }
+        }
+
         // Signed by debug key disallowing distribution on Play Store.
         // Attaches 'debug' suffix to version and package name, allowing installation alongside the release build.
         debug {

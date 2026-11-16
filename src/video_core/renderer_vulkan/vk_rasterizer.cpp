@@ -8,15 +8,18 @@
 #include "common/math_util.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/loader/loader.h"
 #include "core/memory.h"
+#include "video_core/frame_state_dump.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/shader/generator/pica_fs_config.h"
 #include "video_core/texture/texture_decode.h"
 
 namespace Vulkan {
@@ -568,14 +571,42 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
 
     const bool write_color_fb = shadow_rendering || pipeline_info.GetFinalColorWriteMask(instance);
     const bool write_depth_fb = pipeline_info.IsDepthWriteEnabled();
-    const bool using_color_fb =
+    const bool needs_color_fb =
         regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() != 0 && write_color_fb;
-    const bool using_depth_fb =
+    const bool needs_depth_fb =
         !shadow_rendering && regs.framebuffer.framebuffer.GetDepthBufferPhysicalAddress() != 0 &&
         (write_depth_fb || regs.framebuffer.output_merger.depth_test_enable != 0 ||
          (has_stencil && pipeline_info.state.depth_stencil.stencil_test_enable));
 
-    const auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
+    // Games alternate between draws that only touch depth and draws that touch colour (depth
+    // pre-passes, occluders for glows, 2D layers). Selecting a different attachment set for each
+    // would end the render pass every time, which on tile-based GPUs means storing and reloading
+    // the whole target. So an attachment stays bound for as long as consecutive draws render to
+    // the same guest target; the write masks and depth state already keep it untouched.
+    const auto& fb_regs = regs.framebuffer.framebuffer;
+    const BoundTarget target{
+        .color_addr = fb_regs.GetColorBufferPhysicalAddress(),
+        .depth_addr = fb_regs.GetDepthBufferPhysicalAddress(),
+        .width = fb_regs.GetWidth(),
+        .height = fb_regs.GetHeight(),
+        .color_format = static_cast<u32>(fb_regs.color_format.Value()),
+        .depth_format = static_cast<u32>(fb_regs.depth_format.Value()),
+    };
+    const bool same_target =
+        bound_target.valid && !shadow_rendering && bound_target.color_addr == target.color_addr &&
+        bound_target.depth_addr == target.depth_addr && bound_target.width == target.width &&
+        bound_target.height == target.height && bound_target.color_format == target.color_format &&
+        bound_target.depth_format == target.depth_format &&
+        !(Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyAttachments);
+    const bool using_color_fb = needs_color_fb || (same_target && bound_target.color);
+    const bool using_depth_fb = needs_depth_fb || (same_target && bound_target.depth);
+    bound_target = target;
+    bound_target.color = using_color_fb;
+    bound_target.depth = using_depth_fb;
+    bound_target.valid = !shadow_rendering;
+
+    auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
+    fb_helper.SetWrittenAttachments(needs_color_fb, needs_depth_fb);
     const Framebuffer* framebuffer = fb_helper.Framebuffer();
     if (!framebuffer->Handle()) {
         return true;
@@ -606,8 +637,15 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     SyncTextureUnits(framebuffer);
     SyncUtilityTextures(framebuffer);
 
-    // Sync and bind the shader
-    pipeline_cache.UseFragmentShader(regs, user_config);
+    // Sync and bind the shader. With Z-buffering the viewport applies the PICA depth range, so
+    // the shader does not write depth and the host GPU can reject hidden fragments early.
+    const auto depth_range =
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyDepthWrite)
+            ? std::nullopt
+            : Pica::Shader::GetViewportDepthRange(regs.rasterizer);
+    pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value());
+    pipeline_info.dynamic_info.depth_min = depth_range ? depth_range->min_depth : 0.f;
+    pipeline_info.dynamic_info.depth_max = depth_range ? depth_range->max_depth : 1.f;
 
     // Sync the LUTs within the texture buffer
     SyncAndUploadLUTs();
@@ -615,6 +653,8 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     UploadUniforms(accelerate);
 
     // Begin rendering
+    CITRA_FRAME_DUMP("  vk draw rect {},{} {}x{}", draw_rect.left, draw_rect.bottom,
+                     draw_rect.GetWidth(), draw_rect.GetHeight());
     renderpass_cache.BeginRendering(framebuffer, draw_rect);
 
     // Configure viewport and scissor
@@ -724,6 +764,9 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
         Sampler& sampler = res_cache.GetSampler(texture.config);
         const vk::ImageView color_view = framebuffer->ImageView(SurfaceType::Color);
         const bool is_feedback_loop = color_view == surface.FramebufferView();
+        if (is_feedback_loop) {
+            CITRA_FRAME_DUMP("  vk tex{} is the colour target: sampling a copy", texture_index);
+        }
         const vk::ImageView texture_view =
             is_feedback_loop ? surface.CopyImageView() : surface.ImageView();
         update_queue.AddImageSampler(texture_set, texture_index, 0, texture_view, sampler.Handle());
@@ -734,6 +777,7 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
         framebuffer->color_id) {
         const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SAMPLER_ID);
         Surface& color_surface = res_cache.GetSurface(framebuffer->color_id);
+        CITRA_FRAME_DUMP("  vk blend emulation: shader reads a copy of the colour target");
         update_queue.AddImageSampler(texture_set, 3, 0, color_surface.CopyImageView(),
                                      null_sampler.Handle());
     }
@@ -814,6 +858,10 @@ void RasterizerVulkan::BindTextureCube(const Pica::TexturingRegs::FullTextureCon
     update_queue.AddImageSampler(texture_set, 0, 0, surface.ImageView(), sampler.Handle());
 }
 
+// Anything that can modify surfaces from outside a draw ends the run of consecutive draws that
+// bound_target tracks, so the next draw selects exactly the attachments it needs. Flushes only
+// read surfaces back (and run for every indexed draw's index buffer), so they do not.
+
 void RasterizerVulkan::FlushAll() {
     res_cache.FlushAll();
 }
@@ -823,27 +871,33 @@ void RasterizerVulkan::FlushRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerVulkan::InvalidateRegion(PAddr addr, u32 size) {
+    bound_target.valid = false;
     res_cache.InvalidateRegion(addr, size);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    bound_target.valid = false;
     res_cache.FlushRegion(addr, size);
     res_cache.InvalidateRegion(addr, size);
 }
 
 void RasterizerVulkan::ClearAll(bool flush) {
+    bound_target.valid = false;
     res_cache.ClearAll(flush);
 }
 
 bool RasterizerVulkan::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+    bound_target.valid = false;
     return res_cache.AccelerateDisplayTransfer(config);
 }
 
 bool RasterizerVulkan::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
+    bound_target.valid = false;
     return res_cache.AccelerateTextureCopy(config);
 }
 
 bool RasterizerVulkan::AccelerateFill(const Pica::MemoryFillConfig& config) {
+    bound_target.valid = false;
     return res_cache.AccelerateFill(config);
 }
 

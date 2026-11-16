@@ -5,6 +5,7 @@
 #include "common/bit_set.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "video_core/pica/regs_internal.h"
 #include "video_core/pica/shader_setup.h"
 #include "video_core/shader/generator/shader_gen.h"
@@ -49,6 +50,15 @@ void PicaVSConfigState::Init(const Pica::RegsInternal& regs, Pica::ShaderSetup& 
     program_hash = setup.GetProgramCodeHash();
     swizzle_hash = setup.GetSwizzleDataHash();
     main_offset = regs.vs.main_offset;
+
+    bool_uniform_mask = 0;
+    bool_uniform_values = 0;
+    if (!(Common::TraceMarkers::Experiments() & Common::TraceMarkers::GenericVertexShaders)) {
+        const auto bools =
+            setup.GetBoolSpecialization(static_cast<u16>(regs.vs.bool_uniforms.Value()));
+        bool_uniform_mask = bools.mask;
+        bool_uniform_values = bools.values;
+    }
 
     lighting_disable = regs.lighting.disable;
 

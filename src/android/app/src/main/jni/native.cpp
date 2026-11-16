@@ -79,6 +79,8 @@ namespace {
 
 ANativeWindow* s_surface;
 ANativeWindow* s_secondary_surface;
+// Whether the secondary surface is on a display that someone can see
+bool s_secondary_display_shown = true;
 
 enum class CompressionStatus : jint {
     Success = 0,
@@ -342,6 +344,10 @@ static Core::System::ResultStatus RunCitra(const std::string& filepath) {
         break;
     }
 
+    if (secondary_window) {
+        secondary_window->SetVisible(s_secondary_display_shown);
+    }
+
     Camera::RegisterFactory("image", std::make_unique<Camera::StillImage::Factory>());
 
     auto ndk_factory = std::make_unique<Camera::NDK::Factory>();
@@ -536,6 +542,17 @@ void Java_org_citra_citra_1emu_NativeLibrary_secondarySurfaceChanged(JNIEnv* env
     }
 
     LOG_INFO(Frontend, "Secondary Surface changed");
+}
+
+void Java_org_citra_citra_1emu_NativeLibrary_secondaryDisplayShown([[maybe_unused]] JNIEnv* env,
+                                                                   [[maybe_unused]] jobject obj,
+                                                                   jboolean shown) {
+    std::scoped_lock lock(surface_mutex);
+
+    s_secondary_display_shown = shown;
+    if (secondary_window) {
+        secondary_window->SetVisible(shown);
+    }
 }
 
 void Java_org_citra_citra_1emu_NativeLibrary_secondarySurfaceDestroyed(

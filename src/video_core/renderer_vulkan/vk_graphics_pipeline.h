@@ -275,6 +275,9 @@ struct DynamicPipelineInfo {
 
     Common::Rectangle<u32> scissor;
     Common::Rectangle<s32> viewport;
+    /// Viewport depth bounds; carry the PICA depth range when the shader does not write depth.
+    float depth_min = 0.f;
+    float depth_max = 1.f;
 
     bool operator==(const DynamicPipelineInfo& other) const noexcept {
         return std::memcmp(this, &other, sizeof(DynamicPipelineInfo)) == 0;

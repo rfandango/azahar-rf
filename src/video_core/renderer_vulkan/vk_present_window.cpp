@@ -5,6 +5,7 @@
 #include "common/microprofile.h"
 #include "common/settings.h"
 #include "common/thread.h"
+#include "common/trace_markers.h"
 #include "core/frontend/emu_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -246,6 +247,8 @@ void PresentWindow::RecreateFrame(Frame* frame, u32 width, u32 height) {
 
 Frame* PresentWindow::GetRenderFrame() {
     MICROPROFILE_SCOPE(Vulkan_WaitPresent);
+    // Blocks when all presentation frames are queued or still being presented.
+    CITRA_TRACE_SCOPE("Vulkan::WaitPresentFrame");
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
@@ -371,6 +374,7 @@ void PresentWindow::NotifySurfaceChanged() {
 }
 
 void PresentWindow::CopyToSwapchain(Frame* frame) {
+    CITRA_TRACE_SCOPE("Vulkan::CopyToSwapchain");
     const auto recreate_swapchain = [&] {
 #ifdef ANDROID
         {

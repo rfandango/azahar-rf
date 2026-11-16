@@ -117,6 +117,8 @@ class SecondaryDisplay(val context: Context) : DisplayManager.DisplayListener {
             availableDisplays.first { it.displayId == currentDisplayId }
         }
 
+        NativeLibrary.secondaryDisplayShown(currentDisplayId != -1)
+
         // if our presentation is already on the right display, ignore
         if (pres?.display == displayToUse) return
 

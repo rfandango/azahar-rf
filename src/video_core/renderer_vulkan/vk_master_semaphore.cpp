@@ -3,6 +3,7 @@
 
 #include <limits>
 #include <mutex>
+#include "common/trace_markers.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
@@ -48,6 +49,8 @@ void MasterSemaphoreTimeline::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    CITRA_TRACE_SCOPE("Vulkan::WaitGpu");
+    CITRA_TRACE_COUNT(GpuWaits);
     const vk::SemaphoreWaitInfoKHR wait_info = {
         .semaphoreCount = 1,
         .pSemaphores = &semaphore.get(),
@@ -121,7 +124,13 @@ void MasterSemaphoreFence::Refresh() {}
 
 void MasterSemaphoreFence::Wait(u64 tick) {
     std::unique_lock lk{free_mutex};
-    free_cv.wait(lk, [&] { return gpu_tick.load(std::memory_order_relaxed) >= tick; });
+    const auto is_free = [&] { return gpu_tick.load(std::memory_order_relaxed) >= tick; };
+    if (is_free()) {
+        return;
+    }
+    CITRA_TRACE_SCOPE("Vulkan::WaitGpu");
+    CITRA_TRACE_COUNT(GpuWaits);
+    free_cv.wait(lk, is_free);
 }
 
 void MasterSemaphoreFence::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore wait,

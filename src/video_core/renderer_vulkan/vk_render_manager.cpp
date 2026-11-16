@@ -5,6 +5,7 @@
 #include <limits>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
+#include "video_core/frame_state_dump.h"
 #include "video_core/rasterizer_cache/pixel_format.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
@@ -55,6 +56,11 @@ void RenderManager::BeginRendering(const RenderPass& new_pass) {
     }
 
     EndRendering();
+    CITRA_FRAME_DUMP("vk renderpass begin fb={:X} area {},{} {}x{} clear={}",
+                     reinterpret_cast<uintptr_t>(static_cast<VkFramebuffer>(new_pass.framebuffer)),
+                     new_pass.render_area.offset.x, new_pass.render_area.offset.y,
+                     new_pass.render_area.extent.width, new_pass.render_area.extent.height,
+                     new_pass.do_clear);
     scheduler.Record([info = new_pass](vk::CommandBuffer cmdbuf) {
         const vk::RenderPassBeginInfo renderpass_begin_info = {
             .renderPass = info.render_pass,
@@ -74,6 +80,7 @@ void RenderManager::EndRendering() {
         return;
     }
 
+    CITRA_FRAME_DUMP("vk renderpass end");
     scheduler.Record([images = images, aspects = aspects,
                       shadow_rendering = shadow_rendering](vk::CommandBuffer cmdbuf) {
         u32 num_barriers = 0;

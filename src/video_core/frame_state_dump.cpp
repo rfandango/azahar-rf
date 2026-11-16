@@ -1,0 +1,234 @@
+// Copyright 2026 Citra Emulator Project / Azahar Emulator Project
+// Licensed under GPLv2 or any later version
+// Refer to the misc/licenses/gplv2.txt file included.
+
+#include "video_core/frame_state_dump.h"
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <mutex>
+#include <android/log.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
+#include "video_core/pica/regs_internal.h"
+#include "video_core/pica_types.h"
+
+namespace VideoCore::FrameStateDump {
+
+std::atomic_bool active{false};
+
+namespace {
+
+constexpr const char* TRIGGER_PROPERTY = "debug.azahar.dump_frame";
+constexpr const char* LOG_TAG = "AzaharFrameDump";
+constexpr u32 VBLANKS_PER_DUMP = 2;
+
+std::mutex mutex;
+std::string buffer;
+std::string request;
+bool request_initialized = false;
+u32 vblanks_left = 0;
+u32 draw_index = 0;
+
+std::string PackageName() {
+    std::string name;
+    if (std::FILE* file = std::fopen("/proc/self/cmdline", "r")) {
+        char data[256]{};
+        const std::size_t read = std::fread(data, 1, sizeof(data) - 1, file);
+        std::fclose(file);
+        name.assign(data, strnlen(data, read));
+    }
+    return name;
+}
+
+void Write() {
+    const std::string dir = fmt::format("/sdcard/Android/data/{}/files", PackageName());
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::string path = fmt::format("{}/frame-dump-{}.txt", dir, request);
+    if (std::FILE* file = std::fopen(path.c_str(), "w")) {
+        std::fwrite(buffer.data(), 1, buffer.size(), file);
+        std::fclose(file);
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "wrote %s (%zu bytes)", path.c_str(),
+                            buffer.size());
+        return;
+    }
+
+    // No file access: fall back to the log, slowly enough for logd to keep up.
+    __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "cannot write %s (%s), dumping to the log",
+                        path.c_str(), std::strerror(errno));
+    std::size_t start = 0;
+    while (start < buffer.size()) {
+        // Every line is newline-terminated; see Line().
+        const std::size_t end = buffer.find('\n', start);
+        if (end == std::string::npos) {
+            break;
+        }
+        buffer[end] = '\0';
+        __android_log_write(ANDROID_LOG_INFO, LOG_TAG, buffer.c_str() + start);
+        usleep(300);
+        start = end + 1;
+    }
+}
+
+template <typename T>
+u32 Raw(const T& value) {
+    u32 raw{};
+    std::memcpy(&raw, &value, sizeof(raw));
+    return raw;
+}
+
+} // Anonymous namespace
+
+void SaveFile(const std::string& name, const void* data, std::size_t size) {
+    const std::string dir = fmt::format("/sdcard/Android/data/{}/files/shaders", PackageName());
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::string path = fmt::format("{}/{}", dir, name);
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(data, 1, size, file);
+        std::fclose(file);
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "cannot write %s (%s)", path.c_str(),
+                            std::strerror(errno));
+    }
+}
+
+void Line(std::string text) {
+    std::scoped_lock lock{mutex};
+    buffer += text;
+    buffer += '\n';
+}
+
+void Draw(const Pica::RegsInternal& regs, bool hardware_shader, bool is_indexed, u64 vs_hash) {
+    using Pica::f24;
+    const auto& fb = regs.framebuffer.framebuffer;
+    const auto& om = regs.framebuffer.output_merger;
+    const auto& rast = regs.rasterizer;
+    const auto& lighting = regs.lighting;
+    const auto& tex = regs.texturing;
+
+    std::string out = fmt::format(
+        "draw {} {} idx={} verts={} topo={} gs={} vs={:016X}@{:X} vsb={:04X}", draw_index++,
+        hardware_shader ? "hw" : "sw", is_indexed, regs.pipeline.num_vertices,
+        static_cast<u32>(regs.pipeline.triangle_topology.Value()),
+        static_cast<u32>(regs.pipeline.use_gs.Value()), vs_hash, regs.vs.main_offset.Value(),
+        regs.vs.bool_uniforms.Value());
+
+    out +=
+        fmt::format(" | fb c={:08X} cf={} d={:08X} df={} {}x{}", fb.GetColorBufferPhysicalAddress(),
+                    static_cast<u32>(fb.color_format.Value()), fb.GetDepthBufferPhysicalAddress(),
+                    static_cast<u32>(fb.depth_format.Value()), fb.GetWidth(), fb.GetHeight());
+
+    const auto vp = rast.GetViewportRect();
+    out += fmt::format(" | vp {},{}-{},{} sc m={} {},{}-{},{}", vp.left, vp.bottom, vp.right,
+                       vp.top, static_cast<u32>(rast.scissor_test.mode.Value()),
+                       rast.scissor_test.x1.Value(), rast.scissor_test.y1.Value(),
+                       rast.scissor_test.x2.Value(), rast.scissor_test.y2.Value());
+
+    out +=
+        fmt::format(" | z test={} f={} wr={} wbuf={} scale={} off={}", om.depth_test_enable.Value(),
+                    static_cast<u32>(om.depth_test_func.Value()), om.depth_write_enable.Value(),
+                    rast.depthmap_enable == Pica::RasterizerRegs::DepthBuffering::WBuffering,
+                    f24::FromRaw(rast.viewport_depth_range).ToFloat32(),
+                    f24::FromRaw(rast.viewport_depth_near_plane).ToFloat32());
+
+    out += fmt::format(
+        " | mask={}{}{}{} atest={}/{}/{} blend={} eq={}/{} f={},{},{},{} lop={} st={} cull={} "
+        "fop={}",
+        om.red_enable.Value(), om.green_enable.Value(), om.blue_enable.Value(),
+        om.alpha_enable.Value(), om.alpha_test.enable.Value(),
+        static_cast<u32>(om.alpha_test.func.Value()), om.alpha_test.ref.Value(),
+        om.alphablend_enable.Value(),
+        static_cast<u32>(om.alpha_blending.blend_equation_rgb.Value()),
+        static_cast<u32>(om.alpha_blending.blend_equation_a.Value()),
+        static_cast<u32>(om.alpha_blending.factor_source_rgb.Value()),
+        static_cast<u32>(om.alpha_blending.factor_dest_rgb.Value()),
+        static_cast<u32>(om.alpha_blending.factor_source_a.Value()),
+        static_cast<u32>(om.alpha_blending.factor_dest_a.Value()),
+        static_cast<u32>(om.logic_op.Value()), om.stencil_test.enable.Value(),
+        static_cast<u32>(rast.cull_mode.Value()),
+        static_cast<u32>(om.fragment_operation_mode.Value()));
+
+    const u32 num_lights = lighting.disable ? 0 : lighting.max_light_index + 1;
+    out += fmt::format(" | light n={} cfg={} bump={} shadow={} c0={:08X} c1={:08X}", num_lights,
+                       static_cast<u32>(lighting.config0.config.Value()),
+                       static_cast<u32>(lighting.config0.bump_mode.Value()),
+                       lighting.config0.enable_shadow.Value(), Raw(lighting.config0),
+                       lighting.config1.raw);
+    for (u32 i = 0; i < num_lights; i++) {
+        const auto& light = lighting.light[i];
+        out += fmt::format(" L{}[s0={:06X} s1={:06X} d={:06X} a={:06X} c={:X}]", i,
+                           Raw(light.specular_0), Raw(light.specular_1), Raw(light.diffuse),
+                           Raw(light.ambient), Raw(light.config) & 0xF);
+    }
+
+    const auto textures = tex.GetTextures();
+    for (u32 i = 0; i < textures.size(); i++) {
+        if (!textures[i].enabled) {
+            continue;
+        }
+        const auto& config = textures[i].config;
+        out += fmt::format(
+            " | t{} {:08X} {}x{} f={} type={} wrap={},{} filt={},{}", i,
+            config.GetPhysicalAddress(), config.width.Value(), config.height.Value(),
+            static_cast<u32>(textures[i].format), static_cast<u32>(config.type.Value()),
+            static_cast<u32>(config.wrap_s.Value()), static_cast<u32>(config.wrap_t.Value()),
+            static_cast<u32>(config.mag_filter.Value()),
+            static_cast<u32>(config.min_filter.Value()));
+    }
+
+    out += fmt::format(" | proctex={} fog={} tev", tex.main_config.texture3_enable.Value(),
+                       static_cast<u32>(tex.fog_mode.Value()));
+    for (const auto& stage : tex.GetTevStages()) {
+        out += fmt::format(" {:X}:{:X}:{:X}:{:X}", stage.sources_raw, stage.modifiers_raw,
+                           stage.ops_raw, stage.scales_raw);
+    }
+
+    Line(std::move(out));
+}
+
+void OnVBlank() {
+    if (IsActive()) {
+        std::scoped_lock lock{mutex};
+        if (--vblanks_left == 0) {
+            active.store(false, std::memory_order_relaxed);
+            Write();
+            buffer.clear();
+        } else {
+            buffer += "=== vblank\n";
+        }
+        return;
+    }
+
+    char value[PROP_VALUE_MAX]{};
+    if (__system_property_get(TRIGGER_PROPERTY, value) <= 0) {
+        request_initialized = true;
+        return;
+    }
+    if (!request_initialized) {
+        // Ignore a value left over from before this process started.
+        request_initialized = true;
+        request = value;
+        return;
+    }
+    if (request == value) {
+        return;
+    }
+
+    std::scoped_lock lock{mutex};
+    request = value;
+    buffer.clear();
+    buffer += "=== vblank\n";
+    draw_index = 0;
+    vblanks_left = VBLANKS_PER_DUMP;
+    active.store(true, std::memory_order_relaxed);
+}
+
+} // namespace VideoCore::FrameStateDump
+
+#endif

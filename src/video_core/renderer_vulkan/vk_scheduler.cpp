@@ -6,6 +6,8 @@
 #include <utility>
 #include "common/microprofile.h"
 #include "common/thread.h"
+#include "common/trace_markers.h"
+#include "video_core/frame_state_dump.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #ifdef HAVE_LIBRETRO
@@ -65,6 +67,7 @@ void Scheduler::Flush(vk::Semaphore signal, vk::Semaphore wait) {
 }
 
 void Scheduler::Finish(vk::Semaphore signal, vk::Semaphore wait) {
+    CITRA_TRACE_SCOPE("Vulkan::Finish");
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitExecution(signal, wait);
@@ -77,6 +80,7 @@ void Scheduler::WaitWorker() {
     }
 
     MICROPROFILE_SCOPE(Vulkan_WaitForWorker);
+    CITRA_TRACE_SCOPE("Vulkan::WaitWorker");
     DispatchWork();
 
     // Ensure the queue is drained.
@@ -150,7 +154,10 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
-            work->ExecuteAll(current_cmdbuf);
+            {
+                CITRA_TRACE_SCOPE("Vulkan::ExecuteChunk");
+                work->ExecuteAll(current_cmdbuf);
+            }
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
@@ -181,9 +188,12 @@ void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wa
     const u64 signal_value = master_semaphore->NextTick();
 
     on_submit();
+    CITRA_TRACE_COUNT(Submits);
+    CITRA_FRAME_DUMP("vk submit");
 
     Record([signal_semaphore, wait_semaphore, signal_value, this](vk::CommandBuffer cmdbuf) {
         MICROPROFILE_SCOPE(Vulkan_Submit);
+        CITRA_TRACE_SCOPE("vkQueueSubmit");
         std::scoped_lock lock{submit_mutex};
         master_semaphore->SubmitWork(cmdbuf, wait_semaphore, signal_semaphore, signal_value);
     });

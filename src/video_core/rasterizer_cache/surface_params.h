@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <concepts>
 #include <boost/icl/right_open_interval.hpp>
 #include "common/math_util.h"
 #include "video_core/custom_textures/custom_format.h"
@@ -14,6 +15,70 @@ namespace VideoCore {
 using SurfaceInterval = boost::icl::right_open_interval<PAddr>;
 
 constexpr std::size_t MAX_PICA_LEVELS = 8;
+
+/**
+ * Number of host pixels per guest pixel along each axis of a surface: res_scale, or half of
+ * that along an axis marked as half. Host coordinates round down, so that guest rectangles that
+ * touch map to host rectangles that touch.
+ */
+struct SurfaceScale {
+    u32 res_scale = 1;
+    bool half_x = false;
+    bool half_y = false;
+
+    template <std::integral T>
+    [[nodiscard]] constexpr T X(T value) const noexcept {
+        return Apply(value, half_x);
+    }
+
+    template <std::integral T>
+    [[nodiscard]] constexpr T Y(T value) const noexcept {
+        return Apply(value, half_y);
+    }
+
+    [[nodiscard]] constexpr Common::Rectangle<u32> Rect(
+        const Common::Rectangle<u32>& rect) const noexcept {
+        return {X(rect.left), Y(rect.top), X(rect.right), Y(rect.bottom)};
+    }
+
+    /// Guest length that a host length covers, rounded up to whole guest pixels
+    [[nodiscard]] constexpr u32 GuestX(u32 value) const noexcept {
+        return GuestCeil(value, half_x);
+    }
+
+    [[nodiscard]] constexpr u32 GuestY(u32 value) const noexcept {
+        return GuestCeil(value, half_y);
+    }
+
+    /// Smallest guest rectangle that contains a host rectangle
+    [[nodiscard]] constexpr Common::Rectangle<u32> GuestRect(
+        const Common::Rectangle<u32>& rect) const noexcept {
+        const bool y_up = rect.top >= rect.bottom;
+        return {
+            GuestFloor(rect.left, half_x),
+            y_up ? GuestCeil(rect.top, half_y) : GuestFloor(rect.top, half_y),
+            GuestCeil(rect.right, half_x),
+            y_up ? GuestFloor(rect.bottom, half_y) : GuestCeil(rect.bottom, half_y),
+        };
+    }
+
+    constexpr bool operator==(const SurfaceScale&) const noexcept = default;
+
+private:
+    template <std::integral T>
+    [[nodiscard]] constexpr T Apply(T value, bool half) const noexcept {
+        const T scaled = value * static_cast<T>(res_scale);
+        return half ? scaled / 2 : scaled;
+    }
+
+    [[nodiscard]] constexpr u32 GuestFloor(u32 value, bool half) const noexcept {
+        return (half ? value * 2 : value) / res_scale;
+    }
+
+    [[nodiscard]] constexpr u32 GuestCeil(u32 value, bool half) const noexcept {
+        return ((half ? value * 2 : value) + res_scale - 1) / res_scale;
+    }
+};
 
 class SurfaceParams {
 public:
@@ -63,12 +128,16 @@ public:
         return VideoCore::GetFormatBpp(pixel_format);
     }
 
+    [[nodiscard]] SurfaceScale Scaling() const noexcept {
+        return {res_scale, half_scale_x, half_scale_y};
+    }
+
     [[nodiscard]] u32 GetScaledWidth() const noexcept {
-        return width * res_scale;
+        return Scaling().X(width);
     }
 
     [[nodiscard]] u32 GetScaledHeight() const noexcept {
-        return height * res_scale;
+        return Scaling().Y(height);
     }
 
     [[nodiscard]] u8 GetSampleCount() const noexcept {
@@ -109,6 +178,11 @@ public:
     u32 levels = 1;
     u32 res_scale = 1;
     u8 sample_count = 1;
+    /// The surface has half of res_scale along this axis. Set for render targets that the guest
+    /// shrinks to half size in that direction when it displays them (its form of anti-aliasing),
+    /// where the full scale would render samples that never reach the screen.
+    bool half_scale_x = false;
+    bool half_scale_y = false;
 
     bool is_tiled = false;
     TextureType texture_type = TextureType::Texture2D;

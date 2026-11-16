@@ -132,6 +132,10 @@ public:
     /// Mark region as being invalidated by region_owner (nullptr if 3DS memory)
     void InvalidateRegion(PAddr addr, u32 size, SurfaceId region_owner = {});
 
+    /// Like InvalidateRegion, for rows of row_size bytes that start every row_stride bytes. The
+    /// bytes between the rows keep their validity and owner.
+    void InvalidateRows(PAddr addr, u32 row_size, u32 row_stride, u32 rows, SurfaceId region_owner);
+
     /// Flush all cached resources tracked by this cache manager
     void FlushAll();
 
@@ -176,8 +180,10 @@ private:
     /// Computes the hash of the provided texture data.
     u64 ComputeHash(const SurfaceParams& load_info, std::span<u8> upload_data);
 
-    /// Update surface's texture for given region when necessary
-    void ValidateSurface(SurfaceId surface, PAddr addr, u32 size);
+    /// Update surface's texture for given region when necessary. With allow_download unset the
+    /// validation stops, returning false, as soon as it would have to read another surface back
+    /// from the host GPU; whatever was validated up to that point stays valid.
+    bool ValidateSurface(SurfaceId surface, PAddr addr, u32 size, bool allow_download = true);
 
     /// Copies pixel data in interval from the guest VRAM to the host GPU surface
     void UploadSurface(Surface& surface, SurfaceInterval interval);
@@ -229,6 +235,22 @@ private:
     u32 resolution_scale_factor;
     u8 sample_count;
     FramebufferParams fb_params;
+
+    /// A render target that the guest shrinks to half size with a display transfer
+    struct DownscaledTarget {
+        PAddr addr;
+        u32 width;
+        u32 height;
+        PixelFormat pixel_format;
+        bool half_x;
+        bool half_y;
+    };
+    /// Remembers how the source of a display transfer was scaled
+    void NoteDisplayTransferSource(const SurfaceParams& src_params, bool half_x, bool half_y);
+    /// Gives a render target, and the depth buffer used with it, the reduced scale it needs
+    void ApplyDownscaledTargetScale(SurfaceParams& color_params, SurfaceParams& depth_params);
+
+    std::vector<DownscaledTarget> downscaled_targets;
     Settings::TextureFilter filter;
     bool dump_textures;
     bool use_custom_textures;

@@ -2,9 +2,26 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include "video_core/pica_types.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 
 namespace Pica::Shader {
+
+std::optional<ViewportDepthRange> GetViewportDepthRange(const Pica::RasterizerRegs& regs) {
+    if (regs.depthmap_enable != Pica::RasterizerRegs::DepthBuffering::ZBuffering) {
+        return std::nullopt;
+    }
+    const float scale = f24::FromRaw(regs.viewport_depth_range).ToFloat32();
+    const float offset = f24::FromRaw(regs.viewport_depth_near_plane).ToFloat32();
+    // The rasterized depth is -z/w in [0, 1], so depth = offset - scale * rasterized_depth.
+    const float min_depth = offset;
+    const float max_depth = offset - scale;
+    const auto representable = [](float bound) { return bound >= 0.f && bound <= 1.f; };
+    if (!representable(min_depth) || !representable(max_depth)) {
+        return std::nullopt;
+    }
+    return ViewportDepthRange{min_depth, max_depth};
+}
 
 FramebufferConfig::FramebufferConfig(const Pica::RegsInternal& regs) {
     const auto& output_merger = regs.framebuffer.output_merger;

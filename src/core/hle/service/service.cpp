@@ -7,6 +7,8 @@
 #include "common/assert.h"
 #include "common/hacks/hack_manager.h"
 #include "common/logging/log.h"
+#include "common/scope_exit.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/client_port.h"
@@ -185,6 +187,22 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
 
     LOG_TRACE(Service, "{}",
               MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    // Name HLE service calls "<service>::<function>" in detail-level traces.
+    using Common::TraceMarkers::Level;
+    const bool trace = Common::TraceMarkers::IsEnabled(Level::Detail);
+    if (trace) {
+        Common::TraceMarkers::BeginSection(
+            fmt::format("{}::{}", GetServiceName(), info->name).c_str());
+    }
+    SCOPE_EXIT({
+        if (trace) {
+            Common::TraceMarkers::EndSection();
+        }
+    });
+#endif
+
     handler_invoker(this, info->handler_callback, context);
 }
 

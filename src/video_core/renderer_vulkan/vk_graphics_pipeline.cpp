@@ -7,6 +7,7 @@
 #include "common/alignment.h"
 #include "common/hash.h"
 #include "common/microprofile.h"
+#include "common/trace_markers.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -108,6 +109,12 @@ bool GraphicsPipeline::TryBuild(bool wait_built) {
 
 bool GraphicsPipeline::Build(bool fail_on_compile_required) {
     MICROPROFILE_SCOPE(Vulkan_Pipeline);
+    // The fail_on_compile_required variant only asks the driver for an already-cached pipeline.
+    CITRA_TRACE_SCOPE(fail_on_compile_required ? "Vulkan::BuildPipeline (cache probe)"
+                                               : "Vulkan::BuildPipeline");
+    if (!fail_on_compile_required) {
+        CITRA_TRACE_COUNT(PipelineBuilds);
+    }
 
     const u32 stride_alignment = instance.GetMinVertexStrideAlignment();
     std::array<vk::VertexInputBindingDescription, MAX_VERTEX_BINDINGS> bindings;
@@ -276,7 +283,10 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
             continue;
         }
 
-        shader->WaitDone();
+        if (!shader->IsDone()) {
+            CITRA_TRACE_SCOPE("Vulkan::WaitShader");
+            shader->WaitDone();
+        }
         shader_stages[shader_count++] = vk::PipelineShaderStageCreateInfo{
             .stage = MakeShaderStage(i),
             .module = shader->Handle(),

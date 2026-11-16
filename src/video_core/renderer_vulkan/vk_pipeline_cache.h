@@ -90,7 +90,10 @@ public:
     void UseTrivialGeometryShader();
 
     /// Binds a fragment shader generated from PICA state
-    void UseFragmentShader(const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user);
+    /// depth_from_viewport: the caller maps depth through the viewport depth range, so the
+    /// shader must not write depth (see Pica::Shader::GetViewportDepthRange).
+    void UseFragmentShader(const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
+                           bool depth_from_viewport);
 
     /// Queries which channels need min/max blend emulation in the fragment shader
     void QueryBlendEmulation(const Pica::RegsInternal& regs, bool& rgb_emulation,

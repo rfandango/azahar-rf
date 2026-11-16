@@ -7,6 +7,7 @@
 #include "common/memory_detect.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "video_core/gpu.h"
@@ -1136,11 +1137,13 @@ void RendererVulkan::SwapBuffers() {
 #endif
 
 #ifdef ANDROID
-    if (secondary_window) {
-        secondaryWindowEnabled = true;
-    } else {
-        secondaryWindowEnabled = false;
-    }
+    // The secondary window always exists on Android. Without a second screen it sits on a
+    // hidden display, where drawing and presenting every frame would be wasted work.
+    const bool use_secondary_window =
+        secondary_window &&
+        (secondary_window->IsVisible() ||
+         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyHiddenDisplay));
+    secondaryWindowEnabled = use_secondary_window;
 #endif
 
     const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
@@ -1163,7 +1166,7 @@ void RendererVulkan::SwapBuffers() {
 #endif
 
 #ifdef ANDROID
-    if (secondary_window) {
+    if (use_secondary_window) {
         const auto& secondary_layout = secondary_window->GetFramebufferLayout();
         if (!secondary_present_window_ptr) {
             secondary_present_window_ptr = std::make_unique<PresentWindow>(

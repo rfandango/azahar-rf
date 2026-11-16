@@ -4,10 +4,13 @@
 
 #include "common/common_paths.h"
 #include "common/file_util.h"
+#include "common/hash.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/static_lru_cache.h"
+#include "common/trace_markers.h"
 #include "common/zstd_compression.h"
+#include "video_core/frame_state_dump.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_disk_cache.h"
@@ -94,10 +97,17 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
         dst.size = src.size;
     }
 
-    const auto config_hash = config.Hash();
+    auto config_hash = config.Hash();
+
+    // Experimental variants get their own in-memory entries and never reach the disk cache.
+    const u32 variant = Common::TraceMarkers::Experiments() & Common::TraceMarkers::DumpShaders;
+    if (variant != 0) {
+        config_hash = Common::HashCombine(config_hash, u64{variant});
+    }
 
     const auto [iter_config, new_config] = programmable_vertex_map.try_emplace(config_hash);
     if (new_config) {
+        CITRA_TRACE_SCOPE("Vulkan::GenerateVS");
 
         LOG_NEW_OBJECT(Render_Vulkan, "New VS config {:016X}", config_hash);
 
@@ -112,7 +122,10 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
             return {};
         }
 
-        const u64 spirv_id = program.Hash();
+        u64 spirv_id = program.Hash();
+        if (variant != 0) {
+            spirv_id = Common::HashCombine(spirv_id, u64{variant});
+        }
 
         auto [iter_prog, new_program] =
             programmable_vertex_cache.try_emplace(spirv_id, parent.instance);
@@ -123,16 +136,31 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
 
             shader.program = std::move(program);
             const vk::Device device = parent.instance.GetDevice();
-            parent.shader_workers.QueueWork([device, &shader, this, spirv_id] {
+            parent.shader_workers.QueueWork([device, &shader, this, spirv_id, variant] {
+                CITRA_TRACE_SCOPE("Vulkan::CompileVS");
+                CITRA_TRACE_COUNT(ShaderCompiles);
                 auto spirv = CompileGLSL(shader.program, vk::ShaderStageFlagBits::eVertex);
-                AppendVSSPIRV(vs_cache, spirv, spirv_id);
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+                if (variant & Common::TraceMarkers::DumpShaders) {
+                    const std::string_view source{shader.program};
+                    VideoCore::FrameStateDump::SaveFile(fmt::format("vs-{:016X}.glsl", spirv_id),
+                                                        source.data(), source.size());
+                    VideoCore::FrameStateDump::SaveFile(fmt::format("vs-{:016X}.spv", spirv_id),
+                                                        spirv.data(), spirv.size() * sizeof(u32));
+                }
+#endif
+                if (variant == 0) {
+                    AppendVSSPIRV(vs_cache, spirv, spirv_id);
+                }
                 shader.program.clear();
                 shader.module = CompileSPV(spirv, device);
                 shader.MarkDone();
             });
         }
 
-        AppendVSConfigProgram(vs_cache, config, setup, config_hash, spirv_id);
+        if (variant == 0) {
+            AppendVSConfigProgram(vs_cache, config, setup, config_hash, spirv_id);
+        }
 
         iter_config->second = &shader;
     }
@@ -147,17 +175,29 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
 }
 
 std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
-    const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user) {
+    const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
+    bool depth_from_viewport) {
 
-    const FSConfig fs_config{regs};
-    const auto fs_config_hash = fs_config.Hash();
+    FSConfig fs_config{regs};
+    fs_config.framebuffer.depth_from_viewport.Assign(depth_from_viewport);
+    auto fs_config_hash = fs_config.Hash();
+
+    // Experimental variants get their own in-memory entries and never reach the disk cache.
+    const u32 variant = Common::TraceMarkers::Experiments() & Common::TraceMarkers::DumpShaders;
+    if (variant != 0) {
+        fs_config_hash = Common::HashCombine(fs_config_hash, u64{variant});
+    }
+
     const auto [it, new_shader] = fragment_shaders.try_emplace(fs_config_hash, parent.instance);
     auto& shader = it->second;
 
     if (new_shader) {
         LOG_NEW_OBJECT(Render_Vulkan, "New FS config {:016X}", fs_config_hash);
 
-        parent.shader_workers.QueueWork([fs_config, user, this, &shader, fs_config_hash]() {
+        parent.shader_workers.QueueWork([fs_config, user, this, &shader, fs_config_hash,
+                                         variant]() {
+            CITRA_TRACE_SCOPE("Vulkan::CompileFS");
+            CITRA_TRACE_COUNT(ShaderCompiles);
             std::vector<u32> spirv;
             const bool use_spirv = parent.profile.vk_use_spirv_generator;
             if (use_spirv && !fs_config.UsesSpirvIncompatibleConfig()) {
@@ -171,7 +211,14 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
             }
             shader.MarkDone();
 
-            if (user.IsCacheable()) {
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+            if (variant & Common::TraceMarkers::DumpShaders) {
+                VideoCore::FrameStateDump::SaveFile(fmt::format("fs-{:016X}.spv", fs_config_hash),
+                                                    spirv.data(), spirv.size() * sizeof(u32));
+            }
+#endif
+
+            if (user.IsCacheable() && variant == 0) {
                 // Only cache to disk if the user config is cacheable
                 AppendFSSPIRV(fs_cache, spirv, fs_config_hash);
                 FSConfigEntry entry{.version = FSConfigEntry::EXPECTED_VERSION,
@@ -213,6 +260,8 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFixedGeometrySh
             LOG_NEW_OBJECT(Render_Vulkan, "New GS config {:016X}", gs_config_hash);
 
             parent.shader_workers.QueueWork([gs_config, this, &shader, gs_config_hash]() {
+                CITRA_TRACE_SCOPE("Vulkan::CompileGS");
+                CITRA_TRACE_COUNT(ShaderCompiles);
                 ExtraFixedGSConfig extra;
                 extra.use_clip_planes = parent.profile.has_clip_planes;
                 extra.separable_shader = true;

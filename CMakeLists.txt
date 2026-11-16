@@ -168,6 +168,7 @@ option(ENABLE_NATIVE_OPTIMIZATION "Enables processor-specific optimizations via 
 option(CITRA_USE_PRECOMPILED_HEADERS "Use precompiled headers" ON)
 option(CITRA_WARNINGS_AS_ERRORS "Enable warnings as errors" ON)
 option(CITRA_ADDRESS_SANITIZE "Enable address sanitizer" OFF)
+option(ENABLE_PROFILING "Build with frame pointers and (on Android) trace markers for profilers" OFF)
 option(ENABLE_CCACHE "Use ccache to speed up subsequent builds" OFF)
 
 # Handle incompatible options for libretro builds
@@ -285,6 +286,26 @@ if (CITRA_ADDRESS_SANITIZE)
         add_compile_options(-fsanitize=address)
         add_link_options(-fsanitize=address)
     endif()
+endif()
+
+# Profiling support
+# =======================================================================
+if (ENABLE_PROFILING)
+    if (MSVC)
+        message(WARNING "ENABLE_PROFILING has no effect on MSVC builds")
+    else()
+        # Keep frame pointers everywhere (including externals) so sampling profilers such as
+        # simpleperf and perf can unwind cheaply and reliably with --call-graph fp.
+        add_compile_options(-fno-omit-frame-pointer)
+        if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+            add_compile_options(-mno-omit-leaf-frame-pointer)
+        endif()
+    endif()
+    if (ANDROID)
+        # Emit ATrace sections and counters (see src/common/trace_markers.h)
+        add_compile_definitions(CITRA_ENABLE_TRACE_MARKERS)
+    endif()
+    message(STATUS "Profiling support enabled")
 endif()
 
 # Check for march=native support
