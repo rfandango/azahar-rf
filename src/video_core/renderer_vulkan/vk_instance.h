@@ -166,6 +166,11 @@ public:
         return image_format_list;
     }
 
+    /// Returns true when VK_GOOGLE_display_timing is supported
+    bool IsDisplayTimingSupported() const {
+        return display_timing;
+    }
+
     /// Returns true when VK_EXT_pipeline_creation_cache_control is supported
     bool IsPipelineCreationCacheControlSupported() const {
         return pipeline_creation_cache_control;
@@ -343,6 +348,7 @@ protected:
     bool null_descriptor{};
     bool fragment_shader_interlock{};
     bool image_format_list{};
+    bool display_timing{};
     bool create_renderpass2{};
     bool depth_stencil_resolve{};
     bool pipeline_creation_cache_control{};

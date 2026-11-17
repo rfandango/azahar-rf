@@ -141,6 +141,59 @@ void DspInterface::DrainFifoBacklog(std::size_t num_frames) {
     backlog_window_frames = 0;
 }
 
+std::size_t DspInterface::PopResampled(s16* buffer, std::size_t num_frames, double ratio) {
+    // Output frame n lies at input position n * ratio. Four input frames around that position
+    // are kept, and the output is a cubic through them, between the middle two.
+    if (!resampling) {
+        resample_window.fill(last_frame);
+        resample_position = 0.0;
+        resampling = true;
+    }
+
+    const std::size_t wanted = static_cast<std::size_t>(resample_position + ratio * num_frames);
+    resample_input.resize(wanted * 2);
+    const std::size_t available = fifo.Pop(resample_input.data(), wanted);
+    std::size_t next_input = 0;
+
+    const auto advance = [&]() -> bool {
+        while (resample_position >= 1.0) {
+            if (next_input == available) {
+                return false;
+            }
+            std::copy(resample_window.begin() + 1, resample_window.end(), resample_window.begin());
+            resample_window[3] = {resample_input[2 * next_input],
+                                  resample_input[2 * next_input + 1]};
+            next_input++;
+            resample_position -= 1.0;
+        }
+        return true;
+    };
+
+    std::size_t written = 0;
+    for (; written < num_frames; written++) {
+        if (!advance()) {
+            // Ran out of input: the caller holds the last frame
+            return written;
+        }
+        const double t = resample_position;
+        for (std::size_t channel = 0; channel < 2; channel++) {
+            const double y0 = resample_window[0][channel];
+            const double y1 = resample_window[1][channel];
+            const double y2 = resample_window[2][channel];
+            const double y3 = resample_window[3][channel];
+            const double c1 = 0.5 * (y2 - y0);
+            const double c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+            const double c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+            const double value = ((c3 * t + c2) * t + c1) * t + y1;
+            buffer[2 * written + channel] = static_cast<s16>(std::clamp(value, -32768.0, 32767.0));
+        }
+        resample_position += ratio;
+    }
+    // Take in what was popped for the position reached
+    advance();
+    return written;
+}
+
 void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
     // Determine if we should stretch based on the current emulation speed.
     // TODO: Only activate audio stretching when emulation speed goes below 95% threshold
@@ -166,7 +219,18 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
             // so that they do not bleed into the next time the stretcher is enabled.
             time_stretcher.Clear();
         }
-        frames_written += fifo.Pop(buffer, num_frames - frames_written);
+        // The presentation backend may run the emulation a fraction of a percent faster or
+        // slower to keep it in step with the display. The audio it produces is then played at
+        // that speed too, rather than piling up or running out.
+        const double ratio =
+            Settings::values.enable_realtime_audio ? 1.0 : system.frame_limiter.GetPacingScale();
+        if (ratio != 1.0 && ratio > 0.98 && ratio < 1.02) {
+            frames_written +=
+                PopResampled(buffer + 2 * frames_written, num_frames - frames_written, ratio);
+        } else {
+            resampling = false;
+            frames_written += fifo.Pop(buffer, num_frames - frames_written);
+        }
         DrainFifoBacklog(num_frames);
     }
 

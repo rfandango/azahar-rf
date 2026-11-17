@@ -147,6 +147,13 @@ public:
     /// Attempts to reinterpret a rectangle of source to another rectangle of dest
     bool Reinterpret(Surface& source, Surface& dest, const VideoCore::TextureCopy& copy);
 
+    /// Returns true if RelayoutTextures can convert from source to dest
+    bool CanRelayoutTextures(const Surface& source, const Surface& dest) const noexcept;
+
+    /// Fills part of dest from source, which holds the same guest bytes with another layout
+    bool RelayoutTextures(Surface& source, Surface& dest,
+                          const VideoCore::TextureRelayout& relayout);
+
     /// Fills the rectangle of the texture with the clear value provided
     bool ClearTexture(Surface& surface, const VideoCore::TextureClear& clear);
 

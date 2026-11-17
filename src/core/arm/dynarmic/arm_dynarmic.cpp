@@ -4,7 +4,10 @@
 
 #include <csignal>
 #include <cstring>
+#include <optional>
+#include <span>
 #include <dynarmic/interface/A32/a32.h>
+#include <dynarmic/interface/code_cache.h>
 #include <dynarmic/interface/optimization_flags.h>
 #include "common/assert.h"
 #include "common/microprofile.h"
@@ -13,6 +16,7 @@
 #include "core/arm/dynarmic/arm_dynarmic_cp15.h"
 #include "core/arm/dynarmic/arm_exclusive_monitor.h"
 #include "core/arm/dynarmic/arm_tick_counts.h"
+#include "core/arm/dynarmic/jit_code_cache.h"
 #include "core/arm/exception_handler.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -175,6 +179,41 @@ public:
     ARM_Dynarmic& parent;
     Kernel::SVCContext svc_context;
     Memory::MemorySystem& memory;
+};
+
+/// The title's code cache as one core's recompilers see it. The code they produce refers to
+/// that core's coprocessor state by address; here those addresses become positions in the
+/// state, which mean the same for every core and in every run.
+class DynarmicCodeCache final : public Dynarmic::CodeCache {
+public:
+    explicit DynarmicCodeCache(JitCodeCache& store_, const CP15State& cp15_state)
+        : store{store_}, cp15_base{reinterpret_cast<u64>(&cp15_state)} {}
+
+    std::span<const std::byte> Lookup(std::uint64_t location, std::size_t index) override {
+        return store.Lookup(location, index);
+    }
+
+    void Store(std::uint64_t location, std::span<const std::byte> block) override {
+        store.Store(location, block);
+    }
+
+    std::optional<std::uint64_t> PointerToId(std::uint64_t pointer) override {
+        if (pointer < cp15_base || pointer - cp15_base >= sizeof(CP15State)) {
+            return std::nullopt;
+        }
+        return pointer - cp15_base;
+    }
+
+    std::optional<std::uint64_t> IdToPointer(std::uint64_t id) override {
+        if (id >= sizeof(CP15State)) {
+            return std::nullopt;
+        }
+        return cp15_base + id;
+    }
+
+private:
+    JitCodeCache& store;
+    u64 cp15_base;
 };
 
 ARM_Dynarmic::ARM_Dynarmic(Core::System& system_, Memory::MemorySystem& memory_, u32 core_id_,
@@ -362,6 +401,12 @@ void ARM_Dynarmic::ServeBreak([[maybe_unused]] int signal) {
 std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     Dynarmic::A32::UserConfig config;
     config.callbacks = cb.get();
+    if (!code_cache) {
+        if (JitCodeCache* const store = system.GetJitCodeCache()) {
+            code_cache = std::make_unique<DynarmicCodeCache>(*store, cp15_state);
+        }
+    }
+    config.code_cache = code_cache.get();
     if (current_page_table) {
         config.page_table = &current_page_table->GetPointerArray();
     }

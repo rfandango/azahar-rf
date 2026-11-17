@@ -4,7 +4,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <bitset>
+#include <chrono>
+#include <mutex>
 #include <unordered_set>
 
 #include "video_core/rasterizer_interface.h"
@@ -122,6 +125,15 @@ private:
     /// Stores the generated pipeline cache
     void SaveDriverPipelineDiskCache();
 
+    /// A pipeline that is not in the caches on disk yet was requested
+    void NoteNewPipeline();
+
+    /// Stores the driver's pipeline cache some time after new pipelines came up, on a worker.
+    /// The cache is otherwise only stored when the emulation shuts down in an orderly way,
+    /// which on Android is the exception: what the driver compiled would be compiled again in
+    /// the next session.
+    void SaveDriverPipelineDiskCacheWhenDue();
+
     /// Loads the shader disk cache
     void LoadDiskCache(const std::atomic_bool& stop_loading = std::atomic_bool{false},
                        const VideoCore::DiskResourceLoadCallback& callback = {});
@@ -165,6 +177,11 @@ private:
 
     Pica::Shader::Profile profile{};
     vk::UniquePipelineCache driver_pipeline_cache;
+    /// Held while the driver's cache is replaced or written out
+    std::mutex driver_cache_mutex;
+    /// Pipelines requested since the driver's cache was last stored, and when the first came
+    u32 unsaved_pipelines{};
+    std::chrono::steady_clock::time_point first_unsaved_pipeline{};
     vk::UniquePipelineLayout pipeline_layout;
     std::size_t num_worker_threads;
     Common::ThreadWorker pipeline_workers;

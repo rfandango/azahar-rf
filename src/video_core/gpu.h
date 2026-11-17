@@ -39,6 +39,7 @@ namespace VideoCore {
 constexpr u64 FRAME_TICKS = 4481136ull;
 
 class GraphicsDebugger;
+class FrameLiveness;
 class RendererBase;
 class RightEyeDisabler;
 
@@ -94,6 +95,10 @@ public:
         return *right_eye_disabler;
     }
 
+    FrameLiveness& GetFrameLiveness() {
+        return *frame_liveness;
+    }
+
     void ApplyPerProgramSettings(u64 program_ID);
 
 #ifdef ENABLE_FREECAM
@@ -124,8 +129,10 @@ private:
     void serialize(Archive& ar, const u32 file_version);
 
     std::unique_ptr<RightEyeDisabler> right_eye_disabler;
+    std::unique_ptr<FrameLiveness> frame_liveness;
 
 private:
+    friend class FrameLiveness;
     friend class RightEyeDisabler;
     struct Impl;
     std::unique_ptr<Impl> impl;

@@ -198,6 +198,82 @@ to look for:
 - How many times the scene is drawn per VBlank, and at which target sizes. Games that render
   more than one frame per VBlank are running uncapped (see the "Simulate 3DS GPU timings"
   setting).
+- `left out: nobody sees its result` lines: with "Disable Right Eye Rendering" on and one eye
+  on display, draws, copies, transfers and fills whose results never reach a displayed image
+  or the game are not carried out (`FrameLiveness`, in `src/video_core/frame_liveness.cpp`).
+  They are still listed, so a dump shows what the game asked for and what was done.
+
+The log says what is being left out: `Leaving out work nobody sees: ...` when it starts,
+`Unseen work: ...` every 300 game frames with the counts per kind, and `Work that was left
+out turned out to be needed: ...` when a guess was wrong, after which everything is rendered
+for a while. Experiment switch 524288 goes back to the former check, which only knew games
+that render one eye after the other.
+
+## Hitches and frame pacing
+
+A game can run at full speed and still stutter. `Common::Hitches` (`src/common/hitch_tracker.h`)
+tracks that, in every build while the hitch overlay is shown (in-game menu, Overlay Options,
+"Show Hitch Overlay") and always in the profiling build. It follows two things:
+
+- The emulation thread. Scopes account the wall time of each VBlank period to a category:
+  emulated CPU, GPU emulation, texture upload, shader compilation, waits for the GPU, the
+  render thread or a presentation frame, the frame limiter, and time the thread was not
+  running for no known reason. A game frame that takes clearly longer than the usual one is a
+  hitch. Its cause is the category that grew, or `game frame time` when the frame only took
+  more VBlanks of emulated time, which the host cannot change.
+- The screen (Vulkan, where `VK_GOOGLE_display_timing` exists). The display reports when each
+  image was shown, so the tracker knows for how many refreshes each game frame stayed on
+  screen. A frame that stays longer than usual is a hitch on screen: caused by the emulation
+  if that delivered the next frame late, otherwise `shown late` or `image replaced` (the next
+  image took its place in the queue before the display got to it).
+
+The overlay and a `Hitch summary` in logcat every five seconds show the same five lines:
+
+    hitches 10s: 65 on screen, 4 in emulation, worst +183 ms
+    last 0.1s ago: on screen 50.1 ms (+16.7) over 3 refreshes, shown late
+    causes 60s: shown late 239, gpu readback 5, emulated cpu 4
+    screen 60.0 Hz mailbox: 29 fps, held 2x 57%, 3x 21%, 1x 20%, 59 dropped (0 new), latency 29 ms
+    emu 29 fps, vblank 16.7 +-15.5 ms (max 39.0): cpu 3.7, gpu emu 1.7, readback 9.7, sleep 0.8
+
+Where images are paced (see below) a `pacing` line follows the `screen` line:
+
+    pacing: in step with the display, speed +0.27%, lead 23 ms (aim 23), 2 late, 0 missed
+
+`held` is the share of game frames shown for that many refreshes: a steady game has one
+value near 100%. `dropped` counts images the display never showed, `new` those that were the
+first image of a game frame. `latency` is from the emulation thread handing an image over to
+the display showing it. The `emu` line gives the VBlank period as the images were handed over,
+with its deviation, and the time per VBlank in each category.
+
+Every hitch is also logged with its numbers (`adb logcat | grep hitch_tracker`):
+
+    Hitch: frame 3144 took 63.3 ms over 2 vblanks (usual 33.4 over 2): emulated cpu +37.9 ms | cpu 43.5, ...
+    Hitch on screen: frame 1162 stayed 3 refreshes (50.0 ms, usual 2), next frame 1163 on time from emulation, shown late | ...
+
+For the path of every single image, set experiment switch 8192 (`LogPresents`, see below) for
+a few seconds: one line per image with when it was handed over, where in the display's refresh
+cycle that was, and how long it took to be queued and shown.
+
+In a system trace the same data is on the `azahar.frame_interval_us`, `azahar.frame_vblanks`
+and `azahar.hitch_ms` counter tracks.
+
+How images get to the screen (Vulkan with V-Sync on, the default):
+
+- An image is only composed and queued at VBlanks where something on a screen changed, not
+  at every VBlank.
+- Each image is given the refresh it should be shown at, from the number of its VBlank
+  (`VideoCore::FramePacer`), instead of being shown whenever the work of its VBlank happened
+  to end.
+- When the display's rate is within 1% of the console's (60 Hz against 59.83), the emulation
+  runs at the display's rate and is kept a steady time ahead of it: `speed` is that change,
+  `lead` how long before its refresh the latest of the recent images was handed over, `late`
+  the images that came after their refresh was due and `missed` the ones that were on time
+  and still shown late.
+
+Experiment switches 16384, 32768, 65536 and 131072 turn these off one by one, for comparing
+in the same scene. To get to a scene without touching the device, the profiling build loads a
+save state when `debug.azahar.load_state` changes: `adb shell setprop debug.azahar.load_state 1`
+(set it to 0 before the next request for the same slot).
 
 ## Experiment switches
 

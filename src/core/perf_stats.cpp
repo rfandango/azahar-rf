@@ -12,6 +12,7 @@
 #include <fmt/chrono.h>
 #include <fmt/format.h>
 #include "common/file_util.h"
+#include "common/hitch_tracker.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/perf_stats.h"
@@ -250,7 +251,8 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
     }
 
     auto now = Clock::now();
-    double sleep_scale = Settings::GetFrameLimit() / 100.0;
+    double sleep_scale =
+        Settings::GetFrameLimit() / 100.0 * pacing_scale.load(std::memory_order_relaxed);
 
     if (Settings::GetFrameLimit() == 0) {
         return;
@@ -269,6 +271,7 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
         std::clamp(frame_limiting_delta_err, -max_lag_time_us, max_lag_time_us);
 
     if (frame_limiting_delta_err > microseconds::zero()) {
+        const microseconds wanted = frame_limiting_delta_err;
         if (wait_callback) {
             wait_callback(std::chrono::steady_clock::now() + frame_limiting_delta_err);
         } else {
@@ -276,6 +279,11 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
         }
         auto now_after_sleep = Clock::now();
         frame_limiting_delta_err -= duration_cast<microseconds>(now_after_sleep - now);
+        if (now_after_sleep - now > wanted) {
+            Common::Hitches::MoveTime(Common::Hitches::Category::Limiter,
+                                      Common::Hitches::Category::LimiterOvershoot,
+                                      now_after_sleep - now - wanted);
+        }
         now = now_after_sleep;
     }
 

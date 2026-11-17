@@ -2,6 +2,9 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <array>
+#include <bit>
+#include <cmath>
 #include "common/arch.h"
 #include "common/archives.h"
 #include "common/microprofile.h"
@@ -11,7 +14,9 @@
 #include "core/core.h"
 #include "core/memory.h"
 #include "video_core/debug_utils/debug_utils.h"
+#include "video_core/frame_liveness.h"
 #include "video_core/frame_state_dump.h"
+#include "video_core/pica/output_vertex.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/rasterizer_interface.h"
@@ -1039,7 +1044,11 @@ void PicaCore::DrawImmediate() {
     geometry_pipeline.Setup(shader_engine.get());
     geometry_pipeline.SubmitVertex(output);
 
-    // Flush the immediate triangle.
+    // Flush the immediate triangle. Its vertices are with the rasterizer already, so it is
+    // carried out in any case.
+    if (draw_filter) {
+        draw_filter->ShouldAllowDraw(regs.internal, false, false);
+    }
     rasterizer->DrawTriangles();
     immediate.current_attribute = 0;
 
@@ -1051,6 +1060,16 @@ void PicaCore::DrawImmediate() {
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
     CITRA_TRACE_SCOPE_DETAIL("PICA::DrawArrays");
+
+    // A draw whose result nobody will see is left out. The registers were written as usual.
+    if (draw_filter) {
+        const bool replaces_target =
+            draw_filter->MayReplaceTarget(regs.internal) && CoversViewport(is_indexed);
+        if (!draw_filter->ShouldAllowDraw(regs.internal, replaces_target)) {
+            CITRA_FRAME_DUMP("draw left out: nobody sees its result");
+            return;
+        }
+    }
 
     // Track vertex in the debug recorder.
     if (debug_context) {
@@ -1130,6 +1149,112 @@ void PicaCore::DrawArrays(bool is_indexed) {
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
     }
+}
+
+bool PicaCore::CoversViewport(bool is_indexed) {
+    using Topology = PipelineRegs::TriangleTopology;
+    const auto& pipeline = regs.internal.pipeline;
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || !primitive_assembler.IsEmpty()) {
+        return false;
+    }
+    const Topology topology = pipeline.triangle_topology;
+    const u32 count = pipeline.num_vertices;
+    const bool is_list = topology == Topology::List || topology == Topology::Shader;
+    if (count != (is_list ? 6u : 4u)) {
+        return false;
+    }
+
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const u8* index_address_8 = memory.GetPhysicalPointer(base_address + index_info.offset);
+    if (is_indexed && index_address_8 == nullptr) {
+        return false;
+    }
+    const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+    const bool index_u16 = index_info.format != 0;
+
+    const VertexLoader loader(memory, pipeline);
+    ShaderUnit shader_unit;
+    shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+
+    // A full-screen pass is often drawn a fraction of a pixel off the viewport. It replaces
+    // what the target holds as long as its triangles cover the centre of every pixel, which
+    // they do with each vertex less than half a pixel inside of its corner. A pixel is one
+    // of the console's here: that is where the game means the triangles to end.
+    const f32 width = f24::FromRaw(regs.internal.rasterizer.viewport_size_x).ToFloat32() * 2.f;
+    const f32 height = f24::FromRaw(regs.internal.rasterizer.viewport_size_y).ToFloat32() * 2.f;
+    if (!(width >= 1.f && height >= 1.f)) {
+        return false;
+    }
+    constexpr f32 MAX_INSIDE = 0.45f;
+    constexpr f32 MAX_OUTSIDE = 1.f;
+    constexpr f32 DEPTH_TOLERANCE = 1e-4f;
+
+    // Where each vertex ends up, in pixels from the corner it is at (positive to the outside),
+    // and that corner: bit 0 for the right, bit 1 for the top
+    std::array<Common::Vec2<f32>, 6> offsets{};
+    std::array<u32, 6> corners{};
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        shader_unit.LoadInput(regs.internal.vs, input);
+        shader_engine->Run(vs_setup, shader_unit);
+        AttributeBuffer output;
+        shader_unit.WriteOutput(regs.internal.vs, output);
+        const OutputVertex shaded{regs.internal.rasterizer, output};
+
+        const f32 w = shaded.pos.w.ToFloat32();
+        if (!(w > 0.f)) {
+            return false;
+        }
+        // A vertex in front of or behind the depth range has its triangle cut
+        const f32 z = shaded.pos.z.ToFloat32() / w;
+        if (!(z <= DEPTH_TOLERANCE && z >= -1.f - DEPTH_TOLERANCE)) {
+            return false;
+        }
+        const f32 x = shaded.pos.x.ToFloat32() / w;
+        const f32 y = shaded.pos.y.ToFloat32() / w;
+        const Common::Vec2<f32> offset{(std::abs(x) - 1.f) * width / 2.f,
+                                       (std::abs(y) - 1.f) * height / 2.f};
+        if (!(offset.x >= -MAX_INSIDE && offset.x <= MAX_OUTSIDE && offset.y >= -MAX_INSIDE &&
+              offset.y <= MAX_OUTSIDE)) {
+            CITRA_FRAME_DUMP("  draw: vertex {} at {},{} is {},{} pixels off a corner of the "
+                             "viewport",
+                             index, x, y, offset.x, offset.y);
+            return false;
+        }
+        offsets[index] = offset;
+        corners[index] = (x > 0.f ? 1u : 0u) | (y > 0.f ? 2u : 0u);
+    }
+
+    const std::array<u32, 3> first{0, 1, 2};
+    const std::array<u32, 3> second = is_list                       ? std::array<u32, 3>{3, 4, 5}
+                                      : topology == Topology::Strip ? std::array<u32, 3>{1, 2, 3}
+                                                                    : std::array<u32, 3>{0, 2, 3};
+    // The corner a triangle lacks, if its vertices are at three different ones
+    const auto lacking = [&corners](const std::array<u32, 3>& triangle) -> s32 {
+        const u32 present = (1u << corners[triangle[0]]) | (1u << corners[triangle[1]]) |
+                            (1u << corners[triangle[2]]);
+        return std::popcount(present) == 3 ? std::countr_zero(~present & 0xFu) : -1;
+    };
+    // Two halves of the viewport along a diagonal lack corners opposite each other
+    const s32 first_lacks = lacking(first);
+    const s32 second_lacks = lacking(second);
+    if (first_lacks < 0 || second_lacks < 0 || (first_lacks ^ second_lacks) != 3) {
+        return false;
+    }
+    // No gap along that diagonal: the two triangles end in the same places
+    for (const u32 a : first) {
+        for (const u32 b : second) {
+            if (corners[a] == corners[b] && offsets[a] != offsets[b]) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void PicaCore::LoadVertices(bool is_indexed) {

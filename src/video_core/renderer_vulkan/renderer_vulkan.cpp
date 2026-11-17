@@ -137,6 +137,8 @@ RendererVulkan::RendererVulkan(Core::System& system, Pica::PicaCore& pica_,
 }
 
 RendererVulkan::~RendererVulkan() {
+    system.frame_limiter.SetPacingScale(1.0);
+
     vk::Device device = instance.GetDevice();
     scheduler.Finish();
     main_present_window.WaitPresent();
@@ -254,7 +256,7 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
 
         DrawScreens(frame, layout, flipped);
         scheduler.Flush(frame->render_ready);
-        window.Present(frame);
+        window.Present(frame, current_frame);
         if ((secondaryWindowEnabled && isSecondaryWindow) || (!secondaryWindowEnabled)) {
             Core::PerfStats::game_frames_updated = false;
             screenRendered = true;
@@ -1147,39 +1149,56 @@ void RendererVulkan::SwapBuffers() {
 #endif
 
     const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
-    PrepareRendertarget();
-    RenderScreenshot();
-    isSecondaryWindow = false;
-    RenderToWindow(main_present_window, layout, false);
+    // The image of the last VBlank again would be composed and queued a second time for
+    // nothing, and in the queue it gets in the way of the images that differ: it delays the
+    // next one or takes the place of the one before.
+    const bool present_image = ShouldPresentImage();
+    if (present_image) {
+        PrepareRendertarget();
+        RenderScreenshot();
+        isSecondaryWindow = false;
+        RenderToWindow(main_present_window, layout, false);
+    }
 #ifndef ANDROID
     if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
         ASSERT(secondary_window);
-        const auto& secondary_layout = secondary_window->GetFramebufferLayout();
-        if (!secondary_present_window_ptr) {
-            secondary_present_window_ptr = std::make_unique<PresentWindow>(
-                *secondary_window, instance, scheduler, IsLowRefreshRate());
+        if (present_image) {
+            const auto& secondary_layout = secondary_window->GetFramebufferLayout();
+            if (!secondary_present_window_ptr) {
+                secondary_present_window_ptr = std::make_unique<PresentWindow>(
+                    *secondary_window, instance, scheduler, IsLowRefreshRate());
+            }
+            isSecondaryWindow = true;
+            RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
         }
-        isSecondaryWindow = true;
-        RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
         secondary_window->PollEvents();
     }
 #endif
 
 #ifdef ANDROID
     if (use_secondary_window) {
-        const auto& secondary_layout = secondary_window->GetFramebufferLayout();
-        if (!secondary_present_window_ptr) {
-            secondary_present_window_ptr = std::make_unique<PresentWindow>(
-                *secondary_window, instance, scheduler, IsLowRefreshRate());
+        if (present_image) {
+            const auto& secondary_layout = secondary_window->GetFramebufferLayout();
+            if (!secondary_present_window_ptr) {
+                secondary_present_window_ptr = std::make_unique<PresentWindow>(
+                    *secondary_window, instance, scheduler, IsLowRefreshRate());
+            }
+            isSecondaryWindow = true;
+            RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
         }
-        isSecondaryWindow = true;
-        RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
         secondary_window->PollEvents();
     }
 #endif
-    if (!screenRendered) {
+    if (!present_image) {
+        // Nothing to show, but the GPU can start on what was drawn so far
+        scheduler.Flush();
+    } else if (!screenRendered) {
         scheduler.Finish();
     }
+
+    // Where the window can tell when images reach the display, it keeps VBlanks in step with
+    // the refreshes of that display
+    system.frame_limiter.SetPacingScale(main_present_window.SpeedScale());
 
     system.perf_stats->EndSwap();
     rasterizer.TickFrame();

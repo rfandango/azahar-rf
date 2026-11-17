@@ -115,6 +115,16 @@ public:
     /// Queues the provided frame for presentation.
     void Present(Frame* frame);
 
+    /// Same, for the image of a given VBlank. The frontend paces frames here.
+    void Present(Frame* frame, [[maybe_unused]] u64 vblank) {
+        Present(frame);
+    }
+
+    /// Emulation speed that keeps VBlanks in step with the display: not followed here.
+    double SpeedScale() const {
+        return 1.0;
+    }
+
     /// This is called to notify the rendering backend of a surface change
     void NotifySurfaceChanged();
 

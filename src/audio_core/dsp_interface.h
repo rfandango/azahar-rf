@@ -4,10 +4,12 @@
 
 #pragma once
 
+#include <array>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <vector>
 #include <boost/serialization/access.hpp>
 #include "audio_core/audio_types.h"
 #include "audio_core/time_stretch.h"
@@ -120,6 +122,7 @@ private:
     void FlushResidualStretcherAudio();
     void OutputCallback(s16* buffer, std::size_t num_frames);
     void DrainFifoBacklog(std::size_t num_frames);
+    std::size_t PopResampled(s16* buffer, std::size_t num_frames, double ratio);
     void MixCsnd(std::span<std::array<s16, 2>> samples);
     void PushSamples(std::span<const std::array<s16, 2>> samples);
 
@@ -132,6 +135,13 @@ private:
     std::array<s16, 2> last_frame{};
     std::size_t fifo_low_fill = std::numeric_limits<std::size_t>::max();
     std::size_t backlog_window_frames = 0;
+
+    /// Resampling by a ratio close to one, see PopResampled: the four frames around the
+    /// position of the next output frame, and that position between the middle two
+    std::array<std::array<s16, 2>, 4> resample_window{};
+    double resample_position = 0.0;
+    bool resampling = false;
+    std::vector<s16> resample_input;
     TimeStretcher time_stretcher;
     std::unique_ptr<Sink> sink;
 

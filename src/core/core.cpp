@@ -13,6 +13,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/tar_file.h"
+#include "common/trace_markers.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/hle/service/am/am.h"
@@ -22,6 +23,7 @@
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #endif
+#include "core/arm/dynarmic/jit_code_cache.h"
 #include "core/arm/dyncom/arm_dyncom.h"
 #ifdef HAVE_FASTINTERP
 #include "core/arm/fastinterp/fastinterp.h"
@@ -623,6 +625,22 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     cpu_cores.reserve(num_cores);
     if (Settings::values.use_cpu_jit) {
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
+#if CITRA_ARCH(arm64)
+        // The code the recompiler produces is kept per title, across loads of a save state and
+        // for later sessions. Only the arm64 recompiler can make use of it.
+        u64 program_id = 0;
+        if (app_loader) {
+            app_loader->ReadProgramId(program_id);
+        }
+        const bool keep_code = program_id != 0 && !(Common::TraceMarkers::Experiments() &
+                                                    Common::TraceMarkers::NoJitCodeCache);
+        if (!keep_code) {
+            jit_code_cache.reset();
+        } else if (!jit_code_cache || jit_code_cache->GetProgramId() != program_id) {
+            jit_code_cache.reset();
+            jit_code_cache = std::make_unique<JitCodeCache>(program_id);
+        }
+#endif
         for (u32 i = 0; i < num_cores; ++i) {
             cpu_cores.push_back(std::make_shared<ARM_Dynarmic>(
                 *this, *memory, i, timing->GetTimer(i), *exclusive_monitor));
@@ -822,6 +840,14 @@ void System::Shutdown(bool is_deserializing) {
     dsp_core.reset();
     kernel.reset();
     cpu_cores.clear();
+    if (jit_code_cache) {
+        if (is_deserializing) {
+            // Kept for the cores that are about to be made again
+            jit_code_cache->Flush();
+        } else {
+            jit_code_cache.reset();
+        }
+    }
     exclusive_monitor.reset();
     timing.reset();
 

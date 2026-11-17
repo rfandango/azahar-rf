@@ -5,6 +5,7 @@
 #include "common/common_paths.h"
 #include "common/file_util.h"
 #include "common/hash.h"
+#include "common/hitch_tracker.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/static_lru_cache.h"
@@ -108,6 +109,7 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
     const auto [iter_config, new_config] = programmable_vertex_map.try_emplace(config_hash);
     if (new_config) {
         CITRA_TRACE_SCOPE("Vulkan::GenerateVS");
+        CITRA_HITCH_SCOPE(ShaderCompile);
 
         LOG_NEW_OBJECT(Render_Vulkan, "New VS config {:016X}", config_hash);
 
@@ -138,6 +140,7 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
             const vk::Device device = parent.instance.GetDevice();
             parent.shader_workers.QueueWork([device, &shader, this, spirv_id, variant] {
                 CITRA_TRACE_SCOPE("Vulkan::CompileVS");
+                CITRA_HITCH_SCOPE(ShaderCompile);
                 CITRA_TRACE_COUNT(ShaderCompiles);
                 auto spirv = CompileGLSL(shader.program, vk::ShaderStageFlagBits::eVertex);
 #ifdef CITRA_ENABLE_TRACE_MARKERS
@@ -197,6 +200,7 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
         parent.shader_workers.QueueWork([fs_config, user, this, &shader, fs_config_hash,
                                          variant]() {
             CITRA_TRACE_SCOPE("Vulkan::CompileFS");
+            CITRA_HITCH_SCOPE(ShaderCompile);
             CITRA_TRACE_COUNT(ShaderCompiles);
             std::vector<u32> spirv;
             const bool use_spirv = parent.profile.vk_use_spirv_generator;
@@ -261,6 +265,7 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFixedGeometrySh
 
             parent.shader_workers.QueueWork([gs_config, this, &shader, gs_config_hash]() {
                 CITRA_TRACE_SCOPE("Vulkan::CompileGS");
+                CITRA_HITCH_SCOPE(ShaderCompile);
                 CITRA_TRACE_COUNT(ShaderCompiles);
                 ExtraFixedGSConfig extra;
                 extra.use_clip_planes = parent.profile.has_clip_planes;
@@ -306,6 +311,7 @@ GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
 
     if (known_graphic_pipelines.emplace(hash).second) {
         LOG_NEW_OBJECT(Render_Vulkan, "New Pipeline {:016X}", hash);
+        parent.NoteNewPipeline();
 
         PLConfigEntry entry{
             .version = PLConfigEntry::EXPECTED_VERSION,

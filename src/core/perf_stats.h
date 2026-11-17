@@ -213,6 +213,18 @@ public:
      */
     void SetWaitCallback(WaitCallback callback);
 
+    /**
+     * Scales the speed the emulation is limited to, for the presentation backend to keep
+     * emulated VBlanks in step with the refreshes of the display. 1 for the configured speed.
+     */
+    void SetPacingScale(double scale) {
+        pacing_scale.store(scale, std::memory_order_relaxed);
+    }
+
+    double GetPacingScale() const {
+        return pacing_scale.load(std::memory_order_relaxed);
+    }
+
 private:
     void WaitForFrameAdvance();
 
@@ -228,6 +240,9 @@ private:
 
     /// Whether to use frame advancing (i.e. frame by frame)
     std::atomic_bool frame_advancing_enabled;
+
+    /// Factor on the speed limit, see SetPacingScale
+    std::atomic<double> pacing_scale{1.0};
 
     /// Event to advance the frame when frame advancing is enabled
     Common::Event frame_advance_event;

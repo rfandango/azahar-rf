@@ -12,6 +12,7 @@
 namespace VideoCore {
 struct TextureBlit;
 struct TextureCopy;
+struct TextureRelayout;
 struct BufferTextureCopy;
 } // namespace VideoCore
 
@@ -35,6 +36,9 @@ public:
     bool BlitDepthStencil(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit);
 
     bool ConvertDS24S8ToRGBA8(Surface& source, Surface& dest, const VideoCore::TextureCopy& copy);
+
+    /// Fills part of dest from source, which holds the same guest bytes with another layout
+    bool Relayout(Surface& source, Surface& dest, const VideoCore::TextureRelayout& relayout);
 
     bool DepthToBuffer(Surface& source, vk::Buffer buffer,
                        const VideoCore::BufferTextureCopy& copy);
@@ -78,6 +82,7 @@ private:
     DescriptorHeap single_texture_provider;
     DescriptorHeap three_textures_provider;
     vk::PipelineLayout compute_pipeline_layout;
+    vk::PipelineLayout relayout_pipeline_layout;
     vk::PipelineLayout compute_buffer_pipeline_layout;
     vk::PipelineLayout two_textures_pipeline_layout;
     vk::PipelineLayout single_texture_pipeline_layout;
@@ -87,6 +92,8 @@ private:
     vk::ShaderModule d24s8_to_rgba8_comp;
     vk::ShaderModule d24s8_to_rgba8_ms_comp;
     vk::ShaderModule depth_to_buffer_comp;
+    vk::ShaderModule relayout_color_comp;
+    vk::ShaderModule relayout_depth_comp;
     vk::ShaderModule blit_depth_stencil_frag;
     vk::ShaderModule bicubic_frag;
     vk::ShaderModule scale_force_frag;
@@ -97,6 +104,8 @@ private:
     vk::Pipeline d24s8_to_rgba8_pipeline;
     vk::Pipeline d24s8_to_rgba8_ms_pipeline;
     vk::Pipeline depth_to_buffer_pipeline;
+    vk::Pipeline relayout_color_pipeline;
+    vk::Pipeline relayout_depth_pipeline;
     vk::Pipeline depth_blit_pipeline;
     vk::Sampler linear_sampler;
     vk::Sampler nearest_sampler;

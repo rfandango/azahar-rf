@@ -1,0 +1,95 @@
+// Copyright Citra Emulator Project / Azahar Emulator Project
+// Licensed under GPLv2 or any later version
+// Refer to the license.txt file included.
+
+// Fills part of an RGBA8 surface from another surface that holds the same guest bytes with a
+// different layout: another width, tiled or linear, or (with DEPTH_SOURCE) depth and stencil.
+
+#version 450 core
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#ifdef DEPTH_SOURCE
+layout(set = 0, binding = 0) uniform highp texture2D depth;
+layout(set = 0, binding = 1) uniform lowp utexture2D stencil;
+#else
+layout(set = 0, binding = 0) uniform highp texture2D source;
+#endif
+layout(set = 0, binding = 2, rgba8) uniform highp writeonly image2D dest;
+
+layout(push_constant, std140) uniform RelayoutInfo {
+    highp ivec2 dst_offset;  // Host texel of the first invocation
+    highp ivec2 dst_extent;  // Host texels to go through
+    highp int dst_scale;     // Host texels per guest pixel
+    highp int src_scale;
+    highp int dst_width;     // Guest size and layout of the destination
+    highp int dst_height;
+    highp int dst_tiled;
+    highp int src_width;     // Guest size and layout of the source
+    highp int src_height;
+    highp int src_tiled;
+    highp int pixel_delta;   // Index of a guest pixel in the source minus its index in the
+                             // destination
+    highp int first_pixel;   // Destination pixel indices to fill
+    highp int end_pixel;
+};
+
+// Tiled surfaces are stored as rows of 8x8 tiles from the top of the image down, with the
+// pixels of a tile in Z-order. Linear surfaces are stored row by row from the bottom up.
+// Positions are in guest pixels with y pointing up, as in the host images.
+
+highp int PixelIndex(highp ivec2 pos, highp int width, highp int height, highp int tiled) {
+    if (tiled == 0) {
+        return pos.y * width + pos.x;
+    }
+    highp int row = height - 1 - pos.y;
+    highp int x = pos.x & 7;
+    highp int y = row & 7;
+    highp int in_tile = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) |
+                        ((x & 4) << 2) | ((y & 4) << 3);
+    return ((row >> 3) * (width >> 3) + (pos.x >> 3)) * 64 + in_tile;
+}
+
+highp ivec2 PixelPosition(highp int index, highp int width, highp int height, highp int tiled) {
+    if (tiled == 0) {
+        return ivec2(index % width, index / width);
+    }
+    highp int tile = index >> 6;
+    highp int in_tile = index & 63;
+    highp int x = (in_tile & 1) | ((in_tile >> 1) & 2) | ((in_tile >> 2) & 4);
+    highp int y = ((in_tile >> 1) & 1) | ((in_tile >> 2) & 2) | ((in_tile >> 3) & 4);
+    highp int tiles_per_row = width >> 3;
+    highp int row = (tile / tiles_per_row) * 8 + y;
+    return ivec2((tile % tiles_per_row) * 8 + x, height - 1 - row);
+}
+
+void main() {
+    highp ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(local, dst_extent))) {
+        return;
+    }
+    highp ivec2 dst_coord = dst_offset + local;
+    highp ivec2 dst_pixel = dst_coord / dst_scale;
+    highp ivec2 in_pixel = dst_coord - dst_pixel * dst_scale;
+
+    highp int dst_index = PixelIndex(dst_pixel, dst_width, dst_height, dst_tiled);
+    if (dst_index < first_pixel || dst_index >= end_pixel) {
+        return;
+    }
+    highp int src_index = dst_index + pixel_delta;
+    if (src_index < 0 || src_index >= src_width * src_height) {
+        return;
+    }
+    highp ivec2 src_coord = PixelPosition(src_index, src_width, src_height, src_tiled) * src_scale +
+                            in_pixel * src_scale / dst_scale;
+
+#ifdef DEPTH_SOURCE
+    highp uint depth_val = uint(texelFetch(depth, src_coord, 0).x * (exp2(32.0) - 1.0));
+    lowp uint stencil_val = texelFetch(stencil, src_coord, 0).x;
+    highp uvec4 components =
+        uvec4(stencil_val, (uvec3(depth_val) >> uvec3(24u, 16u, 8u)) & 0x000000FFu);
+    imageStore(dest, dst_coord, vec4(components) / (exp2(8.0) - 1.0));
+#else
+    imageStore(dest, dst_coord, texelFetch(source, src_coord, 0));
+#endif
+}

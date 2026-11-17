@@ -3,6 +3,7 @@
 
 #include <limits>
 #include <mutex>
+#include "common/hitch_tracker.h"
 #include "common/trace_markers.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -50,6 +51,7 @@ void MasterSemaphoreTimeline::Wait(u64 tick) {
 
     // If none of the above is hit, fallback to a regular wait
     CITRA_TRACE_SCOPE("Vulkan::WaitGpu");
+    CITRA_HITCH_SCOPE(GpuWait);
     CITRA_TRACE_COUNT(GpuWaits);
     const vk::SemaphoreWaitInfoKHR wait_info = {
         .semaphoreCount = 1,
@@ -129,6 +131,7 @@ void MasterSemaphoreFence::Wait(u64 tick) {
         return;
     }
     CITRA_TRACE_SCOPE("Vulkan::WaitGpu");
+    CITRA_HITCH_SCOPE(GpuWait);
     CITRA_TRACE_COUNT(GpuWaits);
     free_cv.wait(lk, is_free);
 }

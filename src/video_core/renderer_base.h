@@ -100,6 +100,12 @@ public:
         return settings;
     }
 
+    /// Something that shows on a screen changed: a buffer swap, a write into a buffer on
+    /// display, a display register.
+    void NotifyScreenChanged() {
+        screen_revision++;
+    }
+
     /// Returns true if a screenshot is being processed
     [[nodiscard]] bool IsScreenshotPending() const;
 
@@ -112,6 +118,10 @@ protected:
     /// Called on VBlanks where the guest application submits a frame.
     virtual void LimitFramesAheadOfGpu() {}
 
+    /// Whether the image composed at this VBlank can differ from the one composed last. To be
+    /// called once per VBlank.
+    bool ShouldPresentImage();
+
     Core::System& system;
     RendererSettings settings;
     Frontend::EmuWindow& render_window;    /// Reference to the render window handle.
@@ -123,6 +133,12 @@ protected:
 
 private:
     u64 limited_game_frames = 0; /// Guest frame count at the last LimitFramesAheadOfGpu call
+
+    u32 screen_revision = 1;    /// Counts the changes NotifyScreenChanged was told about
+    u32 presented_revision = 0; /// Its value at the last VBlank
+    u32 unchanged_vblanks = 0;  /// VBlanks since the last change
+    Layout::FramebufferLayout presented_layout{};
+    Layout::FramebufferLayout presented_secondary_layout{};
 };
 
 } // namespace VideoCore

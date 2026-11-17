@@ -147,6 +147,7 @@ object SettingKeys {
     external fun performance_overlay_show_available_ram(): String
     external fun performance_overlay_show_battery_temp(): String
     external fun performance_overlay_background(): String
+    external fun hitch_overlay_enable(): String
     external fun use_frame_limit(): String
     external fun android_hide_images(): String
     external fun screen_orientation(): String

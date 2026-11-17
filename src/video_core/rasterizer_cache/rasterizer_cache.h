@@ -8,6 +8,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
 #include "common/alignment.h"
+#include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
@@ -15,6 +16,7 @@
 #include "common/trace_markers.h"
 #include "core/memory.h"
 #include "video_core/custom_textures/custom_tex_manager.h"
+#include "video_core/frame_liveness.h"
 #include "video_core/frame_state_dump.h"
 #include "video_core/pica/regs_external.h"
 #include "video_core/pica/regs_internal.h"
@@ -1210,6 +1212,14 @@ bool RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
             continue;
         }
 
+        // Games reuse memory for surfaces of another shape, so the newest contents of this
+        // region can sit in surfaces that lay the same bytes out differently. Convert those on
+        // the host GPU.
+        if (ValidateByRelayout(surface_id, params.GetInterval())) {
+            notify_validated(params.GetInterval());
+            continue;
+        }
+
         // Last resort: take the data from guest memory. If another surface holds the newest
         // data for this region, the flush downloads it from the GPU first, which has to wait
         // for the GPU to finish everything queued so far.
@@ -1252,6 +1262,7 @@ template <class T>
 void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interval) {
     MICROPROFILE_SCOPE(RasterizerCache_UploadSurface);
     CITRA_TRACE_SCOPE("Surface::Upload");
+    CITRA_HITCH_SCOPE(TextureUpload);
     CITRA_TRACE_COUNT(SurfaceUploads);
 
     const SurfaceParams load_info = surface.FromInterval(interval);
@@ -1423,6 +1434,7 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
     MICROPROFILE_SCOPE(RasterizerCache_DownloadSurface);
     // GPU -> guest memory readback; typically forces the CPU to wait for the GPU.
     CITRA_TRACE_SCOPE("Surface::Download");
+    CITRA_HITCH_SCOPE_ABSORB(GpuReadback);
     CITRA_TRACE_COUNT(SurfaceDownloads);
 
     const SurfaceParams flush_info = surface.FromInterval(interval);
@@ -1493,6 +1505,68 @@ void RasterizerCache<T>::DownloadFillSurface(Surface& surface, SurfaceInterval i
     if (backup_bytes) {
         std::memcpy(&dest_ptr[coarse_start_offset], &backup_data[0], backup_bytes);
     }
+}
+
+template <class T>
+bool RasterizerCache<T>::ValidateByRelayout(SurfaceId surface_id, const SurfaceInterval& interval) {
+    if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyLayoutReadback) {
+        return false;
+    }
+
+    Surface& surface = slot_surfaces[surface_id];
+    if (surface.levels != 1 || surface.stride != surface.width ||
+        surface.texture_type != TextureType::Texture2D || surface.half_scale_x ||
+        surface.half_scale_y) {
+        return false;
+    }
+    const u32 pixel_size = surface.BytesInPixels(1);
+    const auto pixel_aligned = [&](PAddr addr) { return (addr - surface.addr) % pixel_size == 0; };
+
+    // Everything the surface is missing in the interval must come from surfaces that can be
+    // converted. Nothing may have to come from guest memory, as an upload works in rectangles
+    // and would overwrite what is converted.
+    const SurfaceRegions wanted = surface.invalid_regions & interval;
+    SurfaceRegions missing = wanted;
+    boost::container::small_vector<std::pair<SurfaceInterval, SurfaceId>, 4> sources;
+    for (const auto& [region, owner_id] : RangeFromInterval(dirty_regions, interval)) {
+        const SurfaceInterval part = region & interval;
+        // What the surface already has needs no source, whoever holds the newest copy.
+        if (owner_id == surface_id || (wanted & part).empty()) {
+            continue;
+        }
+        const Surface& owner = slot_surfaces[owner_id];
+        if (owner.type == SurfaceType::Fill || owner.levels != 1 || owner.stride != owner.width ||
+            owner.texture_type != TextureType::Texture2D || owner.BytesInPixels(1) != pixel_size ||
+            owner.half_scale_x || owner.half_scale_y || !pixel_aligned(owner.addr) ||
+            !pixel_aligned(part.lower()) || !pixel_aligned(part.upper()) ||
+            !runtime.CanRelayoutTextures(owner, surface)) {
+            return false;
+        }
+        missing -= part;
+        sources.emplace_back(part, owner_id);
+    }
+    if (sources.empty() || !missing.empty()) {
+        return false;
+    }
+
+    for (const auto& [part, owner_id] : sources) {
+        Surface& owner = slot_surfaces[owner_id];
+        CITRA_FRAME_DUMP("cache relayout {} {}x{} t{} @{:08X} -> {} {}x{} t{} @{:08X} "
+                         "[{:08X}-{:08X}]",
+                         PixelFormatAsString(owner.pixel_format), owner.width, owner.height,
+                         static_cast<u32>(owner.type), owner.addr,
+                         PixelFormatAsString(surface.pixel_format), surface.width, surface.height,
+                         static_cast<u32>(surface.type), surface.addr, part.lower(), part.upper());
+        const TextureRelayout relayout = {
+            .dst_rect = surface.GetScaledSubRect(surface.FromInterval(part)),
+            .pixel_delta = (static_cast<s32>(surface.addr) - static_cast<s32>(owner.addr)) /
+                           static_cast<s32>(pixel_size),
+            .first_pixel = (part.lower() - surface.addr) / pixel_size,
+            .end_pixel = (part.upper() - surface.addr) / pixel_size,
+        };
+        runtime.RelayoutTextures(owner, surface, relayout);
+    }
+    return true;
 }
 
 template <class T>
@@ -1585,6 +1659,12 @@ template <class T>
 void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surface_id) {
     if (size == 0) [[unlikely]] {
         return;
+    }
+
+    // What is in guest memory after this gets read. Putting everything there, as before a
+    // save state, is not the game reading it.
+    if (size != 0xFFFFFFFF) {
+        FrameLiveness::NoteGuestRead(addr, size);
     }
 
     const SurfaceInterval flush_interval(addr, addr + size);

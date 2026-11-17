@@ -75,6 +75,7 @@ class AppLoader;
 namespace Core {
 
 class ARM_Interface;
+class JitCodeCache;
 class ExclusiveMonitor;
 class Timing;
 
@@ -328,6 +329,11 @@ public:
     std::unique_ptr<PerfStats> perf_stats;
     FrameLimiter frame_limiter;
 
+    /// The code the recompiler produced for the running title, where that is kept
+    [[nodiscard]] JitCodeCache* GetJitCodeCache() const {
+        return jit_code_cache.get();
+    }
+
     void SetStatus(ResultStatus new_status, const char* details = nullptr) {
         status = new_status;
         if (details) {
@@ -490,6 +496,8 @@ private:
     std::string inserted_cartridge;
 
     /// ARM11 CPU core
+    /// Declared before the cores, which use it for as long as they exist
+    std::unique_ptr<JitCodeCache> jit_code_cache;
     std::vector<std::shared_ptr<ARM_Interface>> cpu_cores;
     ARM_Interface* running_core = nullptr;
 

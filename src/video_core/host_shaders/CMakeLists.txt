@@ -9,6 +9,7 @@ set(SHADER_FILES
     format_reinterpreter/rgba4_to_rgb5a1_ms.frag
     format_reinterpreter/vulkan_d24s8_to_rgba8.comp
     format_reinterpreter/vulkan_d24s8_to_rgba8_ms.comp
+    format_reinterpreter/vulkan_relayout.comp
     texture_filtering/bicubic.frag
     texture_filtering/refine.frag
     texture_filtering/scale_force.frag

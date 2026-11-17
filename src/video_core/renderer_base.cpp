@@ -2,6 +2,7 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include "common/hitch_tracker.h"
 #include "common/settings.h"
 #include "common/trace_markers.h"
 #include "core/core.h"
@@ -47,12 +48,56 @@ void RendererBase::UpdateCurrentFramebufferLayout(bool is_portrait_mode) {
     }
 }
 
+namespace {
+
+/// VBlanks without a known change after which an image is presented at every VBlank again. A
+/// game that stopped swapping buffers may be drawing into the ones on display, and what else
+/// goes into the image (settings, for one) is not followed either.
+constexpr u32 MAX_UNCHANGED_VBLANKS = 6;
+
+bool SameLayout(const Layout::FramebufferLayout& a, const Layout::FramebufferLayout& b) {
+    return a.width == b.width && a.height == b.height &&
+           a.top_screen_enabled == b.top_screen_enabled &&
+           a.bottom_screen_enabled == b.bottom_screen_enabled && a.top_screen == b.top_screen &&
+           a.bottom_screen == b.bottom_screen && a.is_rotated == b.is_rotated &&
+           a.additional_screen_enabled == b.additional_screen_enabled &&
+           a.additional_screen_is_bottom == b.additional_screen_is_bottom &&
+           a.additional_screen == b.additional_screen && a.top_opacity == b.top_opacity &&
+           a.bottom_opacity == b.bottom_opacity;
+}
+
+} // Anonymous namespace
+
+bool RendererBase::ShouldPresentImage() {
+    const bool screen_changed = screen_revision != presented_revision;
+    presented_revision = screen_revision;
+    unchanged_vblanks = screen_changed ? 0 : unchanged_vblanks + 1;
+
+    const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
+    bool layout_changed = !SameLayout(layout, presented_layout);
+    presented_layout = layout;
+    if (secondary_window) {
+        const Layout::FramebufferLayout& secondary = secondary_window->GetFramebufferLayout();
+        layout_changed |= !SameLayout(secondary, presented_secondary_layout);
+        presented_secondary_layout = secondary;
+    }
+
+    const bool requested = settings.screenshot_requested || settings.bg_color_update_requested ||
+                           settings.shader_update_requested;
+    const bool legacy =
+        Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyPresentRepeats;
+
+    return screen_changed || layout_changed || requested ||
+           unchanged_vblanks >= MAX_UNCHANGED_VBLANKS || legacy;
+}
+
 void RendererBase::EndFrame() {
     // One "EmuFrame" async slice per emulated VBlank period, excluding GPU throttling and frame
     // limiting below.
     CITRA_TRACE_ASYNC_END("EmuFrame", current_frame);
     CITRA_TRACE_END_FRAME();
     CITRA_FRAME_DUMP_VBLANK();
+    Common::Hitches::EndVBlank();
 
     current_frame++;
 
@@ -68,12 +113,14 @@ void RendererBase::EndFrame() {
         limited_game_frames = game_frames;
         if (Settings::values.use_limit_frames_ahead_of_gpu.GetValue()) {
             CITRA_TRACE_SCOPE("LimitFramesAheadOfGpu");
+            CITRA_HITCH_SCOPE_ABSORB(GpuBehind);
             LimitFramesAheadOfGpu();
         }
     }
 
     {
         CITRA_TRACE_SCOPE("FrameLimiter");
+        CITRA_HITCH_SCOPE_ABSORB(Limiter);
         system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
     }
 

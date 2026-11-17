@@ -15,6 +15,7 @@
 
 #include "video_core/host_shaders/format_reinterpreter/vulkan_d24s8_to_rgba8_comp.h"
 #include "video_core/host_shaders/format_reinterpreter/vulkan_d24s8_to_rgba8_ms_comp.h"
+#include "video_core/host_shaders/format_reinterpreter/vulkan_relayout_comp.h"
 #include "video_core/host_shaders/full_screen_triangle_vert.h"
 #include "video_core/host_shaders/vulkan_blit_depth_stencil_frag.h"
 #include "video_core/host_shaders/vulkan_depth_to_buffer_comp.h"
@@ -50,6 +51,29 @@ inline constexpr vk::PushConstantRange COMPUTE_PUSH_CONSTANT_RANGE{
     .stageFlags = vk::ShaderStageFlagBits::eCompute,
     .offset = 0,
     .size = sizeof(ComputeInfo),
+};
+
+/// Matches RelayoutInfo in vulkan_relayout.comp
+struct RelayoutInfo {
+    Common::Vec2i dst_offset;
+    Common::Vec2i dst_extent;
+    s32 dst_scale;
+    s32 src_scale;
+    s32 dst_width;
+    s32 dst_height;
+    s32 dst_tiled;
+    s32 src_width;
+    s32 src_height;
+    s32 src_tiled;
+    s32 pixel_delta;
+    s32 first_pixel;
+    s32 end_pixel;
+};
+
+inline constexpr vk::PushConstantRange RELAYOUT_PUSH_CONSTANT_RANGE{
+    .stageFlags = vk::ShaderStageFlagBits::eCompute,
+    .offset = 0,
+    .size = sizeof(RelayoutInfo),
 };
 
 constexpr std::array<vk::DescriptorSetLayoutBinding, 3> COMPUTE_BINDINGS = {{
@@ -237,6 +261,12 @@ BlitHelper::BlitHelper(const Instance& instance_, Scheduler& scheduler_,
                               16},
       compute_pipeline_layout{
           device.createPipelineLayout(PipelineLayoutCreateInfo(&compute_provider.Layout(), true))},
+      relayout_pipeline_layout{device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
+          .setLayoutCount = 1,
+          .pSetLayouts = &compute_provider.Layout(),
+          .pushConstantRangeCount = 1,
+          .pPushConstantRanges = &RELAYOUT_PUSH_CONSTANT_RANGE,
+      })},
       compute_buffer_pipeline_layout{device.createPipelineLayout(
           PipelineLayoutCreateInfo(&compute_buffer_provider.Layout(), true))},
       two_textures_pipeline_layout{
@@ -255,6 +285,11 @@ BlitHelper::BlitHelper(const Instance& instance_, Scheduler& scheduler_,
                                  : VK_NULL_HANDLE},
       depth_to_buffer_comp{Compile(HostShaders::VULKAN_DEPTH_TO_BUFFER_COMP,
                                    vk::ShaderStageFlagBits::eCompute, device)},
+      relayout_color_comp{
+          Compile(HostShaders::VULKAN_RELAYOUT_COMP, vk::ShaderStageFlagBits::eCompute, device)},
+      relayout_depth_comp{Compile(HostShaders::VULKAN_RELAYOUT_COMP,
+                                  vk::ShaderStageFlagBits::eCompute, device,
+                                  "#define DEPTH_SOURCE\n")},
       blit_depth_stencil_frag{VK_NULL_HANDLE},
       // Texture filtering shader modules
       bicubic_frag{Compile(HostShaders::BICUBIC_FRAG, vk::ShaderStageFlagBits::eFragment, device)},
@@ -271,6 +306,8 @@ BlitHelper::BlitHelper(const Instance& instance_, Scheduler& scheduler_,
               : VK_NULL_HANDLE},
       depth_to_buffer_pipeline{
           MakeComputePipeline(depth_to_buffer_comp, compute_buffer_pipeline_layout)},
+      relayout_color_pipeline{MakeComputePipeline(relayout_color_comp, relayout_pipeline_layout)},
+      relayout_depth_pipeline{MakeComputePipeline(relayout_depth_comp, relayout_pipeline_layout)},
       depth_blit_pipeline{VK_NULL_HANDLE},
       linear_sampler{device.createSampler(SAMPLER_CREATE_INFO<vk::Filter::eLinear>)},
       nearest_sampler{device.createSampler(SAMPLER_CREATE_INFO<vk::Filter::eNearest>)} {
@@ -320,6 +357,7 @@ BlitHelper::~BlitHelper() {
     }
     filter_pipeline_cache.clear();
     device.destroyPipelineLayout(compute_pipeline_layout);
+    device.destroyPipelineLayout(relayout_pipeline_layout);
     device.destroyPipelineLayout(compute_buffer_pipeline_layout);
     device.destroyPipelineLayout(two_textures_pipeline_layout);
     device.destroyPipelineLayout(single_texture_pipeline_layout);
@@ -330,6 +368,8 @@ BlitHelper::~BlitHelper() {
         device.destroyShaderModule(d24s8_to_rgba8_ms_comp);
     }
     device.destroyShaderModule(depth_to_buffer_comp);
+    device.destroyShaderModule(relayout_color_comp);
+    device.destroyShaderModule(relayout_depth_comp);
     if (blit_depth_stencil_frag) {
         device.destroyShaderModule(blit_depth_stencil_frag);
     }
@@ -340,6 +380,8 @@ BlitHelper::~BlitHelper() {
     device.destroyShaderModule(mmpx_frag);
     device.destroyShaderModule(refine_frag);
     device.destroyPipeline(depth_to_buffer_pipeline);
+    device.destroyPipeline(relayout_color_pipeline);
+    device.destroyPipeline(relayout_depth_pipeline);
     device.destroyPipeline(d24s8_to_rgba8_pipeline);
     if (d24s8_to_rgba8_ms_pipeline) {
         device.destroyPipeline(d24s8_to_rgba8_ms_pipeline);
@@ -547,6 +589,103 @@ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
         // Resolve the destination image if needed
         ResolveTexture(dest);
     }
+    return true;
+}
+
+bool BlitHelper::Relayout(Surface& source, Surface& dest,
+                          const VideoCore::TextureRelayout& relayout) {
+    const bool depth_source = source.type == VideoCore::SurfaceType::DepthStencil;
+    const auto pipeline = depth_source ? relayout_depth_pipeline : relayout_color_pipeline;
+    const auto src_layout =
+        depth_source ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eGeneral;
+
+    const auto descriptor_set = compute_provider.Commit();
+    if (depth_source) {
+        update_queue.AddImageSampler(descriptor_set, 0, 0, source.ImageView(ViewType::Depth),
+                                     VK_NULL_HANDLE, src_layout);
+        update_queue.AddImageSampler(descriptor_set, 1, 0, source.ImageView(ViewType::Stencil),
+                                     VK_NULL_HANDLE, src_layout);
+    } else {
+        // The second texture is not used; give it something valid all the same.
+        update_queue.AddImageSampler(descriptor_set, 0, 0, source.ImageView(), VK_NULL_HANDLE,
+                                     src_layout);
+        update_queue.AddImageSampler(descriptor_set, 1, 0, source.ImageView(), VK_NULL_HANDLE,
+                                     src_layout);
+    }
+    update_queue.AddStorageImage(descriptor_set, 2, dest.ImageView());
+
+    const RelayoutInfo info = {
+        .dst_offset = Common::Vec2i{static_cast<int>(relayout.dst_rect.left),
+                                    static_cast<int>(relayout.dst_rect.bottom)},
+        .dst_extent = Common::Vec2i{static_cast<int>(relayout.dst_rect.GetWidth()),
+                                    static_cast<int>(relayout.dst_rect.GetHeight())},
+        .dst_scale = static_cast<s32>(dest.res_scale),
+        .src_scale = static_cast<s32>(source.res_scale),
+        .dst_width = static_cast<s32>(dest.width),
+        .dst_height = static_cast<s32>(dest.height),
+        .dst_tiled = dest.is_tiled,
+        .src_width = static_cast<s32>(source.width),
+        .src_height = static_cast<s32>(source.height),
+        .src_tiled = source.is_tiled,
+        .pixel_delta = relayout.pixel_delta,
+        .first_pixel = static_cast<s32>(relayout.first_pixel),
+        .end_pixel = static_cast<s32>(relayout.end_pixel),
+    };
+
+    renderpass_cache.EndRendering();
+
+    scheduler.Record([this, pipeline, descriptor_set, info, src_layout,
+                      src_aspect = source.Aspect(), src_access = source.AccessFlags(),
+                      src_stages = source.PipelineStageFlags(), src_image = source.Image(),
+                      dst_access = dest.AccessFlags(), dst_stages = dest.PipelineStageFlags(),
+                      dst_image = dest.Image()](vk::CommandBuffer cmdbuf) {
+        const auto barrier = [](vk::Image image, vk::ImageAspectFlags aspect,
+                                vk::AccessFlags from_access, vk::AccessFlags to_access,
+                                vk::ImageLayout from_layout, vk::ImageLayout to_layout) {
+            return vk::ImageMemoryBarrier{
+                .srcAccessMask = from_access,
+                .dstAccessMask = to_access,
+                .oldLayout = from_layout,
+                .newLayout = to_layout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = image,
+                .subresourceRange{
+                    .aspectMask = aspect,
+                    .baseMipLevel = 0,
+                    .levelCount = VK_REMAINING_MIP_LEVELS,
+                    .baseArrayLayer = 0,
+                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                },
+            };
+        };
+        // The destination keeps its contents: only part of it is written.
+        const std::array pre_barriers = {
+            barrier(src_image, src_aspect, src_access, vk::AccessFlagBits::eShaderRead,
+                    vk::ImageLayout::eGeneral, src_layout),
+            barrier(dst_image, vk::ImageAspectFlagBits::eColor, dst_access,
+                    vk::AccessFlagBits::eShaderWrite, vk::ImageLayout::eGeneral,
+                    vk::ImageLayout::eGeneral),
+        };
+        const std::array post_barriers = {
+            barrier(src_image, src_aspect, vk::AccessFlagBits::eShaderRead, src_access, src_layout,
+                    vk::ImageLayout::eGeneral),
+            barrier(dst_image, vk::ImageAspectFlagBits::eColor, vk::AccessFlagBits::eShaderWrite,
+                    dst_access, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral),
+        };
+        cmdbuf.pipelineBarrier(src_stages | dst_stages, vk::PipelineStageFlagBits::eComputeShader,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
+
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, relayout_pipeline_layout, 0,
+                                  descriptor_set, {});
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        cmdbuf.pushConstants(relayout_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             sizeof(info), &info);
+        cmdbuf.dispatch((info.dst_extent.x + 7) / 8, (info.dst_extent.y + 7) / 8, 1);
+
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, src_stages | dst_stages,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
+    });
     return true;
 }
 

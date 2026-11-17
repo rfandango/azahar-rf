@@ -2,8 +2,10 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <array>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
+#include "common/hitch_tracker.h"
 #include "common/microprofile.h"
 #include "common/trace_markers.h"
 #include "core/core.h"
@@ -12,6 +14,7 @@
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/loader/loader.h"
 #include "video_core/debug_utils/debug_utils.h"
+#include "video_core/frame_liveness.h"
 #include "video_core/frame_state_dump.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_debugger.h"
@@ -91,6 +94,7 @@ MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(1
 GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
          Frontend::EmuWindow* secondary_window)
     : right_eye_disabler{std::make_unique<RightEyeDisabler>(*this)},
+      frame_liveness{std::make_unique<FrameLiveness>(*this)},
       impl{std::make_unique<Impl>(system, emu_window, secondary_window)} {
     impl->vblank_event = impl->timing.RegisterEvent(
         "GPU::VBlankCallback",
@@ -99,6 +103,7 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
+    impl->pica.SetDrawFilter(frame_liveness.get());
 }
 
 GPU::~GPU() = default;
@@ -341,20 +346,24 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     if (impl->debug_context) {
         impl->debug_context->OnEvent(Pica::DebugContext::Event::BufferSwapped, nullptr);
     }
+    impl->renderer->NotifyScreenChanged();
 
     if (screen_id == 0) {
         MicroProfileFlip();
         impl->system.perf_stats->EndGameFrame();
+        Common::Hitches::NoteGameFrame();
         // Steps once per guest frame (top screen buffer swap).
         CITRA_TRACE_SET_COUNTER("azahar.game_frame", impl->system.perf_stats->GetGameFrameCount());
         CITRA_FRAME_DUMP("bufferswap top (guest frame end)");
         right_eye_disabler->ReportEndFrame();
+        frame_liveness->EndFrame();
     }
 }
 
 void GPU::SetColorFill(const Pica::ColorFill& fill) {
     impl->pica.regs_lcd.color_fill_top = fill;
     impl->pica.regs_lcd.color_fill_bottom = fill;
+    impl->renderer->NotifyScreenChanged();
 }
 
 u32 GPU::ReadReg(VAddr addr) {
@@ -380,6 +389,9 @@ u32 GPU::ReadReg(VAddr addr) {
 }
 
 void GPU::WriteReg(VAddr addr, u32 data) {
+    // Registers written this way include the ones that select and configure what is displayed
+    impl->renderer->NotifyScreenChanged();
+
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -467,6 +479,29 @@ void GPU::ApplyPerProgramSettings(u64 program_ID) {
     impl->rasterizer->SetAccurateMul(use_accurate_mul);
 }
 
+namespace {
+
+/// Whether a range of guest memory lies in one of the buffers on display.
+template <typename FramebufferConfigs>
+bool IsOnDisplay(const FramebufferConfigs& configs, PAddr start, PAddr end) {
+    for (const auto& framebuffer : configs) {
+        const u32 size = framebuffer.stride * framebuffer.height;
+        const bool first = framebuffer.active_fb == 0;
+        const std::array<PAddr, 2> addresses{
+            first ? framebuffer.address_left1 : framebuffer.address_left2,
+            first ? framebuffer.address_right1 : framebuffer.address_right2,
+        };
+        for (const PAddr address : addresses) {
+            if (address != 0 && start < address + size && address < end) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+} // Anonymous namespace
+
 void GPU::SubmitCmdList(u32 index) {
     // Check if a command list was triggered.
     auto& config = impl->pica.regs.internal.pipeline.command_buffer;
@@ -476,6 +511,7 @@ void GPU::SubmitCmdList(u32 index) {
 
     MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
     CITRA_TRACE_SCOPE("GPU::CommandList");
+    CITRA_HITCH_SCOPE(GpuEmulation);
     CITRA_TRACE_COUNT(CommandLists);
 
     // Forward command list processing to the PICA core.
@@ -507,10 +543,18 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
     }
 
     CITRA_TRACE_SCOPE("GPU::MemoryFill");
+    CITRA_HITCH_SCOPE(GpuEmulation);
 
-    // Perform memory fill.
+    if (IsOnDisplay(impl->pica.regs.framebuffer_config, config.GetStartAddress(),
+                    config.GetEndAddress())) {
+        impl->renderer->NotifyScreenChanged();
+    }
+
+    // Perform memory fill, unless nobody gets to see what is filled.
     CITRA_FRAME_DUMP("fill {}", config.DebugName());
-    if (!impl->rasterizer->AccelerateFill(config)) {
+    if (!frame_liveness->ShouldAllowFill(config)) {
+        CITRA_FRAME_DUMP("  fill left out: nobody sees its result");
+    } else if (!impl->rasterizer->AccelerateFill(config)) {
         CITRA_TRACE_SCOPE("GPU::MemoryFill (software fallback)");
         CITRA_FRAME_DUMP("  fill: SOFTWARE fallback");
         impl->sw_blitter->MemoryFill(config);
@@ -546,10 +590,20 @@ void GPU::MemoryTransfer() {
 
     MICROPROFILE_SCOPE(GPU_DisplayTransfer);
     CITRA_TRACE_SCOPE(config.is_texture_copy ? "GPU::TextureCopy" : "GPU::DisplayTransfer");
+    CITRA_HITCH_SCOPE(GpuEmulation);
 
     // Notify debugger about the display transfer.
     if (impl->debug_context) {
         impl->debug_context->OnEvent(Pica::DebugContext::Event::IncomingDisplayTransfer, nullptr);
+    }
+
+    // A game without a second buffer transfers into the one on display, without a swap after
+    const PAddr output_start = config.GetPhysicalOutputAddress();
+    const u32 output_size = config.is_texture_copy ? config.texture_copy.size
+                                                   : config.output_width * config.output_height *
+                                                         BytesPerPixel(config.output_format);
+    if (IsOnDisplay(impl->pica.regs.framebuffer_config, output_start, output_start + output_size)) {
+        impl->renderer->NotifyScreenChanged();
     }
 
     u64 delay{};
@@ -565,7 +619,9 @@ void GPU::MemoryTransfer() {
                          config.texture_copy.size, config.texture_copy.input_width * 16,
                          config.texture_copy.input_gap * 16, config.texture_copy.output_width * 16,
                          config.texture_copy.output_gap * 16);
-        if (!impl->rasterizer->AccelerateTextureCopy(config)) {
+        if (!frame_liveness->ShouldAllowTransfer(config)) {
+            CITRA_FRAME_DUMP("  texcopy left out: nobody sees its result");
+        } else if (!impl->rasterizer->AccelerateTextureCopy(config)) {
             CITRA_TRACE_SCOPE("GPU::TextureCopy (software fallback)");
             CITRA_FRAME_DUMP("  texcopy: SOFTWARE fallback");
             impl->sw_blitter->TextureCopy(config);
@@ -575,8 +631,10 @@ void GPU::MemoryTransfer() {
             DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
             config.texture_copy.size);
     } else {
-        if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
-                                                           config.input_height)) {
+        if (!frame_liveness->ShouldAllowTransfer(config)) {
+            CITRA_FRAME_DUMP("transfer {} left out: nobody sees its result", config.DebugName());
+        } else if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
+                                                                  config.input_height)) {
             CITRA_FRAME_DUMP("transfer {} in {}x{} fmt {} out {}x{} fmt {} flags {:08X}",
                              config.DebugName(), config.input_width.Value(),
                              config.input_height.Value(),
@@ -605,8 +663,10 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
 
     // Present renderered frame.
+    frame_liveness->NoteDisplay();
     {
         CITRA_TRACE_SCOPE("VBlank::SwapBuffers");
+        CITRA_HITCH_SCOPE(Compose);
         impl->renderer->SwapBuffers();
     }
 

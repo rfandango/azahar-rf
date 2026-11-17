@@ -19,6 +19,7 @@ class MemorySystem;
 namespace Core {
 
 class DynarmicUserCallbacks;
+class DynarmicCodeCache;
 class DynarmicExclusiveMonitor;
 class ExclusiveMonitor;
 class System;
@@ -70,6 +71,8 @@ private:
     Core::System& system;
     Memory::MemorySystem& memory;
     std::unique_ptr<DynarmicUserCallbacks> cb;
+    /// Hands the code this core's recompilers produce to the title's code cache, if it has one
+    std::unique_ptr<DynarmicCodeCache> code_cache;
     std::unique_ptr<Dynarmic::A32::Jit> MakeJit();
 
     u32 fpexc = 0;

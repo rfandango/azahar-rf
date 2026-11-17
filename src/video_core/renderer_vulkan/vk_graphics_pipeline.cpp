@@ -6,6 +6,7 @@
 
 #include "common/alignment.h"
 #include "common/hash.h"
+#include "common/hitch_tracker.h"
 #include "common/microprofile.h"
 #include "common/trace_markers.h"
 #include "video_core/renderer_vulkan/pica_to_vk.h"
@@ -102,13 +103,29 @@ bool GraphicsPipeline::TryBuild(bool wait_built) {
     }
 
     // Fallback to (a)synchronous compilation
-    worker->QueueWork([this] { Build(); });
+    worker->QueueWork([this] {
+        if (!build_claimed.test_and_set()) {
+            Build();
+        }
+    });
     is_pending = true;
     return wait_built;
 }
 
+void GraphicsPipeline::BuildNowOrWait() {
+    if (IsDone()) {
+        return;
+    }
+    if (!build_claimed.test_and_set()) {
+        Build();
+        return;
+    }
+    WaitDone();
+}
+
 bool GraphicsPipeline::Build(bool fail_on_compile_required) {
     MICROPROFILE_SCOPE(Vulkan_Pipeline);
+    CITRA_HITCH_SCOPE(ShaderCompile);
     // The fail_on_compile_required variant only asks the driver for an already-cached pipeline.
     CITRA_TRACE_SCOPE(fail_on_compile_required ? "Vulkan::BuildPipeline (cache probe)"
                                                : "Vulkan::BuildPipeline");

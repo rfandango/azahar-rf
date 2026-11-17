@@ -9,6 +9,10 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     custom_textures/material.h
     debug_utils/debug_utils.cpp
     debug_utils/debug_utils.h
+    frame_liveness.cpp
+    frame_liveness.h
+    frame_pacer.cpp
+    frame_pacer.h
     frame_state_dump.cpp
     frame_state_dump.h
     gpu.cpp

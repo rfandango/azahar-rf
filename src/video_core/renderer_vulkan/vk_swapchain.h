@@ -4,7 +4,10 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
 #include <mutex>
+#include <span>
 #include <vector>
 #include "common/common_types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -26,8 +29,41 @@ public:
     /// Acquires the next image in the swapchain.
     bool AcquireNextImage();
 
-    /// Presents the current image and move to the next one
-    void Present();
+    /// Presents the current image and move to the next one. A present_id other than zero asks
+    /// the display, where it can tell, when the image reached it: see TakePresentTimings. A
+    /// desired_time other than zero is the time the image should be displayed at (steady clock,
+    /// nanoseconds), instead of as soon as possible.
+    void Present(u32 present_id = 0, u64 desired_time = 0);
+
+    /// Returns when the display showed images presented with an id, for those it has not
+    /// reported yet. Valid until the next call.
+    std::span<const vk::PastPresentationTimingGOOGLE> TakePresentTimings();
+
+    /// Whether every image is displayed, in the order presented
+    bool IsFifo() const {
+        return present_mode == vk::PresentModeKHR::eFifo;
+    }
+
+    /// Refresh period of the display, zero if unknown
+    std::chrono::nanoseconds GetRefreshPeriod() const {
+        return refresh_period;
+    }
+
+    /// Name of the present mode in use
+    const char* GetPresentModeName() const {
+        switch (present_mode) {
+        case vk::PresentModeKHR::eImmediate:
+            return "immediate";
+        case vk::PresentModeKHR::eMailbox:
+            return "mailbox";
+        case vk::PresentModeKHR::eFifo:
+            return "fifo";
+        case vk::PresentModeKHR::eFifoRelaxed:
+            return "fifo relaxed";
+        default:
+            return "other";
+        }
+    }
 
     vk::SurfaceKHR GetSurface() const {
         return surface;
@@ -94,6 +130,8 @@ private:
     vk::SurfaceKHR surface{};
     vk::SurfaceFormatKHR surface_format;
     vk::PresentModeKHR present_mode;
+    std::chrono::nanoseconds refresh_period{};
+    std::array<vk::PastPresentationTimingGOOGLE, 16> past_timings;
     vk::Extent2D extent;
     vk::SurfaceTransformFlagBitsKHR transform;
     vk::CompositeAlphaFlagBitsKHR composite_alpha;

@@ -575,11 +575,7 @@ struct Values {
                                                           Keys::use_limit_frames_ahead_of_gpu};
     SwitchableSetting<bool> use_skip_duplicate_frames{false, Keys::use_skip_duplicate_frames};
     SwitchableSetting<bool> shaders_accurate_mul{true, Keys::shaders_accurate_mul};
-#ifdef ANDROID // TODO: Fuck this -OS
-    SwitchableSetting<bool> use_vsync{false, Keys::use_vsync};
-#else
     SwitchableSetting<bool> use_vsync{true, Keys::use_vsync};
-#endif
     SwitchableSetting<bool> use_display_refresh_rate_detection{
         true, Keys::use_display_refresh_rate_detection};
     Setting<bool> use_shader_jit{true, Keys::use_shader_jit};

@@ -221,6 +221,17 @@ object NativeLibrary {
     external fun getPerfStats(): DoubleArray
 
     /**
+     * Turns the tracking of hitches on or off. It is only needed while their overlay is shown.
+     */
+    external fun setHitchOverlayEnabled(enabled: Boolean)
+
+    /**
+     * Returns the text of the hitch overlay: recent hitches, their causes, and how evenly frames
+     * reach the screen. Empty while hitches are not tracked.
+     */
+    external fun getHitchOverlayText(): String
+
+    /**
      * Notifies the core emulation that the layout should be updated
      */
     external fun updateFramebuffer(isPortrait: Boolean)

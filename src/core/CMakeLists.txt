@@ -561,6 +561,8 @@ if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)
         arm/dynarmic/arm_exclusive_monitor.h
         arm/dynarmic/arm_tick_counts.cpp
         arm/dynarmic/arm_tick_counts.h
+        arm/dynarmic/jit_code_cache.cpp
+        arm/dynarmic/jit_code_cache.h
     )
     target_link_libraries(citra_core PRIVATE dynarmic)
 endif()

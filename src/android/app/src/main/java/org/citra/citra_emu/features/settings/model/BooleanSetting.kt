@@ -35,6 +35,11 @@ enum class BooleanSetting(
         CitraSettings.SECTION_LAYOUT,
         false
     ),
+    HITCH_OVERLAY_ENABLE(
+        SettingKeys.hitch_overlay_enable(),
+        CitraSettings.SECTION_LAYOUT,
+        false
+    ),
     PERF_OVERLAY_SHOW_FPS(
         SettingKeys.performance_overlay_show_fps(),
         CitraSettings.SECTION_LAYOUT,
@@ -109,7 +114,7 @@ enum class BooleanSetting(
     USE_FASTINTERP(SettingKeys.use_fastinterp(), CitraSettings.SECTION_CORE, true),
     HW_SHADER(SettingKeys.use_hw_shader(), CitraSettings.SECTION_RENDERER, true),
     SHADER_JIT(SettingKeys.use_shader_jit(), CitraSettings.SECTION_RENDERER, true),
-    VSYNC(SettingKeys.use_vsync(), CitraSettings.SECTION_RENDERER, false),
+    VSYNC(SettingKeys.use_vsync(), CitraSettings.SECTION_RENDERER, true),
     USE_LIMIT_FRAMES_AHEAD_OF_GPU(
         SettingKeys.use_limit_frames_ahead_of_gpu(),
         CitraSettings.SECTION_RENDERER,
@@ -196,6 +201,7 @@ enum class BooleanSetting(
             ASYNC_FS_OPERATIONS,
             ANDROID_HIDE_IMAGES,
             PERF_OVERLAY_ENABLE, // Works in overlay options, but not from the settings menu
+            HITCH_OVERLAY_ENABLE, // Same
             APPLY_REGION_FREE_PATCH,
             EXPAND_TO_CUTOUT_AREA
         )

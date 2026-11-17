@@ -166,9 +166,9 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # 0 (default): Game Controlled, 1: Nearest Neighbor, 2: Linear
 )") DECLARE_KEY(texture_sampling) BOOST_HANA_STRING(R"(
 
-# Forces VSync on the display thread. Can cause input delay, so only turn this on
-# if you have screen tearing, which is unusual on Android
-# 0 (default): Off, 1: On
+# Shows every image the emulation produces, in order and at an even pace. When off, a newer
+# image can take the place of one that is waiting to be shown, which makes motion uneven.
+# 0: Off, 1 (default): On
 )") DECLARE_KEY(use_vsync) BOOST_HANA_STRING(R"(
 
 # Limits the frames ahead of the GPU. May decrease latency, but may also decrease performance for some systems.
@@ -325,6 +325,11 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 
 # Whether or not the performance overlay should have a transparent background to aid visibility
 )") DECLARE_KEY(performance_overlay_background) BOOST_HANA_STRING(R"(
+
+# Whether or not the hitch overlay should be displayed: recent hitches, their causes and how
+# evenly frames reach the screen
+# 0 (default): Hidden, 1: Shown
+)") DECLARE_KEY(hitch_overlay_enable) BOOST_HANA_STRING(R"(
 
 [Storage]
 # Whether to compress the installed CIA contents

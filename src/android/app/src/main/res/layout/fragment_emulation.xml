@@ -118,17 +118,39 @@
 
         </com.google.android.material.card.MaterialCardView>
 
-        <TextView
-            android:id="@+id/performance_overlay_show_text"
+        <LinearLayout
+            android:id="@+id/stats_overlay"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_gravity="left"
             android:clickable="false"
             android:focusable="false"
-            android:shadowColor="@android:color/black"
-            android:textColor="@android:color/white"
-            android:textSize="12sp"
-            tools:ignore="RtlHardcoded" />
+            android:orientation="vertical"
+            tools:ignore="RtlHardcoded">
+
+            <TextView
+                android:id="@+id/performance_overlay_show_text"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:clickable="false"
+                android:focusable="false"
+                android:shadowColor="@android:color/black"
+                android:textColor="@android:color/white"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/hitch_overlay_text"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:background="@color/citra_transparent_black"
+                android:clickable="false"
+                android:focusable="false"
+                android:fontFamily="monospace"
+                android:textColor="@android:color/white"
+                android:textSize="10sp"
+                android:visibility="gone" />
+
+        </LinearLayout>
 
     </androidx.coordinatorlayout.widget.CoordinatorLayout>
 

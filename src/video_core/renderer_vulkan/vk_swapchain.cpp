@@ -3,7 +3,9 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <algorithm>
+#include <array>
 #include <limits>
+#include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
@@ -87,8 +89,19 @@ void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_, bool lo
         throw;
     }
 
+    refresh_period = {};
+    if (instance.IsDisplayTimingSupported()) {
+        vk::RefreshCycleDurationGOOGLE cycle{};
+        if (instance.GetDevice().getRefreshCycleDurationGOOGLE(swapchain, &cycle) ==
+            vk::Result::eSuccess) {
+            refresh_period = std::chrono::nanoseconds{cycle.refreshDuration};
+        }
+    }
+
     SetupImages();
     RefreshSemaphores();
+    LOG_INFO(Render_Vulkan, "Swapchain with {} images, present mode {}, refresh period {} ns",
+             image_count, GetPresentModeName(), refresh_period.count());
 }
 
 bool Swapchain::AcquireNextImage() {
@@ -120,8 +133,20 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
-void Swapchain::Present() {
+void Swapchain::Present(u32 present_id, u64 desired_time) {
+    // Have the display record when it shows the image, and show it at the time asked for
+    const vk::PresentTimeGOOGLE present_time = {
+        .presentID = present_id,
+        .desiredPresentTime = desired_time,
+    };
+    const vk::PresentTimesInfoGOOGLE present_times = {
+        .swapchainCount = 1,
+        .pTimes = &present_time,
+    };
+    const bool timed = present_id != 0 && instance.IsDisplayTimingSupported();
+
     const vk::PresentInfoKHR present_info = {
+        .pNext = timed ? &present_times : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -145,6 +170,19 @@ void Swapchain::Present() {
     }
 
     frame_index = (frame_index + 1) % image_count;
+}
+
+std::span<const vk::PastPresentationTimingGOOGLE> Swapchain::TakePresentTimings() {
+    if (!instance.IsDisplayTimingSupported() || !swapchain || needs_recreation) {
+        return {};
+    }
+    u32 count = static_cast<u32>(past_timings.size());
+    const vk::Result result = instance.GetDevice().getPastPresentationTimingGOOGLE(
+        swapchain, &count, past_timings.data());
+    if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+        return {};
+    }
+    return std::span{past_timings}.first(count);
 }
 
 void Swapchain::FindPresentFormat() {
@@ -183,7 +221,9 @@ void Swapchain::SetPresentMode() {
         return;
     }
 
-    const bool use_vsync = Settings::values.use_vsync.GetValue();
+    const bool use_vsync =
+        Settings::values.use_vsync.GetValue() &&
+        !(Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyPresentMode);
     const auto find_mode = [&modes](vk::PresentModeKHR requested) {
         const auto it =
             std::find_if(modes.begin(), modes.end(),
@@ -244,6 +284,10 @@ void Swapchain::SetSurfaceProperties() {
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
     image_count = capabilities.minImageCount + 1;
+    if (IsFifo() && instance.IsDisplayTimingSupported()) {
+        // Images are queued ahead of the refresh they are meant for: room for one more
+        image_count++;
+    }
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

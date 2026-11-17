@@ -41,6 +41,22 @@ enum Experiment : std::uint32_t {
     LegacyHiddenDisplay = 512,     ///< Render to the secondary window while it is hidden, as before
     LegacyFullScaleTargets = 1024, ///< Render targets that the game shrinks when it displays
                                    ///< them get the full resolution scale, as before
+    LegacyLayoutReadback = 2048,   ///< Surfaces with a different layout exchange their contents
+                                   ///< through guest memory, as before
+    LegacyThreadPlacement = 4096,  ///< Android: the emulation thread may run on any core, as
+                                   ///< before
+    LogPresents = 8192,            ///< Log every image the display reports, for the hitch tracker
+    LegacyPresentRepeats = 16384,  ///< Compose and present an image at every VBlank, also when
+                                   ///< nothing on the screens changed, as before
+    LegacyPresentMode = 32768,     ///< Queue images as with V-Sync off, the former default on
+                                   ///< Android
+    NoPresentTimes = 65536,        ///< Do not ask the display for a time for each image
+    NoDisplayRateLock = 131072,    ///< Do not keep emulated VBlanks in step with the display
+    NoJitCodeCache = 262144,       ///< Do not keep recompiled code for reuse. Read when a title
+                                   ///< starts or a save state is loaded.
+    LegacyRightEyeSkip = 524288,   ///< "Disable right eye render" goes by the order of command
+                                   ///< lists and transfers, as before, not by which results
+                                   ///< reach the screen
 };
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS

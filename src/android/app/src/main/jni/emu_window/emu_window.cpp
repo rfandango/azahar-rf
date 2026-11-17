@@ -5,11 +5,20 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <fstream>
+#include <optional>
 #include <string>
+#include <vector>
 #include <android/native_window_jni.h>
+#include <fmt/format.h>
+#include <sched.h>
 #include "common/android_utils.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+#include <sys/system_properties.h>
+#endif
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "input_common/main.h"
@@ -48,10 +57,103 @@ void EmuWindow_Android::OnTouchMoved(int x, int y) {
     TouchMoved((unsigned)std::max(x, 0), (unsigned)std::max(y, 0));
 }
 
+namespace {
+
+struct CoreSets {
+    cpu_set_t all;
+    cpu_set_t fast;
+};
+
+/// Finds the cores outside the slowest cluster. Empty if the cores are all alike, or if fewer
+/// than two would be left.
+std::optional<CoreSets> FindFastCores() {
+    std::vector<long> max_freqs;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        std::ifstream file{
+            fmt::format("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu)};
+        long max_freq{};
+        if (!(file >> max_freq)) {
+            break;
+        }
+        max_freqs.push_back(max_freq);
+    }
+    if (max_freqs.empty()) {
+        return std::nullopt;
+    }
+
+    const long slowest = *std::ranges::min_element(max_freqs);
+    CoreSets sets;
+    CPU_ZERO(&sets.all);
+    CPU_ZERO(&sets.fast);
+    for (std::size_t cpu = 0; cpu < max_freqs.size(); cpu++) {
+        CPU_SET(cpu, &sets.all);
+        if (max_freqs[cpu] > slowest) {
+            CPU_SET(cpu, &sets.fast);
+        }
+    }
+    if (CPU_COUNT(&sets.fast) < 2) {
+        return std::nullopt;
+    }
+    return sets;
+}
+
+/// Keeps the calling thread, the emulation thread, off the slowest cores.
+///
+/// The thread works in bursts and sleeps in between (frame limiter, waiting for the GPU), so the
+/// scheduler takes it for a light task and now and then moves it to the slow cluster, where a
+/// frame's work takes several times longer. The performance hint below asks for the opposite,
+/// but not every device acts on it.
+void KeepOffSlowCores() {
+    static const std::optional<CoreSets> cores = FindFastCores();
+    if (!cores) {
+        return;
+    }
+    static thread_local int current = -1;
+    const int wanted =
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyThreadPlacement) ? 0 : 1;
+    if (wanted == current) {
+        return;
+    }
+    current = wanted;
+    const cpu_set_t& set = wanted ? cores->fast : cores->all;
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        LOG_WARNING(Frontend, "Could not set the cores of the emulation thread: {}", errno);
+    } else {
+        LOG_INFO(Frontend, "Emulation thread runs on {} of {} cores", CPU_COUNT(&set),
+                 CPU_COUNT(&cores->all));
+    }
+}
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+/// Profiling builds load a save state when asked through a system property, so that a scene
+/// can be reached without touching the device: `adb shell setprop debug.azahar.load_state 1`.
+/// Acts when the value changes; zero asks for nothing.
+void PollLoadStateRequest() {
+    static int last_slot = 0;
+    char value[PROP_VALUE_MAX]{};
+    const int slot =
+        __system_property_get("debug.azahar.load_state", value) > 0 ? std::atoi(value) : 0;
+    if (slot == last_slot) {
+        return;
+    }
+    last_slot = slot;
+    if (slot > 0) {
+        LOG_INFO(Frontend, "Loading save state {} on request", slot);
+        Core::System::GetInstance().SendSignal(Core::System::Signal::Load, slot);
+    }
+}
+#endif
+
+} // Anonymous namespace
+
 void EmuWindow_Android::ReportFrameWork() {
     if (is_secondary) {
         return;
     }
+    KeepOffSlowCores();
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    PollLoadStateRequest();
+#endif
     auto& system = Core::System::GetInstance();
     if (!system.perf_stats) {
         return;

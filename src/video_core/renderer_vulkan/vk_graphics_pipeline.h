@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/hash.h"
 #include "common/thread_worker.h"
 #include "video_core/pica/regs_pipeline.h"
@@ -329,6 +330,11 @@ public:
 
     bool Build(bool fail_on_compile_required = false);
 
+    /// Returns once the pipeline is built, for a draw that cannot go on without it. A build
+    /// that is still waiting for a worker is done on the calling thread right away: the workers
+    /// can have many other pipelines to get through first.
+    void BuildNowOrWait();
+
     [[nodiscard]] vk::Pipeline Handle() const noexcept {
         return *pipeline;
     }
@@ -345,6 +351,8 @@ private:
     PipelineInfo info;
     std::array<Shader*, 3> stages;
     bool is_pending{};
+    /// Set by whoever builds the pipeline after it was queued: a worker, or a thread waiting
+    std::atomic_flag build_claimed;
 };
 
 } // namespace Vulkan

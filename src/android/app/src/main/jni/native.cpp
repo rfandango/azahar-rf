@@ -28,6 +28,7 @@
 #include "common/dynamic_library.h"
 #include "common/file_derived.h"
 #include "common/file_util.h"
+#include "common/hitch_tracker.h"
 #include "common/logging/backend.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
@@ -1058,6 +1059,17 @@ jdoubleArray Java_org_citra_citra_1emu_NativeLibrary_getPerfStats(JNIEnv* env,
     }
 
     return j_stats;
+}
+
+void Java_org_citra_citra_1emu_NativeLibrary_setHitchOverlayEnabled([[maybe_unused]] JNIEnv* env,
+                                                                    [[maybe_unused]] jobject obj,
+                                                                    jboolean enabled) {
+    Common::Hitches::SetOverlayEnabled(enabled);
+}
+
+jstring Java_org_citra_citra_1emu_NativeLibrary_getHitchOverlayText(JNIEnv* env,
+                                                                    [[maybe_unused]] jobject obj) {
+    return ToJString(env, Common::Hitches::OverlayText());
 }
 
 void Java_org_citra_citra_1emu_NativeLibrary_run__Ljava_lang_String_2(JNIEnv* env,

@@ -9,6 +9,9 @@
 namespace VideoCore {
 class GPU;
 
+/// Leaves out the command lists and the transfer for the right eye's image, going by the order
+/// in which a game renders and transfers the two. FrameLiveness has taken its place and goes
+/// by where the results end up; this one is kept for comparing against.
 class RightEyeDisabler {
 public:
     RightEyeDisabler(GPU& gpu) : gpu{gpu} {}

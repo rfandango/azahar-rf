@@ -21,8 +21,9 @@ class MemorySystem;
 }
 
 namespace VideoCore {
+class FrameLiveness;
 class RasterizerInterface;
-}
+} // namespace VideoCore
 
 namespace Pica {
 
@@ -142,6 +143,10 @@ private:
     void DrawArrays(bool is_indexed);
 
     void LoadVertices(bool is_indexed);
+
+    /// Whether the triangles of the draw about to be carried out cover all of the viewport.
+    /// Only looks at draws of two triangles, whose vertices are shaded here to find out.
+    bool CoversViewport(bool is_indexed);
 
 public:
     union Regs {
@@ -404,6 +409,11 @@ public:
 
     RenderPropertiesGuess GuessCmdRenderProperties(PAddr list, u32 size);
 
+    /// Sets who is asked about each draw before it is carried out, see FrameLiveness.
+    void SetDrawFilter(VideoCore::FrameLiveness* filter) {
+        draw_filter = filter;
+    }
+
 private:
     Memory::MemorySystem& memory;
     VideoCore::RasterizerInterface* rasterizer;
@@ -412,6 +422,7 @@ private:
     GeometryPipeline geometry_pipeline;
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
+    VideoCore::FrameLiveness* draw_filter{};
     std::unique_ptr<ShaderEngine> shader_engine;
 };
 

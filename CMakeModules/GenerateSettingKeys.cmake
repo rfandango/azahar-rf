@@ -278,6 +278,7 @@ if (ANDROID)
         "performance_overlay_show_available_ram"
         "performance_overlay_show_battery_temp"
         "performance_overlay_background"
+        "hitch_overlay_enable"
         "use_frame_limit" # FIXME: DUPLICATE KEY (shared equivalent: frame_limit)
         "android_hide_images"
         "screen_orientation"

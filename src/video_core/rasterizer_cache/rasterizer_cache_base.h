@@ -201,6 +201,10 @@ private:
     bool ValidateByReinterpretation(Surface& surface, SurfaceParams params,
                                     const SurfaceInterval& interval);
 
+    /// Attempt to fill the interval from the surfaces that hold its newest contents with another
+    /// layout, by converting on the host GPU
+    bool ValidateByRelayout(SurfaceId surface_id, const SurfaceInterval& interval);
+
     /// Create a new surface
     SurfaceId CreateSurface(const SurfaceParams& params, const SurfaceFlagBits& initial_flags = {});
 

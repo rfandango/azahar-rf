@@ -12,6 +12,11 @@
         android:checkable="true" />
 
     <item
+        android:id="@+id/menu_hitch_overlay_show"
+        android:title="@string/hitch_overlay_show"
+        android:checkable="true" />
+
+    <item
         android:id="@+id/menu_haptic_feedback"
         android:title="@string/emulation_haptic_feedback"
         android:checkable="true" />

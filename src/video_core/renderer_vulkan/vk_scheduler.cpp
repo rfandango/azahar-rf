@@ -4,6 +4,7 @@
 
 #include <mutex>
 #include <utility>
+#include "common/hitch_tracker.h"
 #include "common/microprofile.h"
 #include "common/thread.h"
 #include "common/trace_markers.h"
@@ -81,6 +82,7 @@ void Scheduler::WaitWorker() {
 
     MICROPROFILE_SCOPE(Vulkan_WaitForWorker);
     CITRA_TRACE_SCOPE("Vulkan::WaitWorker");
+    CITRA_HITCH_SCOPE(RenderThread);
     DispatchWork();
 
     // Ensure the queue is drained.

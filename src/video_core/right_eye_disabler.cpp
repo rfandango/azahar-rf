@@ -3,6 +3,7 @@
 // Refer to the LICENSE.txt file included.
 
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "right_eye_disabler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_impl.h"
@@ -58,7 +59,10 @@ void RightEyeDisabler::ReportEndFrame() {
     if (!enabled)
         return;
 
-    enable_for_frame = Settings::values.disable_right_eye_render.GetValue();
+    // FrameLiveness does this job unless it is switched off for a comparison
+    enable_for_frame =
+        Settings::values.disable_right_eye_render.GetValue() &&
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyRightEyeSkip) != 0;
 
     if (display_tranfer_happened) {
         top_screen_drawn = false;

@@ -91,6 +91,7 @@ class EmulationFragment :
 
     private lateinit var emulationState: EmulationState
     private var perfStatsUpdater: Runnable? = null
+    private var hitchOverlayUpdater: Runnable? = null
 
     private val emulationActivity: EmulationActivity
         get() = (requireActivity() as EmulationActivity)
@@ -206,6 +207,7 @@ class EmulationFragment :
 
         // Show/hide the "Stats" overlay
         updateShowPerformanceOverlay()
+        updateShowHitchOverlay()
 
         val position = activeSettings.get(IntSetting.PERFORMANCE_OVERLAY_POSITION)
         updateStatsPosition(position)
@@ -555,6 +557,8 @@ class EmulationFragment :
     override fun onDestroyView() {
         perfStatsUpdater?.let { perfStatsUpdateHandler.removeCallbacks(it) }
         perfStatsUpdater = null
+        hitchOverlayUpdater?.let { perfStatsUpdateHandler.removeCallbacks(it) }
+        hitchOverlayUpdater = null
         super.onDestroyView()
     }
 
@@ -737,6 +741,8 @@ class EmulationFragment :
             findItem(R.id.menu_show_overlay).isChecked = EmulationMenuSettings.showOverlay
             findItem(R.id.menu_performance_overlay_show).isChecked =
                 activeSettings.get(BooleanSetting.PERF_OVERLAY_ENABLE)
+            findItem(R.id.menu_hitch_overlay_show).isChecked =
+                activeSettings.get(BooleanSetting.HITCH_OVERLAY_ENABLE)
             findItem(R.id.menu_haptic_feedback).isChecked = EmulationMenuSettings.hapticFeedback
             findItem(R.id.menu_emulation_joystick_rel_center).isChecked =
                 EmulationMenuSettings.joystickRelCenter
@@ -759,6 +765,16 @@ class EmulationFragment :
                     )
                     SettingsFile.saveSetting(BooleanSetting.PERF_OVERLAY_ENABLE, activeSettings)
                     updateShowPerformanceOverlay()
+                    true
+                }
+
+                R.id.menu_hitch_overlay_show -> {
+                    activeSettings.setByCurrentState(
+                        BooleanSetting.HITCH_OVERLAY_ENABLE,
+                        !activeSettings.get(BooleanSetting.HITCH_OVERLAY_ENABLE)
+                    )
+                    SettingsFile.saveSetting(BooleanSetting.HITCH_OVERLAY_ENABLE, activeSettings)
+                    updateShowHitchOverlay()
                     true
                 }
 
@@ -1574,11 +1590,40 @@ class EmulationFragment :
         }
     }
 
+    /**
+     * Shows or hides the hitch overlay, below the performance overlay. Hitches are only tracked
+     * while it is shown.
+     */
+    private fun updateShowHitchOverlay() {
+        hitchOverlayUpdater?.let { perfStatsUpdateHandler.removeCallbacks(it) }
+        hitchOverlayUpdater = null
+
+        val enabled = activeSettings.get(BooleanSetting.HITCH_OVERLAY_ENABLE)
+        NativeLibrary.setHitchOverlayEnabled(enabled)
+        if (!enabled) {
+            binding.hitchOverlayText.visibility = View.GONE
+            return
+        }
+
+        hitchOverlayUpdater = Runnable {
+            binding.hitchOverlayText.text = NativeLibrary.getHitchOverlayText()
+            perfStatsUpdateHandler.postDelayed(hitchOverlayUpdater!!, 500)
+        }
+        perfStatsUpdateHandler.post(hitchOverlayUpdater!!)
+        binding.hitchOverlayText.visibility = View.VISIBLE
+    }
+
     private fun updateStatsPosition(position: Int) {
-        val params =
-            binding.performanceOverlayShowText.layoutParams as CoordinatorLayout.LayoutParams
+        val params = binding.statsOverlay.layoutParams as CoordinatorLayout.LayoutParams
         val padding = (20 * resources.displayMetrics.density).toInt() // 20dp
         params.setMargins(padding, 0, padding, 0)
+
+        // Both overlays line up on the side they are placed at
+        binding.statsOverlay.gravity = when (position) {
+            1, 4 -> Gravity.CENTER_HORIZONTAL
+            2, 5 -> Gravity.END
+            else -> Gravity.START
+        }
 
         when (position) {
             0 -> {
@@ -1606,7 +1651,7 @@ class EmulationFragment :
             }
         }
 
-        binding.performanceOverlayShowText.layoutParams = params
+        binding.statsOverlay.layoutParams = params
     }
 
     private fun getBatteryTemperature(): Float {
@@ -1658,10 +1703,7 @@ class EmulationFragment :
             ViewCompat.setOnApplyWindowInsetsListener(binding.surfaceEmulation, applyCutoutInsets)
         }
         ViewCompat.setOnApplyWindowInsetsListener(binding.surfaceInputOverlay, applyCutoutInsets)
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.performanceOverlayShowText,
-            applyCutoutInsets
-        )
+        ViewCompat.setOnApplyWindowInsetsListener(binding.statsOverlay, applyCutoutInsets)
         ViewCompat.setOnApplyWindowInsetsListener(binding.inGameMenu, applyCutoutInsets)
     }
 

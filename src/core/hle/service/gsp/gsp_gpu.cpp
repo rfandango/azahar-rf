@@ -20,6 +20,7 @@
 #include "core/hle/result.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/memory.h"
+#include "video_core/frame_liveness.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_debugger.h"
 #include "video_core/pica/pica_core.h"
@@ -1135,6 +1136,7 @@ void GSP_GPU::ApplyPerProgramSettings(const Kernel::Process& process) {
     auto& gpu = system.GPU();
     gpu.ApplyPerProgramSettings(process.codeset->program_id);
     gpu.GetRightEyeDisabler().SetEnabled(right_eye_disable_allow);
+    gpu.GetFrameLiveness().SetAllowed(right_eye_disable_allow);
     gpu.PicaCore().vs_setup.SetRequiresShaderFixup(requires_shader_fixup);
     gpu.PicaCore().gs_setup.SetRequiresShaderFixup(requires_shader_fixup);
 }

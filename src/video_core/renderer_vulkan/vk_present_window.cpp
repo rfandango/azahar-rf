@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include "common/hitch_tracker.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -110,7 +111,11 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
       blit_supported{
           CanBlitToSwapchain(instance.GetPhysicalDevice(), swapchain.GetSurfaceFormat().format)},
       use_present_thread{Settings::values.async_presentation.GetValue()},
+      is_main_window{!emu_window.isSecondary()},
+      legacy_present_mode{
+          (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyPresentMode) != 0},
       last_render_surface{emu_window.GetWindowInfo().render_surface} {
+    UpdateDisplay();
 
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
@@ -249,6 +254,7 @@ Frame* PresentWindow::GetRenderFrame() {
     MICROPROFILE_SCOPE(Vulkan_WaitPresent);
     // Blocks when all presentation frames are queued or still being presented.
     CITRA_TRACE_SCOPE("Vulkan::WaitPresentFrame");
+    CITRA_HITCH_SCOPE(PresentQueue);
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
@@ -285,7 +291,52 @@ Frame* PresentWindow::GetRenderFrame() {
     return frame;
 }
 
-void PresentWindow::Present(Frame* frame) {
+void PresentWindow::UpdateDisplay() {
+    if (!is_main_window) {
+        return;
+    }
+    const bool timed = instance.IsDisplayTimingSupported();
+    // A time for each image only works out when every image is shown, in order
+    const bool paced = timed && swapchain.IsFifo();
+    pacer.SetDisplay(swapchain.GetRefreshPeriod(), paced);
+    can_pace = paced;
+    Common::Hitches::SetDisplayTiming(timed, swapchain.GetRefreshPeriod(),
+                                      swapchain.GetPresentModeName());
+}
+
+void PresentWindow::Present(Frame* frame, u64 vblank) {
+    const auto now = std::chrono::steady_clock::now();
+    frame->game_frame = Common::Hitches::CurrentGameFrame();
+    frame->submitted = now;
+    frame->present_id = 0;
+    frame->desired_time = 0;
+    if (is_main_window) {
+        if (++next_present_id == 0) {
+            next_present_id = 1;
+        }
+        frame->present_id = next_present_id;
+
+        // At another speed than the normal one there is no pace to keep
+        if (can_pace && Settings::GetFrameLimit() == 100.0) {
+            frame->desired_time = pacer.Schedule(frame->present_id, vblank, now);
+        } else {
+            pacer.Reset();
+        }
+        if (Common::Hitches::IsEnabled()) {
+            const VideoCore::FramePacer::Status status = pacer.GetStatus();
+            Common::Hitches::SetPacing(Common::Hitches::Pacing{
+                .active = status.active,
+                .locked = status.locked,
+                .overloaded = status.overloaded,
+                .speed = status.speed,
+                .lead_ms = status.lead_ms,
+                .target_ms = status.target_ms,
+                .slips = status.slips,
+                .misses = status.misses,
+            });
+        }
+    }
+
     if (!use_present_thread) {
         scheduler.WaitWorker();
         CopyToSwapchain(frame);
@@ -375,9 +426,9 @@ void PresentWindow::NotifySurfaceChanged() {
 
 void PresentWindow::CopyToSwapchain(Frame* frame) {
     CITRA_TRACE_SCOPE("Vulkan::CopyToSwapchain");
-    const auto recreate_swapchain = [&] {
+    const auto recreate_swapchain = [&]([[maybe_unused]] bool new_surface = true) {
 #ifdef ANDROID
-        {
+        if (new_surface) {
             std::unique_lock lock{recreate_surface_mutex};
             recreate_surface_cv.wait(lock, [this]() { return surface != next_surface; });
             surface = next_surface;
@@ -386,7 +437,15 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         std::scoped_lock submit_lock{scheduler.submit_mutex};
         graphics_queue.waitIdle();
         swapchain.Create(frame->width, frame->height, surface, low_refresh_rate);
+        UpdateDisplay();
     };
+
+    const bool legacy_mode =
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyPresentMode) != 0;
+    if (legacy_mode != legacy_present_mode) [[unlikely]] {
+        legacy_present_mode = legacy_mode;
+        recreate_swapchain(false);
+    }
 
 #ifndef ANDROID
     const bool use_vsync = Settings::values.use_vsync.GetValue();
@@ -504,16 +563,29 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         .pSignalSemaphores = &present_ready,
     };
 
-    std::scoped_lock submit_lock{scheduler.submit_mutex, recreate_surface_mutex};
+    {
+        std::scoped_lock submit_lock{scheduler.submit_mutex, recreate_surface_mutex};
 
-    try {
-        graphics_queue.submit(submit_info, frame->present_done);
-    } catch (vk::DeviceLostError& err) {
-        LOG_CRITICAL(Render_Vulkan, "Device lost during present submit: {}", err.what());
-        UNREACHABLE();
+        try {
+            graphics_queue.submit(submit_info, frame->present_done);
+        } catch (vk::DeviceLostError& err) {
+            LOG_CRITICAL(Render_Vulkan, "Device lost during present submit: {}", err.what());
+            UNREACHABLE();
+        }
+
+        Common::Hitches::NotePresentQueued(frame->present_id, frame->game_frame, frame->submitted);
+        swapchain.Present(frame->present_id, frame->desired_time);
     }
 
-    swapchain.Present();
+    if (frame->present_id != 0) {
+        // Asking the display can take a while: not something to hold up submissions for
+        std::scoped_lock surface_lock{recreate_surface_mutex};
+        for (const vk::PastPresentationTimingGOOGLE& timing : swapchain.TakePresentTimings()) {
+            pacer.NoteDisplayed(timing.presentID, timing.actualPresentTime);
+            Common::Hitches::NotePresentShown(timing.presentID, timing.actualPresentTime,
+                                              timing.presentMargin);
+        }
+    }
 }
 
 vk::RenderPass PresentWindow::CreateRenderpass() {

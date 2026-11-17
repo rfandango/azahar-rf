@@ -3,10 +3,12 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
 #include "common/polyfill_thread.h"
+#include "video_core/frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 VK_DEFINE_HANDLE(VmaAllocation)
@@ -32,6 +34,13 @@ struct Frame {
     vk::Semaphore render_ready;
     vk::Fence present_done;
     vk::CommandBuffer cmdbuf;
+    /// Game frame the image belongs to and when the emulation thread handed it over
+    u32 game_frame{};
+    std::chrono::steady_clock::time_point submitted{};
+    /// Identifies the image in what the display reports, zero for none
+    u32 present_id{};
+    /// When the image should be displayed (steady clock, nanoseconds), zero for at once
+    u64 desired_time{};
 };
 
 class PresentWindow final {
@@ -49,8 +58,14 @@ public:
     /// Recreates the render frame to match provided parameters.
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
-    /// Queues the provided frame for presentation.
-    void Present(Frame* frame);
+    /// Queues the provided frame, the image of the given VBlank, for presentation.
+    void Present(Frame* frame, u64 vblank = 0);
+
+    /// Emulation speed, relative to the nominal one, that keeps VBlanks in step with the
+    /// refreshes of the display. 1 where that is not known or not wanted.
+    double SpeedScale() const {
+        return pacer.SpeedScale();
+    }
 
     /// This is called to notify the rendering backend of a surface change
     void NotifySurfaceChanged();
@@ -71,6 +86,9 @@ private:
     void PresentThread(std::stop_token token);
 
     void CopyToSwapchain(Frame* frame);
+
+    /// Tells the frame pacer and the hitch tracker about the display behind the swapchain.
+    void UpdateDisplay();
 
     vk::RenderPass CreateRenderpass();
 
@@ -99,6 +117,14 @@ private:
     bool vsync_enabled{};
     bool blit_supported;
     bool use_present_thread{true};
+    /// Whether this is the window whose images are paced and followed by the hitch tracker
+    bool is_main_window{};
+    VideoCore::FramePacer pacer;
+    /// Whether the swapchain shows every image and tells when, which pacing needs
+    std::atomic_bool can_pace{};
+    u32 next_present_id{};
+    /// State of the LegacyPresentMode experiment the swapchain was made for
+    bool legacy_present_mode{};
     void* last_render_surface{};
 };
 

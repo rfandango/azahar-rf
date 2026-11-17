@@ -608,6 +608,22 @@ bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
     return true;
 }
 
+bool TextureRuntime::CanRelayoutTextures(const Surface& source,
+                                         const Surface& dest) const noexcept {
+    // The conversion writes the destination as a storage image.
+    return dest.pixel_format == PixelFormat::RGBA8 &&
+           instance.GetTraits(PixelFormat::RGBA8).storage_support &&
+           (source.pixel_format == PixelFormat::RGBA8 ||
+            source.pixel_format == PixelFormat::D24S8) &&
+           source.sample_count == 1 && dest.sample_count == 1 && !source.IsCustom() &&
+           !dest.IsCustom();
+}
+
+bool TextureRuntime::RelayoutTextures(Surface& source, Surface& dest,
+                                      const VideoCore::TextureRelayout& relayout) {
+    return blit_helper.Relayout(source, dest, relayout);
+}
+
 bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
                                   const VideoCore::TextureBlit& blit) {
     const bool is_depth_stencil = source.type == VideoCore::SurfaceType::DepthStencil;

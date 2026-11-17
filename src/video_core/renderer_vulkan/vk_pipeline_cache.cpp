@@ -6,6 +6,7 @@
 
 #include "common/common_paths.h"
 #include "common/file_util.h"
+#include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
@@ -241,6 +242,7 @@ void PipelineCache::LoadDriverPipelineDiskCache(
 
     auto load_cache = [this, &cache_info, &callback](bool allow_fallback) {
         const vk::Device device = instance.GetDevice();
+        std::scoped_lock lock{driver_cache_mutex};
         try {
             driver_pipeline_cache = device.createPipelineCacheUnique(cache_info);
         } catch (const vk::SystemError& err) {
@@ -311,6 +313,8 @@ void PipelineCache::LoadDriverPipelineDiskCache(
 }
 
 void PipelineCache::SaveDriverPipelineDiskCache() {
+    std::scoped_lock lock{driver_cache_mutex};
+
     // Save Vulkan pipeline cache
     if (!Settings::values.use_disk_shader_cache || !driver_pipeline_cache) {
         return;
@@ -325,18 +329,49 @@ void PipelineCache::SaveDriverPipelineDiskCache() {
     const auto cache_file_path =
         fmt::format("{}{:016X}-{:X}{:X}.bin", cache_dir, program_id, vendor_id, device_id);
 
-    FileUtil::IOFile cache_file{cache_file_path, "wb"};
-    if (!cache_file.IsOpen()) {
-        LOG_ERROR(Render_Vulkan, "Unable to open pipeline cache for writing");
-        return;
-    }
+    // Written next to the file and moved into place, so that being killed while writing does
+    // not leave half a cache behind
+    const std::string temp_file_path = cache_file_path + ".tmp";
+    {
+        FileUtil::IOFile cache_file{temp_file_path, "wb"};
+        if (!cache_file.IsOpen()) {
+            LOG_ERROR(Render_Vulkan, "Unable to open pipeline cache for writing");
+            return;
+        }
 
-    const vk::Device device = instance.GetDevice();
-    const auto cache_data = device.getPipelineCacheData(*driver_pipeline_cache);
-    if (cache_file.WriteBytes(cache_data.data(), cache_data.size()) != cache_data.size()) {
-        LOG_ERROR(Render_Vulkan, "Error during pipeline cache write");
+        const vk::Device device = instance.GetDevice();
+        const auto cache_data = device.getPipelineCacheData(*driver_pipeline_cache);
+        if (cache_file.WriteBytes(cache_data.data(), cache_data.size()) != cache_data.size()) {
+            LOG_ERROR(Render_Vulkan, "Error during pipeline cache write");
+            return;
+        }
+    }
+    FileUtil::Delete(cache_file_path);
+    if (!FileUtil::Rename(temp_file_path, cache_file_path)) {
+        LOG_ERROR(Render_Vulkan, "Unable to move the pipeline cache into place");
+    }
+}
+
+void PipelineCache::NoteNewPipeline() {
+    if (unsaved_pipelines++ == 0) {
+        first_unsaved_pipeline = std::chrono::steady_clock::now();
+    }
+}
+
+void PipelineCache::SaveDriverPipelineDiskCacheWhenDue() {
+    if (unsaved_pipelines == 0) [[likely]] {
         return;
     }
+    // New pipelines come in groups, with a new scene or effect. Some time after the first, the
+    // group has been through the workers, which this goes to the back of.
+    constexpr std::chrono::seconds SAVE_DELAY{10};
+    if (std::chrono::steady_clock::now() - first_unsaved_pipeline < SAVE_DELAY) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "Storing the driver's pipeline cache with {} new pipelines",
+             unsaved_pipelines);
+    unsaved_pipelines = 0;
+    pipeline_workers.QueueWork([this] { SaveDriverPipelineDiskCache(); });
 }
 
 void PipelineCache::LoadDiskCache(const std::atomic_bool& stop_loading,
@@ -415,6 +450,7 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
     }
 
     GraphicsPipeline* const pipeline = curr_disk_cache->GetPipeline(info);
+    SaveDriverPipelineDiskCacheWhenDue();
     if (!pipeline->IsDone() && !pipeline->TryBuild(wait_built)) {
         return false;
     }
@@ -527,7 +563,15 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
         if (pipeline_dirty) {
             if (!pipeline->IsDone()) {
                 CITRA_TRACE_SCOPE("Vulkan::WaitPipeline");
-                pipeline->WaitDone();
+                CITRA_HITCH_SCOPE_ANY_THREAD(ShaderCompile);
+                const auto start = std::chrono::steady_clock::now();
+                pipeline->BuildNowOrWait();
+                const std::chrono::duration<double, std::milli> waited =
+                    std::chrono::steady_clock::now() - start;
+                if (waited.count() >= 4.0) {
+                    LOG_INFO(Render_Vulkan, "A draw waited {:.1f} ms for its pipeline",
+                             waited.count());
+                }
             }
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
         }
