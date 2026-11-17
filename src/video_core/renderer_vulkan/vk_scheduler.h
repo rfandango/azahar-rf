@@ -6,6 +6,7 @@
 
 #include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 #include "common/alignment.h"
 #include "common/common_funcs.h"
@@ -43,6 +44,12 @@ public:
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    /// For frame dumps with GPU times: sends what was recorded so far to the GPU, waits until
+    /// it is done and notes how long that took in the dump.
+    void TimeGpuWork(const std::string& what);
+#endif
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
@@ -98,6 +105,8 @@ public:
     }
 
     std::mutex submit_mutex;
+    /// Held while an image is handed to the display on a queue of its own
+    std::mutex present_mutex;
 
 private:
     class Command {
@@ -202,6 +211,8 @@ private:
     StateFlags state{};
     std::function<void()> on_submit;
     std::function<void()> on_dispatch;
+    /// Set while a submission is being put together, when nothing else may be submitted
+    bool is_submitting{};
     std::mutex execution_mutex;
     std::mutex reserve_mutex;
     std::mutex queue_mutex;

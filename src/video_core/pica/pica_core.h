@@ -146,7 +146,13 @@ private:
 
     /// Whether the triangles of the draw about to be carried out cover all of the viewport.
     /// Only looks at draws of two triangles, whose vertices are shaded here to find out.
-    bool CoversViewport(bool is_indexed);
+    bool CoversViewport(bool is_indexed, bool* exactly = nullptr);
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    /// Frame dumps: where the vertices of a draw of two triangles at the most end up in the
+    /// target, and which texture coordinates they have
+    void DumpSmallDraw(bool is_indexed);
+#endif
 
 public:
     union Regs {

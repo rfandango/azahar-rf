@@ -35,7 +35,8 @@ enum Experiment : std::uint32_t {
     SkipFlatDraws = 8,             ///< Drop unlit draws without depth test (2D overlays)
     DumpShaders = 16,              ///< Save shaders generated from now on next to the frame dumps
     SkipUnlitSolidDraws = 32,      ///< Drop unlit draws that test and write depth
-    LegacyAttachments = 64,        ///< Bind only the attachments each draw uses, as before
+    LegacyAttachments = 64,        ///< Bind only the attachments each draw uses, and start a new
+                                   ///< render pass whenever the area drawn to changes, as before
     LegacyTexCopyGap = 128,        ///< Texture copies load their output gap first, as before
     GenericVertexShaders = 256,    ///< Vertex shaders test bool uniforms at run time, as before
     LegacyHiddenDisplay = 512,     ///< Render to the secondary window while it is hidden, as before
@@ -63,6 +64,22 @@ enum Experiment : std::uint32_t {
                                    ///< what depends on its pace copes with frames that come late
     RealtimeAudio = 4194304,       ///< As the "Enable Realtime Audio" setting: sound is produced in
                                    ///< step with real time, however slowly the game runs
+    LegacyFrameHandoff = 8388608,  ///< Vulkan: the emulation waits for the render thread at every
+                                   ///< VBlank, and images are handed to the display on the queue
+                                   ///< rendering is submitted to, as before
+    LegacyScissor = 33554432,      ///< Vulkan: fragment shaders test the scissor that keeps what is
+                                   ///< inside a rectangle and drop what is outside, as before
+    /// Shadow maps are rendered at the resolution scale, as before
+    LegacyShadowMapScale = 67108864,
+    /// Vulkan: all the arithmetic of fragment shaders is marked as needing no more than half
+    /// precision, to measure what that is worth. Renders incorrectly.
+    RelaxedShaderPrecision = 134217728,
+    /// Fragment shaders leave out fragment lighting and use a fixed colour in its place, to
+    /// measure what the lighting of a lit fragment costs. Renders incorrectly.
+    SkipLightingMath = 268435456,
+    /// Fragment shaders work out the level of detail for every texture sample, also of
+    /// textures that have one level only, as before
+    LegacyTextureLod = 536870912,
 };
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS

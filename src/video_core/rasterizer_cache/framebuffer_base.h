@@ -27,7 +27,9 @@ struct FramebufferParams {
     u32 color_level;
     u32 depth_level;
     bool shadow_rendering;
-    INSERT_PADDING_BYTES(3);
+    /// Which of its two images the colour surface is in, see SurfaceBase::swapped
+    bool color_swapped;
+    INSERT_PADDING_BYTES(2);
 
     bool operator==(const FramebufferParams& params) const noexcept {
         return std::memcmp(this, &params, sizeof(FramebufferParams)) == 0;
@@ -144,6 +146,12 @@ public:
     void SetWrittenAttachments(bool color, bool depth) noexcept {
         color_written = color;
         depth_written = depth;
+    }
+
+    /// To be called after the colour surface changed images: the framebuffer to go on with
+    typename T::Framebuffer* Refresh() {
+        fb = res_cache->RefreshFramebuffer(static_cast<const FramebufferParams&>(*fb));
+        return fb;
     }
 
     typename T::Framebuffer* Framebuffer() const noexcept {

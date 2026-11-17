@@ -2,6 +2,7 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include "common/trace_markers.h"
 #include "video_core/pica_types.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 
@@ -83,13 +84,29 @@ TextureConfig::TextureConfig(const Pica::TexturingRegs& regs) {
     shadow_texture_orthographic.Assign(regs.shadow.orthographic != 0);
 
     const auto pica_textures = regs.GetTextures();
+    u32 one_level = 0;
     for (u32 tex_index = 0; tex_index < 3; tex_index++) {
         requested_wrap[tex_index].s = pica_textures[tex_index].config.wrap_s;
         requested_wrap[tex_index].t = pica_textures[tex_index].config.wrap_t;
 
         texture_border_color[tex_index].enable_s.Assign(false);
         texture_border_color[tex_index].enable_t.Assign(false);
+
+        // A texture without smaller levels is sampled at its only one whatever the level of
+        // detail comes to, so that need not be worked out: most of what games sample is like
+        // that, everything they render into first of all. A unit that is off gets a texture
+        // of one level, and only plain 2D textures are sampled with a level of detail.
+        const auto& texture = pica_textures[tex_index];
+        const bool plain_2d =
+            tex_index != 0 || regs.texture0.type == Pica::TexturingRegs::TextureConfig::Texture2D;
+        if (!texture.enabled || !plain_2d || texture.config.lod.max_level == 0) {
+            one_level |= 1u << tex_index;
+        }
     }
+    if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyTextureLod) {
+        one_level = 0;
+    }
+    single_level.Assign(one_level);
 
     const auto& stages = regs.GetTevStages();
     for (std::size_t i = 0; i < tev_stages.size(); i++) {

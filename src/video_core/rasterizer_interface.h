@@ -77,6 +77,11 @@ public:
         return false;
     }
 
+    /// Says what the draw that comes next overwrites: every pixel of the colour buffer in the
+    /// area it is confined to, every pixel of depth and stencil there. A renderer that would
+    /// fetch what the area held before it draws need not. Said again, with false, after it.
+    virtual void NoteDrawOverwrites([[maybe_unused]] bool color, [[maybe_unused]] bool depth) {}
+
     virtual void LoadDefaultDiskResources(
         [[maybe_unused]] const std::atomic_bool& stop_loading,
         [[maybe_unused]] const DiskResourceLoadCallback& callback) {}

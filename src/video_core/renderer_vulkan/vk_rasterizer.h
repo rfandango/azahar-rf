@@ -60,6 +60,7 @@ public:
     bool AccelerateDisplay(const Pica::FramebufferConfig& config, PAddr framebuffer_addr,
                            u32 pixel_stride, ScreenInfo& screen_info);
     bool AccelerateDrawBatch(bool is_indexed) override;
+    void NoteDrawOverwrites(bool color, bool depth) override;
 
     /// Switches the disk resources to the specified title
     void SwitchDiskResources(u64 title_id) override;
@@ -75,7 +76,10 @@ private:
     void SyncAndUploadLUTsLF();
 
     /// Syncs all enabled PICA texture units
-    void SyncTextureUnits(const Framebuffer* framebuffer);
+    /// Returns whether the colour surface of the framebuffer moved to its other image, for a
+    /// draw that samples it and overwrites all of the rectangle it is confined to
+    bool SyncTextureUnits(const Framebuffer* framebuffer, const Common::Rectangle<u32>& draw_rect,
+                          bool overwrites_color);
 
     /// Syncs all utility textures in the fragment shader.
     void SyncUtilityTextures(const Framebuffer* framebuffer);
@@ -158,6 +162,9 @@ private:
         bool valid{};
     };
     BoundTarget bound_target{};
+    /// What the draw that comes next overwrites of the area it is confined to
+    bool next_draw_overwrites_color{};
+    bool next_draw_overwrites_depth{};
 };
 
 } // namespace Vulkan

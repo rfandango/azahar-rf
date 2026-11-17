@@ -242,6 +242,16 @@ public:
     /// Returns a copy of the upscaled image handle, used for feedback loops.
     vk::ImageView CopyImageView() noexcept;
 
+    /// Whether the surface can change places with its second image, see SwapForOverwrite
+    bool CanSwapForOverwrite() const noexcept;
+
+    /// For a draw that samples the surface it draws to and overwrites every pixel of the
+    /// rectangle it is confined to: instead of copying the surface for the draw to sample, the
+    /// surface moves to its second image. What is outside the rectangle is copied there, the
+    /// rectangle is left for the draw to fill. Returns the view to sample, of the image the
+    /// surface was in.
+    vk::ImageView SwapForOverwrite(const Common::Rectangle<u32>& rect) noexcept;
+
     /// Returns the framebuffer view of the surface image
     vk::ImageView FramebufferView() noexcept {
         is_framebuffer = true;
@@ -287,6 +297,10 @@ public:
     vk::PipelineStageFlags PipelineStageFlags() const noexcept;
 
 private:
+    /// Makes sure there is a second image, like the one the surface is in. Returns whether it
+    /// was made just now, with nothing in it and no layout.
+    bool EnsureCopyHandle();
+
     /// Performs blit between the scaled/unscaled images
     void BlitScale(const VideoCore::TextureBlit& blit, bool up_scale);
 
@@ -306,6 +320,11 @@ public:
     vk::UniqueImageView storage_view;
     bool is_framebuffer{};
     bool is_storage{};
+    /// What the images of the surface were created with, for a second one of the same kind
+    vk::ImageUsageFlags image_usage{};
+    vk::ImageCreateFlags image_flags{};
+    bool image_format_list{};
+    bool has_image_params{};
 };
 
 class Framebuffer : public VideoCore::FramebufferParams {

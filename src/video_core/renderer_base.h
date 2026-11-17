@@ -118,6 +118,12 @@ protected:
     /// Called on VBlanks where the guest application submits a frame.
     virtual void LimitFramesAheadOfGpu() {}
 
+    /// Whether the renderer needs that wait whatever the setting says, because nothing else
+    /// keeps the emulation from getting frames ahead of the GPU
+    virtual bool AlwaysLimitsFramesAheadOfGpu() const {
+        return false;
+    }
+
     /// Whether the image composed at this VBlank can differ from the one composed last. To be
     /// called once per VBlank.
     bool ShouldPresentImage();

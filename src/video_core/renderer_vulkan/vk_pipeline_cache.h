@@ -95,8 +95,10 @@ public:
     /// Binds a fragment shader generated from PICA state
     /// depth_from_viewport: the caller maps depth through the viewport depth range, so the
     /// shader must not write depth (see Pica::Shader::GetViewportDepthRange).
+    /// With `host_scissor` the scissor test, if it keeps what is inside its rectangle, is left
+    /// to the scissor the pipeline is drawn with
     void UseFragmentShader(const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
-                           bool depth_from_viewport);
+                           bool depth_from_viewport, bool host_scissor);
 
     /// Queries which channels need min/max blend emulation in the fragment shader
     void QueryBlendEmulation(const Pica::RegsInternal& regs, bool& rgb_emulation,

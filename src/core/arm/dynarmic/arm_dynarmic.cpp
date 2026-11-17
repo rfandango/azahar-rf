@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <array>
+#include <atomic>
 #include <csignal>
 #include <cstring>
 #include <optional>
@@ -10,6 +12,7 @@
 #include <dynarmic/interface/code_cache.h>
 #include <dynarmic/interface/optimization_flags.h>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/trace_markers.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -172,9 +175,35 @@ public:
         s64 ticks = parent.GetTimer().GetDowncount();
         return static_cast<u64>(ticks <= 0 ? 0 : ticks);
     }
-    std::uint64_t GetTicksForCode(bool is_thumb, VAddr, std::uint32_t instruction) override {
+    std::uint64_t GetTicksForCode(bool is_thumb, VAddr pc, std::uint32_t instruction) override {
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+        NoteHintInstruction(is_thumb, pc, instruction);
+#endif
         return Core::TicksForInstruction(is_thumb, instruction);
     }
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    /// Says which of the instructions a program waits with (YIELD, WFE, WFI, SEV) the
+    /// recompiler comes across: it translates them to nothing, so a program that waits in a
+    /// loop of them runs that loop for all the time it is given.
+    static void NoteHintInstruction(bool is_thumb, VAddr pc, std::uint32_t instruction) {
+        const std::uint32_t hint =
+            is_thumb ? ((instruction & 0xFF0F) == 0xBF00 ? (instruction >> 4) & 0xF : 0)
+                     : ((instruction & 0x0FFFFFF0) == 0x0320F000 ? instruction & 0xF : 0);
+        if (hint < 1 || hint > 4) {
+            return;
+        }
+        static constexpr std::array<const char*, 5> names{"", "YIELD", "WFE", "WFI", "SEV"};
+        static std::array<std::atomic<u32>, 5> counts{};
+        const u32 count = ++counts[hint];
+        // The first few of each, then every time the count doubles
+        if (count <= 4 || (count & (count - 1)) == 0) {
+            LOG_INFO(Core_ARM11,
+                     "Guest code waits with {} at {:08X} ({}): {} places translated so far",
+                     names[hint], pc, is_thumb ? "Thumb" : "ARM", count);
+        }
+    }
+#endif
 
     ARM_Dynarmic& parent;
     Kernel::SVCContext svc_context;

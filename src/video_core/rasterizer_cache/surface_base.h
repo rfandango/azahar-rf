@@ -95,6 +95,10 @@ private:
 
 public:
     SurfaceFlagBits flags{};
+    /// Renderers that keep a second image of a surface, to draw into while the first is
+    /// sampled, flip this when the two change places: what was made for one image of the
+    /// surface, a framebuffer for one, is not for the other.
+    bool swapped{};
     const Material* material = nullptr;
     SurfaceRegions invalid_regions;
     u32 fill_size = 0;

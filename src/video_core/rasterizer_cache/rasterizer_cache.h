@@ -438,10 +438,13 @@ typename T::Sampler& RasterizerCache<T>::GetSampler(SamplerId sampler_id) {
 
 template <class T>
 typename T::Sampler& RasterizerCache<T>::GetSampler(
-    const Pica::TexturingRegs::TextureConfig& config) {
+    const Pica::TexturingRegs::TextureConfig& config, bool nearest) {
     using TextureFilter = Pica::TexturingRegs::TextureConfig::TextureFilter;
 
-    const auto get_filter = [](TextureFilter filter) {
+    const auto get_filter = [nearest](TextureFilter filter) {
+        if (nearest) {
+            return TextureFilter::Nearest;
+        }
         switch (Settings::values.texture_sampling.GetValue()) {
         case Settings::TextureSampling::GameControlled:
             return filter;
@@ -513,7 +516,10 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
     const u32 dst_scale = dst_surface.res_scale;
     const u32 src_sample_count = src_surface.sample_count;
     const u32 dst_sample_count = dst_surface.sample_count;
-    if ((src_scale > dst_scale) || (src_sample_count > dst_sample_count)) {
+    // A surface takes on the scale of what it is filled from, except a shadow map that is
+    // kept small on purpose: that one is filled by shrinking
+    if (((src_scale > dst_scale) || (src_sample_count > dst_sample_count)) &&
+        !IsNativeScaleShadowMap(dst_surface)) {
         dst_surface.ScaleUp(src_scale, src_sample_count);
     }
 
@@ -800,6 +806,35 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
 
     color_params.addr = config.GetColorBufferPhysicalAddress();
     color_params.pixel_format = PixelFormatFromColorFormat(config.color_format);
+
+    // A shadow map is looked up, not looked at: every lit pixel reads four of its texels and
+    // compares depths. At the resolution scale it takes that scale squared as much memory for
+    // the same lookups, 25 times at 5x, far more than the GPU keeps at hand, so that each of
+    // them goes to main memory. It stays the size the game gave it, as on the console. The
+    // game clears it with an ordinary draw before it renders into it, which is why the
+    // buffers are remembered.
+    if (using_color_fb && resolution_scale_factor > 1) {
+        static constexpr std::size_t MAX_SHADOW_MAP_TARGETS = 8;
+        auto target =
+            std::ranges::find(shadow_map_targets, color_params.addr, &ShadowMapTarget::addr);
+        if (target == shadow_map_targets.end() && regs.framebuffer.IsShadowRendering()) {
+            if (shadow_map_targets.size() == MAX_SHADOW_MAP_TARGETS) {
+                shadow_map_targets.erase(shadow_map_targets.begin());
+            }
+            shadow_map_targets.push_back(ShadowMapTarget{color_params.addr, false});
+            target = shadow_map_targets.end() - 1;
+        }
+        if (target != shadow_map_targets.end()) {
+            // Colour and depth have to be of one size. Should the buffer be drawn to with a
+            // depth buffer, it keeps the resolution scale from then on.
+            target->with_depth = target->with_depth || using_depth_fb;
+            if (!target->with_depth && sample_count == 1 &&
+                (Common::TraceMarkers::Experiments() &
+                 Common::TraceMarkers::LegacyShadowMapScale) == 0) {
+                color_params.res_scale = 1;
+            }
+        }
+    }
     color_params.UpdateParams();
 
     depth_params.addr = config.GetDepthBufferPhysicalAddress();
@@ -864,16 +899,23 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         .shadow_rendering = regs.framebuffer.IsShadowRendering(),
     };
 
+    return FramebufferHelper<T>{this, RefreshFramebuffer(fb_params),
+                                regs.framebuffer.framebuffer.IsFlipped(), regs.rasterizer, fb_rect};
+}
+
+template <class T>
+typename RasterizerCache<T>::Framebuffer* RasterizerCache<T>::RefreshFramebuffer(
+    FramebufferParams fb_params) {
+    fb_params.color_swapped = fb_params.color_id && slot_surfaces[fb_params.color_id].swapped;
+
     auto [it, new_framebuffer] = framebuffers.try_emplace(fb_params);
     if (new_framebuffer) {
         // Validation can grow slot_surfaces, so get fresh references here
-        Surface* color_surface = color_id ? &slot_surfaces[color_id] : nullptr;
-        Surface* depth_surface = depth_id ? &slot_surfaces[depth_id] : nullptr;
+        Surface* color_surface = fb_params.color_id ? &slot_surfaces[fb_params.color_id] : nullptr;
+        Surface* depth_surface = fb_params.depth_id ? &slot_surfaces[fb_params.depth_id] : nullptr;
         it->second = slot_framebuffers.insert(runtime, fb_params, color_surface, depth_surface);
     }
-
-    return FramebufferHelper<T>{this, &slot_framebuffers[it->second],
-                                regs.framebuffer.framebuffer.IsFlipped(), regs.rasterizer, fb_rect};
+    return &slot_framebuffers[it->second];
 }
 
 template <class T>
@@ -1570,6 +1612,16 @@ bool RasterizerCache<T>::ValidateByRelayout(SurfaceId surface_id, const SurfaceI
 }
 
 template <class T>
+bool RasterizerCache<T>::IsNativeScaleShadowMap(const SurfaceParams& surface) const {
+    if (surface.res_scale != 1 || resolution_scale_factor == 1 ||
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyShadowMapScale)) {
+        return false;
+    }
+    const auto target = std::ranges::find(shadow_map_targets, surface.addr, &ShadowMapTarget::addr);
+    return target != shadow_map_targets.end() && !target->with_depth;
+}
+
+template <class T>
 bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfaceParams params,
                                                     const SurfaceInterval& interval) {
     SurfaceId reinterpret_id =
@@ -1582,6 +1634,9 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
         }
         const u32 res_scale = src_surface.res_scale;
         const u8 sample_count = src_surface.sample_count;
+        if (res_scale > surface.res_scale && IsNativeScaleShadowMap(surface)) {
+            return false;
+        }
         if ((res_scale > surface.res_scale) || (sample_count > surface.sample_count)) {
             surface.ScaleUp(res_scale, sample_count);
         }

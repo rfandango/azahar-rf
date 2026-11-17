@@ -147,7 +147,16 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
 RasterizerVulkan::~RasterizerVulkan() = default;
 
 void RasterizerVulkan::TickFrame() {
+    // The cache frees what the GPU is done with, going by how far its submissions got. That
+    // is past anything the render thread still has to pass on, so there is nothing to wait
+    // for here. With LibRetro the frontend owns the device and that progress is not known.
+#ifdef HAVE_LIBRETRO
     scheduler.WaitWorker();
+#else
+    if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyFrameHandoff) {
+        scheduler.WaitWorker();
+    }
+#endif
     res_cache.TickFrame();
 }
 
@@ -562,6 +571,11 @@ void RasterizerVulkan::DrawTriangles() {
     Draw(false, false);
 }
 
+void RasterizerVulkan::NoteDrawOverwrites(bool color, bool depth) {
+    next_draw_overwrites_color = color;
+    next_draw_overwrites_depth = depth;
+}
+
 bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     MICROPROFILE_SCOPE(Vulkan_Drawing);
     SyncDrawState();
@@ -634,7 +648,11 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     }
 
     // Sync and bind the texture surfaces
-    SyncTextureUnits(framebuffer);
+    const bool overwrites_color = next_draw_overwrites_color && write_color_fb && !shadow_rendering;
+    const bool overwrites_depth = next_draw_overwrites_depth && write_depth_fb && !shadow_rendering;
+    if (SyncTextureUnits(framebuffer, draw_rect, overwrites_color)) {
+        framebuffer = fb_helper.Refresh();
+    }
     SyncUtilityTextures(framebuffer);
 
     // Sync and bind the shader. With Z-buffering the viewport applies the PICA depth range, so
@@ -643,7 +661,11 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyDepthWrite)
             ? std::nullopt
             : Pica::Shader::GetViewportDepthRange(regs.rasterizer);
-    pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value());
+    // A scissor that keeps the inside of a rectangle is done with the scissor of the draw
+    const bool host_scissor =
+        regs.rasterizer.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Include &&
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyScissor) == 0;
+    pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value(), host_scissor);
     pipeline_info.dynamic_info.depth_min = depth_range ? depth_range->min_depth : 0.f;
     pipeline_info.dynamic_info.depth_max = depth_range ? depth_range->max_depth : 1.f;
 
@@ -655,7 +677,9 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     // Begin rendering
     CITRA_FRAME_DUMP("  vk draw rect {},{} {}x{}", draw_rect.left, draw_rect.bottom,
                      draw_rect.GetWidth(), draw_rect.GetHeight());
-    renderpass_cache.BeginRendering(framebuffer, draw_rect);
+    // The draw is confined to that rectangle. If it overwrites all of it and a render pass
+    // begins with it, there is nothing in the rectangle for the pass to load.
+    renderpass_cache.BeginRendering(framebuffer, draw_rect, overwrites_color, overwrites_depth);
 
     // Configure viewport and scissor
     const auto viewport = fb_helper.Viewport();
@@ -666,6 +690,16 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         viewport.y + viewport.height,
     };
     pipeline_info.dynamic_info.scissor = draw_rect;
+    if (host_scissor) {
+        // The same pixels the shader's test would keep: those from x1, y1 up to x2, y2
+        const s32 left = std::max(static_cast<s32>(draw_rect.left), scissor_x1);
+        const s32 right = std::max(left, std::min(static_cast<s32>(draw_rect.right), scissor_x2));
+        const s32 bottom = std::max(static_cast<s32>(draw_rect.bottom), scissor_y1);
+        const s32 top = std::max(bottom, std::min(static_cast<s32>(draw_rect.top), scissor_y2));
+        pipeline_info.dynamic_info.scissor =
+            Common::Rectangle<u32>{static_cast<u32>(left), static_cast<u32>(top),
+                                   static_cast<u32>(right), static_cast<u32>(bottom)};
+    }
 
     // Draw the vertex batch
     bool succeeded = true;
@@ -688,11 +722,23 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     }
 
     vertex_batch.clear();
+    CITRA_FRAME_DUMP_GPU_TIME_OF_DRAW(scheduler);
     return succeeded;
 }
 
-void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
+bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
+                                        const Common::Rectangle<u32>& draw_rect,
+                                        bool overwrites_color) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
+    // The view the colour surface is drawn to through, before and after it changed images
+    const vk::ImageView color_view = framebuffer->ImageView(SurfaceType::Color);
+    vk::ImageView swapped_color_view{};
+    vk::ImageView swapped_sample_view{};
+    const bool may_swap =
+        overwrites_color && framebuffer->Samples() == 1 && framebuffer->color_level == 0 &&
+        !pipeline_info.state.blending.rgb_blend_emulation &&
+        !pipeline_info.state.blending.alpha_blend_emulation &&
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyAttachments) == 0;
 
     const auto pica_textures = regs.texturing.GetTextures();
     const bool use_cube_heap =
@@ -740,7 +786,9 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
             switch (texture.config.type.Value()) {
             case TextureType::Shadow2D: {
                 Surface& surface = res_cache.GetTextureSurface(texture);
-                Sampler& sampler = res_cache.GetSampler(texture.config);
+                // The shader gathers the texels, which hold depths as integers: a sampler
+                // that filters has no business with those
+                Sampler& sampler = res_cache.GetSampler(texture.config, true);
                 surface.flags |= VideoCore::SurfaceFlagBits::ShadowSource;
                 update_queue.AddImageSampler(texture_set, texture_index, 0, surface.StorageView(),
                                              sampler.Handle());
@@ -762,13 +810,27 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
         // Bind the texture provided by the rasterizer cache
         Surface& surface = res_cache.GetTextureSurface(texture);
         Sampler& sampler = res_cache.GetSampler(texture.config);
-        const vk::ImageView color_view = framebuffer->ImageView(SurfaceType::Color);
-        const bool is_feedback_loop = color_view == surface.FramebufferView();
-        if (is_feedback_loop) {
+        const vk::ImageView surface_view = surface.FramebufferView();
+        vk::ImageView texture_view;
+        if (swapped_color_view && surface_view == swapped_color_view) {
+            // Another unit samples the colour target as well
+            texture_view = swapped_sample_view;
+        } else if (surface_view != color_view) {
+            texture_view = surface.ImageView();
+        } else if (may_swap && surface.CanSwapForOverwrite()) {
+            // The draw samples what it draws to and leaves nothing of it in the rectangle it
+            // is confined to: a full-screen effect done in place. Instead of copying all of
+            // the target for it to sample, it draws to the target's second image.
+            CITRA_FRAME_DUMP("  vk tex{} is the colour target, all overwritten: the target moves "
+                             "to its other image",
+                             texture_index);
+            swapped_sample_view = surface.SwapForOverwrite(draw_rect);
+            swapped_color_view = surface.FramebufferView();
+            texture_view = swapped_sample_view;
+        } else {
             CITRA_FRAME_DUMP("  vk tex{} is the colour target: sampling a copy", texture_index);
+            texture_view = surface.CopyImageView();
         }
-        const vk::ImageView texture_view =
-            is_feedback_loop ? surface.CopyImageView() : surface.ImageView();
         update_queue.AddImageSampler(texture_set, texture_index, 0, texture_view, sampler.Handle());
     }
 
@@ -781,6 +843,7 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
         update_queue.AddImageSampler(texture_set, 3, 0, color_surface.CopyImageView(),
                                      null_sampler.Handle());
     }
+    return static_cast<bool>(swapped_color_view);
 }
 
 void RasterizerVulkan::SyncUtilityTextures(const Framebuffer* framebuffer) {
@@ -888,17 +951,26 @@ void RasterizerVulkan::ClearAll(bool flush) {
 
 bool RasterizerVulkan::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     bound_target.valid = false;
-    return res_cache.AccelerateDisplayTransfer(config);
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "what came before this transfer");
+    const bool done = res_cache.AccelerateDisplayTransfer(config);
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "transfer");
+    return done;
 }
 
 bool RasterizerVulkan::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     bound_target.valid = false;
-    return res_cache.AccelerateTextureCopy(config);
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "what came before this texture copy");
+    const bool done = res_cache.AccelerateTextureCopy(config);
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "texture copy");
+    return done;
 }
 
 bool RasterizerVulkan::AccelerateFill(const Pica::MemoryFillConfig& config) {
     bound_target.valid = false;
-    return res_cache.AccelerateFill(config);
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "what came before this fill");
+    const bool done = res_cache.AccelerateFill(config);
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "fill");
+    return done;
 }
 
 bool RasterizerVulkan::AccelerateDisplay(const Pica::FramebufferConfig& config,

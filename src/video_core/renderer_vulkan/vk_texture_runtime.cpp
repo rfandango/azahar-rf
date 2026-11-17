@@ -826,6 +826,10 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
     }
 
     const bool need_format_list = is_mutable && instance.IsImageFormatListSupported();
+    image_usage = usage;
+    image_flags = flags;
+    image_format_list = need_format_list;
+    has_image_params = true;
     handles[Type::Base].Create(width, height, levels, texture_type, format,
                                vk::SampleCountFlagBits::e1, usage, flags, traits.aspect,
                                need_format_list, DebugName(false));
@@ -1276,18 +1280,147 @@ vk::PipelineStageFlags Surface::PipelineStageFlags() const noexcept {
                        : vk::PipelineStageFlagBits::eNone);
 }
 
-vk::ImageView Surface::CopyImageView() noexcept {
+bool Surface::EnsureCopyHandle() {
     auto& copy_handle = handles[Type::Copy];
-    vk::ImageLayout copy_layout = vk::ImageLayout::eGeneral;
-    if (!copy_handle) {
+    if (copy_handle) {
+        return false;
+    }
+    if (has_image_params) {
+        // Of the same kind as the image the surface is in, so that the two can change places
+        copy_handle.Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type, traits.native,
+                           vk::SampleCountFlagBits::e1, image_usage, image_flags, traits.aspect,
+                           image_format_list);
+    } else {
         vk::ImageCreateFlags flags{};
         if (texture_type == VideoCore::TextureType::CubeMap) {
             flags |= vk::ImageCreateFlagBits::eCubeCompatible;
         }
         copy_handle.Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type, traits.native,
                            vk::SampleCountFlagBits::e1, traits.usage, flags, traits.aspect, false);
-        copy_layout = vk::ImageLayout::eUndefined;
     }
+    return true;
+}
+
+bool Surface::CanSwapForOverwrite() const noexcept {
+    return has_image_params && levels == 1 && sample_count == 1 &&
+           texture_type == VideoCore::TextureType::Texture2D &&
+           traits.aspect == vk::ImageAspectFlagBits::eColor &&
+           current == (res_scale != 1 ? Type::Scaled : Type::Base);
+}
+
+vk::ImageView Surface::SwapForOverwrite(const Common::Rectangle<u32>& rect) noexcept {
+    const vk::ImageLayout copy_layout =
+        EnsureCopyHandle() ? vk::ImageLayout::eUndefined : vk::ImageLayout::eGeneral;
+    auto& copy_handle = handles[Type::Copy];
+
+    runtime.renderpass_cache.EndRendering();
+
+    // What is outside the rectangle, in up to four pieces: below, above, left and right
+    const u32 width = GetScaledWidth();
+    const u32 height = GetScaledHeight();
+    const u32 left = std::min(std::min(rect.left, rect.right), width);
+    const u32 right = std::min(std::max(rect.left, rect.right), width);
+    const u32 bottom = std::min(std::min(rect.bottom, rect.top), height);
+    const u32 top = std::min(std::max(rect.bottom, rect.top), height);
+    std::array<vk::ImageCopy, 4> regions{};
+    u32 num_regions = 0;
+    const auto keep = [&regions, &num_regions](u32 x0, u32 y0, u32 x1, u32 y1) {
+        if (x0 >= x1 || y0 >= y1) {
+            return;
+        }
+        const vk::ImageSubresourceLayers layers = {
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        regions[num_regions++] = vk::ImageCopy{
+            .srcSubresource = layers,
+            .srcOffset = {static_cast<s32>(x0), static_cast<s32>(y0), 0},
+            .dstSubresource = layers,
+            .dstOffset = {static_cast<s32>(x0), static_cast<s32>(y0), 0},
+            .extent = {x1 - x0, y1 - y0, 1},
+        };
+    };
+    keep(0, 0, width, bottom);
+    keep(0, top, width, height);
+    keep(0, bottom, left, top);
+    keep(right, bottom, width, top);
+
+    const RecordParams params = {
+        .aspect = Aspect(),
+        .pipeline_flags = PipelineStageFlags(),
+        .src_access = AccessFlags(),
+        .src_image = Image(),
+        .dst_image = copy_handle.image,
+    };
+    scheduler.Record([params, copy_layout, regions, num_regions](vk::CommandBuffer cmdbuf) {
+        const std::array pre_barriers = {
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = params.src_image,
+                .subresourceRange = MakeSubresourceRange(params.aspect, 0, 1),
+            },
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eShaderRead,
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .oldLayout = copy_layout,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = params.dst_image,
+                .subresourceRange = MakeSubresourceRange(params.aspect, 0, 1),
+            },
+        };
+        // From here on the image the surface was in is sampled and the other one drawn to
+        const std::array post_barriers = {
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = params.src_image,
+                .subresourceRange = MakeSubresourceRange(params.aspect, 0, 1),
+            },
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = params.dst_image,
+                .subresourceRange = MakeSubresourceRange(params.aspect, 0, 1),
+            },
+        };
+        cmdbuf.pipelineBarrier(params.pipeline_flags, vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
+        if (num_regions != 0) {
+            cmdbuf.copyImage(params.src_image, vk::ImageLayout::eTransferSrcOptimal,
+                             params.dst_image, vk::ImageLayout::eTransferDstOptimal, num_regions,
+                             regions.data());
+        }
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, params.pipeline_flags,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
+    });
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "copy of what is outside the rectangle");
+
+    std::swap(handles[current], copy_handle);
+    swapped = !swapped;
+    return ImageView(ViewType::Sample, Type::Copy);
+}
+
+vk::ImageView Surface::CopyImageView() noexcept {
+    auto& copy_handle = handles[Type::Copy];
+    const vk::ImageLayout copy_layout =
+        EnsureCopyHandle() ? vk::ImageLayout::eUndefined : vk::ImageLayout::eGeneral;
 
     CITRA_FRAME_DUMP("  vk full-surface copy {}x{} levels {} @{:08X} (ends the render pass)",
                      GetScaledWidth(), GetScaledHeight(), levels, addr);
@@ -1378,6 +1511,7 @@ vk::ImageView Surface::CopyImageView() noexcept {
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, params.pipeline_flags,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
     });
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "full-surface copy");
 
     return copy_handle.image_views[ViewType::Sample];
 }

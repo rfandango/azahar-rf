@@ -505,11 +505,16 @@ bool Instance::CreateDevice() {
     }
 #endif
 
-    static constexpr std::array<f32, 1> queue_priorities = {1.0f};
+    // A second queue, where there is one, to hand images to the display on: that can block
+    // for as long as a frame takes to render, and nothing may be submitted to a queue meanwhile
+    static constexpr std::array<f32, 2> queue_priorities = {1.0f, 1.0f};
+    const u32 queue_count = std::min<u32>(family_properties[queue_family_index].queueCount,
+                                          static_cast<u32>(queue_priorities.size()));
+    separate_present_queue = queue_count > 1;
 
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = queue_count,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -657,7 +662,7 @@ bool Instance::CreateDevice() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
-    present_queue = device->getQueue(queue_family_index, 0);
+    present_queue = device->getQueue(queue_family_index, separate_present_queue ? 1 : 0);
 
     CreateAllocator();
     return true;

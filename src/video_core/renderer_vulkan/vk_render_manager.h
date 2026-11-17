@@ -45,8 +45,12 @@ public:
     explicit RenderManager(const Instance& instance, Scheduler& scheduler);
     ~RenderManager();
 
-    /// Begins a new renderpass with the provided framebuffer as render target.
-    void BeginRendering(const Framebuffer* framebuffer, Common::Rectangle<u32> draw_rect);
+    /// Begins a new renderpass with the provided framebuffer as render target, unless the one
+    /// that is open can go on. The draw that follows is confined to the rectangle; if it
+    /// overwrites all the colour or all the depth and stencil in it, a pass that begins here
+    /// does not load those.
+    void BeginRendering(const Framebuffer* framebuffer, Common::Rectangle<u32> draw_rect,
+                        bool overwrites_color = false, bool overwrites_depth = false);
 
     /// Begins a new renderpass with the provided render state.
     void BeginRendering(const RenderPass& new_pass);
@@ -58,10 +62,17 @@ public:
     vk::RenderPass GetRenderpass(VideoCore::PixelFormat color, VideoCore::PixelFormat depth,
                                  bool is_clear, u8 sample_count = 1);
 
+    /// Returns a renderpass for the format pair that begins without loading the attachments
+    /// named, whose content in the render area is undefined until it is drawn over
+    vk::RenderPass GetDiscardingRenderpass(VideoCore::PixelFormat color,
+                                           VideoCore::PixelFormat depth, bool discard_color,
+                                           bool discard_depth);
+
 private:
     /// Creates a renderpass configured appropriately and stores it in cached_renderpasses
     vk::UniqueRenderPass CreateRenderPass(vk::Format color, vk::Format depth,
-                                          vk::AttachmentLoadOp load_op) const;
+                                          vk::AttachmentLoadOp color_load_op,
+                                          vk::AttachmentLoadOp depth_load_op) const;
 
     /// Creates an MSAA renderpass configured appropriately and stores it in cached_renderpasses
     vk::UniqueRenderPass CreateRenderPassMSAA(vk::Format color, vk::Format depth,
@@ -73,6 +84,8 @@ private:
     Scheduler& scheduler;
     vk::UniqueRenderPass cached_renderpasses[NumColorFormats + 1][NumDepthFormats + 1]
                                             [std::bit_width(MaxSamples)][2];
+    /// Those that do not load colour, depth or either
+    vk::UniqueRenderPass discarding_renderpasses[NumColorFormats + 1][NumDepthFormats + 1][3];
     std::mutex cache_mutex;
     std::array<vk::Image, 4> images;
     std::array<vk::ImageAspectFlags, 4> aspects;

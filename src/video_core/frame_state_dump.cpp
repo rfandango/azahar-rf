@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <string_view>
 #include <android/log.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
@@ -20,12 +21,18 @@
 namespace VideoCore::FrameStateDump {
 
 std::atomic_bool active{false};
+std::atomic_bool times_gpu{false};
+std::atomic_bool times_draws{false};
 
 namespace {
 
 constexpr const char* TRIGGER_PROPERTY = "debug.azahar.dump_frame";
 constexpr const char* LOG_TAG = "AzaharFrameDump";
 constexpr u32 VBLANKS_PER_DUMP = 2;
+/// With GPU times a game frame is wanted that starts with the GPU idle, which the first is not
+constexpr u32 VBLANKS_PER_TIMED_DUMP = 4;
+constexpr std::string_view TIMED_PREFIX = "gpu";
+constexpr std::string_view TIMED_DRAWS_PREFIX = "gpud";
 
 std::mutex mutex;
 std::string buffer;
@@ -153,6 +160,15 @@ void Draw(const Pica::RegsInternal& regs, bool hardware_shader, bool is_indexed,
         static_cast<u32>(om.logic_op.Value()), om.stencil_test.enable.Value(),
         static_cast<u32>(rast.cull_mode.Value()),
         static_cast<u32>(om.fragment_operation_mode.Value()));
+    if (om.stencil_test.enable) {
+        out += fmt::format(" sten f={} ref={:02X} in={:02X} wr={:02X} ops={}{}{}",
+                           static_cast<u32>(om.stencil_test.func.Value()),
+                           om.stencil_test.reference_value.Value(),
+                           om.stencil_test.input_mask.Value(), om.stencil_test.write_mask.Value(),
+                           static_cast<u32>(om.stencil_test.action_stencil_fail.Value()),
+                           static_cast<u32>(om.stencil_test.action_depth_fail.Value()),
+                           static_cast<u32>(om.stencil_test.action_depth_pass.Value()));
+    }
 
     const u32 num_lights = lighting.disable ? 0 : lighting.max_light_index + 1;
     out += fmt::format(" | light n={} cfg={} bump={} shadow={} c0={:08X} c1={:08X}", num_lights,
@@ -197,6 +213,8 @@ void OnVBlank() {
         std::scoped_lock lock{mutex};
         if (--vblanks_left == 0) {
             active.store(false, std::memory_order_relaxed);
+            times_gpu.store(false, std::memory_order_relaxed);
+            times_draws.store(false, std::memory_order_relaxed);
             Write();
             buffer.clear();
         } else {
@@ -225,7 +243,10 @@ void OnVBlank() {
     buffer.clear();
     buffer += "=== vblank\n";
     draw_index = 0;
-    vblanks_left = VBLANKS_PER_DUMP;
+    const bool timed = request.starts_with(TIMED_PREFIX);
+    vblanks_left = timed ? VBLANKS_PER_TIMED_DUMP : VBLANKS_PER_DUMP;
+    times_gpu.store(timed, std::memory_order_relaxed);
+    times_draws.store(request.starts_with(TIMED_DRAWS_PREFIX), std::memory_order_relaxed);
     active.store(true, std::memory_order_relaxed);
 }
 

@@ -35,7 +35,7 @@ public:
         const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, const VertexLayout& layout);
     std::optional<std::pair<u64, Shader* const>> UseFragmentShader(
         const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
-        bool depth_from_viewport);
+        bool depth_from_viewport, bool host_scissor);
     std::optional<std::pair<u64, Shader* const>> UseFixedGeometryShader(
         const Pica::RegsInternal& regs);
 
@@ -128,7 +128,8 @@ private:
     static_assert(sizeof(VSProgramEntry) == 32784);
 
     struct FSConfigEntry {
-        static constexpr u8 EXPECTED_VERSION = 0;
+        // 1: shadow textures are gathered, with a sampler that does not filter
+        static constexpr u8 EXPECTED_VERSION = 1;
 
         u64 version; // Surprise tool that can help us later
 

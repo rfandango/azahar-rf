@@ -97,7 +97,9 @@ public:
     Surface& GetSurface(SurfaceId surface_id);
 
     /// Returns a reference to the sampler object matching the provided configuration
-    Sampler& GetSampler(const Pica::TexturingRegs::TextureConfig& config);
+    /// With `nearest` the sampler does not filter, whatever the texture and the settings ask
+    /// for: for textures whose texels are not colours to blend
+    Sampler& GetSampler(const Pica::TexturingRegs::TextureConfig& config, bool nearest = false);
     Sampler& GetSampler(SamplerId sampler_id);
 
     /// Copy one surface's region to another
@@ -122,6 +124,10 @@ public:
 
     /// Get the color and depth surfaces based on the framebuffer configuration
     FramebufferHelper<T> GetFramebufferSurfaces(bool using_color_fb, bool using_depth_fb);
+
+    /// The framebuffer for the same surfaces as these parameters name, with the colour surface
+    /// in the image it is in now
+    Framebuffer* RefreshFramebuffer(FramebufferParams params);
 
     /// Get a surface that matches a "texture copy" display transfer config
     SurfaceRect_Tuple GetTexCopySurface(const SurfaceParams& params);
@@ -263,6 +269,16 @@ private:
     void ApplyDownscaledTargetScale(SurfaceParams& color_params, SurfaceParams& depth_params);
 
     std::vector<DownscaledTarget> downscaled_targets;
+
+    /// A colour buffer that a shadow map was rendered into
+    struct ShadowMapTarget {
+        PAddr addr;
+        /// Drawn to together with a depth buffer, which is at the resolution scale
+        bool with_depth;
+    };
+    std::vector<ShadowMapTarget> shadow_map_targets;
+    /// Whether the surface is a shadow map that is kept at the size the game gave it
+    bool IsNativeScaleShadowMap(const SurfaceParams& surface) const;
     Settings::TextureFilter filter;
     bool dump_textures;
     bool use_custom_textures;

@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <boost/container/small_vector.hpp>
+#include "common/trace_markers.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 #include "video_core/shader/generator/spv_fs_shader_gen.h"
 
@@ -216,6 +217,13 @@ void FragmentModule::WriteLighting() {
     if (!config.lighting.enable) {
         return;
     }
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::SkipLightingMath) {
+        primary_fragment_color = ConstF32(0.5f, 0.5f, 0.5f, 1.f);
+        secondary_fragment_color = ConstF32(0.f, 0.f, 0.f, 1.f);
+        return;
+    }
+#endif
 
     const auto& lighting = config.lighting;
 
@@ -786,40 +794,38 @@ Id FragmentModule::SampleShadow() {
     const Id sampled_image{OpLoad(TypeSampledImage(image2d_u32_id), tex0_id)};
     const Id shadow_texture{OpImage(image2d_u32_id, sampled_image)};
     const Id px_size{OpImageQuerySizeLod(ivec_ids.Get(2), shadow_texture, ConstS32(0))};
-    const Id coord{OpFma(vec_ids.Get(2), OpConvertSToF(vec_ids.Get(2), px_size), texcoord0,
-                         ConstF32(-0.5f, -0.5f))};
+    const Id px_size_f{OpConvertSToF(vec_ids.Get(2), px_size)};
+    const Id coord{OpFma(vec_ids.Get(2), px_size_f, texcoord0, ConstF32(-0.5f, -0.5f))};
     const Id coord_floor{OpFloor(vec_ids.Get(2), coord)};
     const Id f{OpFSub(vec_ids.Get(2), coord, coord_floor)};
     const Id i{OpConvertFToS(ivec_ids.Get(2), coord_floor)};
 
-    const auto sample_shadow2D = [&](Id uv) -> Id {
-        const Id true_label{OpLabel()};
-        const Id false_label{OpLabel()};
-        const Id end_label{OpLabel()};
+    // The four texels around the point are compared, every lit fragment of a scene with
+    // shadows does this. They are fetched with one gather instead of one by one: a quarter of
+    // the texture lookups. Gathering at the corner the four share returns exactly them, as
+    // that corner is half a texel away from where any other four begin.
+    const Id corner{
+        OpFDiv(vec_ids.Get(2), OpFAdd(vec_ids.Get(2), coord_floor, ConstF32(1.f, 1.f)), px_size_f)};
+    const Id texels{OpImageGather(uvec_ids.Get(4), sampled_image, corner, ConstS32(0))};
+
+    // A texel outside the texture counts as lit. The gather returns what the wrap mode makes
+    // of it, which is put aside.
+    const auto sample_shadow2D = [&](Id uv, u32 component) -> Id {
         const Id uv_le_zero{OpSLessThan(bvec_ids.Get(2), uv, ConstS32(0, 0))};
         const Id uv_geq_size{OpSGreaterThanEqual(bvec_ids.Get(2), uv, px_size)};
-        const Id cond{
+        const Id outside{
             OpAny(bool_id, OpCompositeConstruct(bvec_ids.Get(4), uv_le_zero, uv_geq_size))};
-        OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
-        OpBranchConditional(cond, true_label, false_label);
-        AddLabel(true_label);
-        OpBranch(end_label);
-        AddLabel(false_label);
-        const Id px_texel{OpImageFetch(uvec_ids.Get(4), shadow_texture, uv,
-                                       spv::ImageOperandsMask::Lod, ConstS32(0))};
-        const Id px_texel_x{OpCompositeExtract(u32_id, px_texel, 0)};
-        const Id result{CompareShadow(px_texel_x, z)};
-        OpBranch(end_label);
-        AddLabel(end_label);
-        return OpPhi(f32_id, ConstF32(1.f), true_label, result, false_label);
+        const Id texel{OpCompositeExtract(u32_id, texels, component)};
+        return OpSelect(f32_id, outside, ConstF32(1.f), CompareShadow(texel, z));
     };
 
+    // A gather returns the texels at (0, 1), (1, 1), (1, 0) and (0, 0), in that order
     const Id s_xy{
-        OpCompositeConstruct(vec_ids.Get(2), sample_shadow2D(i),
-                             sample_shadow2D(OpIAdd(ivec_ids.Get(2), i, ConstS32(1, 0))))};
+        OpCompositeConstruct(vec_ids.Get(2), sample_shadow2D(i, 3),
+                             sample_shadow2D(OpIAdd(ivec_ids.Get(2), i, ConstS32(1, 0)), 2))};
     const Id s_zw{OpCompositeConstruct(
-        vec_ids.Get(2), sample_shadow2D(OpIAdd(ivec_ids.Get(2), i, ConstS32(0, 1))),
-        sample_shadow2D(OpIAdd(ivec_ids.Get(2), i, ConstS32(1, 1))))};
+        vec_ids.Get(2), sample_shadow2D(OpIAdd(ivec_ids.Get(2), i, ConstS32(0, 1)), 0),
+        sample_shadow2D(OpIAdd(ivec_ids.Get(2), i, ConstS32(1, 1)), 1))};
     const Id f_yy{OpVectorShuffle(vec_ids.Get(2), f, f, 1, 1)};
     const Id t{OpFMix(vec_ids.Get(2), s_xy, s_zw, f_yy)};
     const Id t_x{OpCompositeExtract(f32_id, t, 0)};
@@ -984,6 +990,11 @@ void FragmentModule::DefineTexSampler(u32 texture_unit) {
     // (See OpenGL 4.6 spec, 8.14.1 - Scale Factor and Level-of-Detail)
     const auto sample_lod = [&](Id tex_id) {
         const Id sampled_image{OpLoad(TypeSampledImage(image2d_id), tex_id)};
+        if (config.texture.single_level & (1u << texture_unit)) {
+            // The one level the texture has, whatever the formula below would come to
+            return OpImageSampleExplicitLod(vec_ids.Get(4), sampled_image, texcoord,
+                                            spv::ImageOperandsMask::Lod, ConstF32(0.f));
+        }
         const Id tex_image{OpImage(image2d_id, sampled_image)};
         const Id tex_size{OpImageQuerySizeLod(ivec_ids.Get(2), tex_image, ConstS32(0))};
         const Id coord{OpFMul(vec_ids.Get(2), texcoord, OpConvertSToF(vec_ids.Get(2), tex_size))};

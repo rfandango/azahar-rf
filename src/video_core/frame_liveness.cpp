@@ -201,8 +201,10 @@ bool FrameLiveness::MayReplaceTarget(const Pica::RegsInternal& regs) const {
     const auto& framebuffer = regs.framebuffer.framebuffer;
     const auto& merger = regs.framebuffer.output_merger;
 
-    // Two triangles at the most
-    if (regs.pipeline.num_vertices > 6) {
+    // Two triangles at the most, facing either way
+    using CullMode = Pica::RasterizerRegs::CullMode;
+    if (regs.pipeline.num_vertices > 6 || regs.rasterizer.cull_mode == CullMode::KeepClockWise ||
+        regs.rasterizer.cull_mode == CullMode::KeepCounterClockWise) {
         return false;
     }
     // No pixel is kept from being written

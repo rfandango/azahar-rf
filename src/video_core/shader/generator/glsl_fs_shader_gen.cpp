@@ -1720,8 +1720,12 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
     case 0:
         switch (config.texture.texture0_type) {
         case TexturingRegs::TextureConfig::Texture2D:
-            out += "return textureLod(tex0, texcoord0, getLod(texcoord0 * "
-                   "vec2(textureSize(tex0, 0))) + tex_lod_bias[0]);";
+            if (config.texture.single_level & 1u) {
+                out += "return textureLod(tex0, texcoord0, 0.0);";
+            } else {
+                out += "return textureLod(tex0, texcoord0, getLod(texcoord0 * "
+                       "vec2(textureSize(tex0, 0))) + tex_lod_bias[0]);";
+            }
             break;
         case TexturingRegs::TextureConfig::Projection2D:
             // TODO (wwylele): find the exact LOD formula for projection texture
@@ -1745,18 +1749,24 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
         }
         break;
     case 1:
-        out += "return textureLod(tex1, texcoord1, getLod(texcoord1 * vec2(textureSize(tex1, "
-               "0))) + tex_lod_bias[1]);";
-        break;
-    case 2:
-        if (config.texture.texture2_use_coord1) {
-            out += "return textureLod(tex2, texcoord1, getLod(texcoord1 * "
-                   "vec2(textureSize(tex2, 0))) + tex_lod_bias[2]);";
+        if (config.texture.single_level & 2u) {
+            out += "return textureLod(tex1, texcoord1, 0.0);";
         } else {
-            out += "return textureLod(tex2, texcoord2, getLod(texcoord2 * "
-                   "vec2(textureSize(tex2, 0))) + tex_lod_bias[2]);";
+            out += "return textureLod(tex1, texcoord1, getLod(texcoord1 * vec2(textureSize(tex1, "
+                   "0))) + tex_lod_bias[1]);";
         }
         break;
+    case 2: {
+        const char* texcoord = config.texture.texture2_use_coord1 ? "texcoord1" : "texcoord2";
+        if (config.texture.single_level & 4u) {
+            out += fmt::format("return textureLod(tex2, {}, 0.0);", texcoord);
+        } else {
+            out += fmt::format("return textureLod(tex2, {0}, getLod({0} * "
+                               "vec2(textureSize(tex2, 0))) + tex_lod_bias[2]);",
+                               texcoord);
+        }
+        break;
+    }
     case 3:
         if (config.proctex.enable) {
             out += "return ProcTex();";

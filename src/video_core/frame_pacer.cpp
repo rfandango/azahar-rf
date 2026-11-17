@@ -94,10 +94,26 @@ s64 FramePacer::LowestRecentLead() const {
     return *std::min_element(recent_leads.begin(), recent_leads.begin() + count);
 }
 
+s64 FramePacer::LowestRecentDelay() const {
+    const std::size_t count = std::min<std::size_t>(delay_samples, recent_delays.size());
+    if (count == 0) {
+        return minimum_lead + nominal_period;
+    }
+    return *std::min_element(recent_delays.begin(), recent_delays.begin() + count);
+}
+
 void FramePacer::NoteDisplayed(u32 present_id, u64 display_time_ns) {
     std::scoped_lock lock{mutex};
     const Nanos time = static_cast<Nanos>(display_time_ns);
     last_report = Clock::now();
+
+    if (present_id != 0) {
+        const HandedOver& image = handed_over_at[present_id % handed_over_at.size()];
+        if (image.present_id == present_id && time > image.time) {
+            recent_delays[delay_samples % recent_delays.size()] = time - image.time;
+            delay_samples++;
+        }
+    }
 
     // The refresh period, from reports far enough apart for their precision not to matter
     if (period_anchor == 0 || time <= last_display || time - period_anchor > 4 * SECOND) {
@@ -154,6 +170,7 @@ u64 FramePacer::Schedule(u32 present_id, u64 vblank, Clock::time_point now) {
         return 0;
     }
     const Nanos handed_over = ToNanos(now);
+    handed_over_at[present_id % handed_over_at.size()] = HandedOver{present_id, handed_over};
 
     // One emulated VBlank per refresh, or per whole number of refreshes on a faster display
     const double refreshes_per_vblank = std::max(1.0, std::round(VBLANK_PERIOD / period));
@@ -243,12 +260,28 @@ u64 FramePacer::Schedule(u32 present_id, u64 vblank, Clock::time_point now) {
         speed_scale.store(1.0, std::memory_order_relaxed);
     }
 
-    if (overloaded || (experiments & Common::TraceMarkers::NoPresentTimes)) {
+    if (experiments & Common::TraceMarkers::NoPresentTimes) {
         return 0;
     }
-    // The display shows an image at the first refresh after the time asked for: ask for the
-    // middle of the refresh period before, which leaves half a period of error either way
-    return static_cast<u64>(target - static_cast<Nanos>(period / 2));
+    const Nanos half_period = static_cast<Nanos>(period / 2);
+    Nanos time;
+    if (overloaded) {
+        // There is no slot to keep, so the image is to be shown as soon as it can be. It is
+        // given a time all the same: the display goes on using the last time it was given, and
+        // an image whose time is long past is skipped as soon as another waits behind it, which
+        // with a busy GPU is always. The time is when the image will be on display anyway,
+        // going by the last few, and half a refresh less in case it can be sooner by now.
+        time = handed_over + LowestRecentDelay() - half_period;
+    } else {
+        // The display shows an image at the first refresh after the time asked for: ask for
+        // the middle of the refresh period before, which leaves half a period of error either
+        // way
+        time = target - half_period;
+    }
+    // No two images for the same refresh
+    time = std::max(time, last_time_given + static_cast<Nanos>(period));
+    last_time_given = time;
+    return static_cast<u64>(time);
 }
 
 FramePacer::Status FramePacer::GetStatus() const {

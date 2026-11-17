@@ -111,7 +111,8 @@ void RendererBase::EndFrame() {
     const u64 game_frames = system.perf_stats->GetGameFrameCount();
     if (game_frames != limited_game_frames) {
         limited_game_frames = game_frames;
-        if (Settings::values.use_limit_frames_ahead_of_gpu.GetValue()) {
+        if (Settings::values.use_limit_frames_ahead_of_gpu.GetValue() ||
+            AlwaysLimitsFramesAheadOfGpu()) {
             CITRA_TRACE_SCOPE("LimitFramesAheadOfGpu");
             CITRA_HITCH_SCOPE_ABSORB(GpuBehind);
             LimitFramesAheadOfGpu();

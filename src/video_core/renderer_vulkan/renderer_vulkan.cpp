@@ -1205,6 +1205,18 @@ void RendererVulkan::SwapBuffers() {
     EndFrame();
 }
 
+bool RendererVulkan::AlwaysLimitsFramesAheadOfGpu() const {
+#ifdef HAVE_LIBRETRO
+    return false;
+#else
+    // The emulation no longer waits for the render thread at every VBlank, which used to hold
+    // it back (and held the GPU up with it). It may be one game frame ahead of what the GPU
+    // has finished: the GPU then always has the next frame to go on with, and what is on
+    // screen is no older than it has to be.
+    return (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyFrameHandoff) == 0;
+#endif
+}
+
 void RendererVulkan::LimitFramesAheadOfGpu() {
     if (previous_game_frame_tick != 0) {
         scheduler.Wait(previous_game_frame_tick);

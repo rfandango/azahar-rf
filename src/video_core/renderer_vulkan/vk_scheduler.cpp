@@ -2,7 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <chrono>
 #include <mutex>
+#include <string>
 #include <utility>
 #include "common/hitch_tracker.h"
 #include "common/microprofile.h"
@@ -104,6 +106,20 @@ void Scheduler::Wait(u64 tick) {
     master_semaphore->Wait(tick);
 }
 
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+void Scheduler::TimeGpuWork(const std::string& what) {
+    if (is_submitting) {
+        // Called while a submission is put together: its time goes to whoever asked for it
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    Finish();
+    const std::chrono::duration<double, std::milli> elapsed =
+        std::chrono::steady_clock::now() - start;
+    CITRA_FRAME_DUMP("  gpu {:6.2f} ms  {}", elapsed.count(), what);
+}
+#endif
+
 void Scheduler::DispatchWork() {
     if (!use_worker_thread || chunk->Empty()) {
         return;
@@ -189,7 +205,9 @@ void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wa
     state = StateFlags::AllDirty;
     const u64 signal_value = master_semaphore->NextTick();
 
+    is_submitting = true;
     on_submit();
+    is_submitting = false;
     CITRA_TRACE_COUNT(Submits);
     CITRA_FRAME_DUMP("vk submit");
 

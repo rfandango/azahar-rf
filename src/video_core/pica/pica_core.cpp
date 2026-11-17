@@ -1057,15 +1057,100 @@ void PicaCore::DrawImmediate() {
     }
 }
 
+namespace {
+
+/// What a draw overwrites if its triangles cover the viewport: every pixel of the colour
+/// buffer in the area it is confined to, every pixel of depth and stencil there
+struct Overwrites {
+    bool color{};
+    bool depth{};
+};
+
+Overwrites MayOverwriteArea(const RegsInternal& regs) {
+    using Func = FramebufferRegs::CompareFunc;
+    const auto& framebuffer = regs.framebuffer.framebuffer;
+    const auto& merger = regs.framebuffer.output_merger;
+    const auto& rasterizer = regs.rasterizer;
+
+    // Two triangles at the most, facing either way, and no fragment of them is dropped
+    if (regs.pipeline.num_vertices > 6 || merger.alpha_test.enable || rasterizer.clip_enable ||
+        rasterizer.cull_mode == RasterizerRegs::CullMode::KeepClockWise ||
+        rasterizer.cull_mode == RasterizerRegs::CullMode::KeepCounterClockWise ||
+        merger.fragment_operation_mode != FramebufferRegs::FragmentOperationMode::Default) {
+        return {};
+    }
+    if (merger.depth_test_enable && merger.depth_test_func != Func::Always) {
+        return {};
+    }
+    const bool has_stencil = regs.framebuffer.HasStencil();
+    const bool tests_stencil = has_stencil && merger.stencil_test.enable;
+    if (tests_stencil && merger.stencil_test.func != Func::Always) {
+        return {};
+    }
+    // The scissor leaves all of the viewport
+    const auto& scissor = rasterizer.scissor_test;
+    if (scissor.mode == RasterizerRegs::ScissorMode::Exclude) {
+        return {};
+    }
+    if (scissor.mode == RasterizerRegs::ScissorMode::Include) {
+        const auto viewport = rasterizer.GetViewportRect();
+        if (static_cast<s32>(scissor.x1) > viewport.left ||
+            static_cast<s32>(scissor.y1) > viewport.bottom ||
+            static_cast<s32>(scissor.x2) + 1 < viewport.right ||
+            static_cast<s32>(scissor.y2) + 1 < viewport.top) {
+            return {};
+        }
+    }
+
+    Overwrites result;
+    // All of each pixel is written, and nothing of what it held goes into the result
+    if (framebuffer.allow_color_write != 0 && merger.red_enable && merger.green_enable &&
+        merger.blue_enable && merger.alpha_enable) {
+        if (merger.alphablend_enable) {
+            const auto& blending = merger.alpha_blending;
+            result.color = blending.factor_source_rgb == FramebufferRegs::BlendFactor::One &&
+                           blending.factor_source_a == FramebufferRegs::BlendFactor::One &&
+                           blending.factor_dest_rgb == FramebufferRegs::BlendFactor::Zero &&
+                           blending.factor_dest_a == FramebufferRegs::BlendFactor::Zero &&
+                           blending.blend_equation_rgb == FramebufferRegs::BlendEquation::Add &&
+                           blending.blend_equation_a == FramebufferRegs::BlendEquation::Add;
+        } else {
+            result.color = merger.logic_op == FramebufferRegs::LogicOp::Copy;
+        }
+    }
+    // Depth and stencil are one buffer, so both have to be all new
+    const bool may_write = framebuffer.allow_depth_stencil_write != 0;
+    bool new_stencil = true;
+    if (has_stencil) {
+        using Action = FramebufferRegs::StencilAction;
+        const Action action = merger.stencil_test.action_depth_pass;
+        new_stencil = tests_stencil && may_write && merger.stencil_test.write_mask == 0xFF &&
+                      (action == Action::Replace || action == Action::Zero);
+    }
+    result.depth = may_write && merger.depth_write_enable && new_stencil;
+    return result;
+}
+
+} // Anonymous namespace
+
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
     CITRA_TRACE_SCOPE_DETAIL("PICA::DrawArrays");
 
+    // Whether the triangles of a draw cover the viewport is of use twice over: a draw that
+    // replaces all its target holds ends the life of what was drawn there before, and one that
+    // overwrites the area it is confined to lets the renderer begin without what that held.
+    const bool may_replace_target = draw_filter && draw_filter->MayReplaceTarget(regs.internal);
+    const Overwrites may_overwrite = MayOverwriteArea(regs.internal);
+    bool covers_viewport = false;
+    bool covers_exactly = false;
+    if (may_replace_target || may_overwrite.color || may_overwrite.depth) {
+        covers_viewport = CoversViewport(is_indexed, &covers_exactly);
+    }
+
     // A draw whose result nobody will see is left out. The registers were written as usual.
     if (draw_filter) {
-        const bool replaces_target =
-            draw_filter->MayReplaceTarget(regs.internal) && CoversViewport(is_indexed);
-        if (!draw_filter->ShouldAllowDraw(regs.internal, replaces_target)) {
+        if (!draw_filter->ShouldAllowDraw(regs.internal, may_replace_target && covers_viewport)) {
             CITRA_FRAME_DUMP("draw left out: nobody sees its result");
             return;
         }
@@ -1124,11 +1209,19 @@ void PicaCore::DrawArrays(bool is_indexed) {
     if (VideoCore::FrameStateDump::IsActive()) [[unlikely]] {
         VideoCore::FrameStateDump::Draw(regs.internal, accelerate_draw, is_indexed,
                                         vs_setup.GetProgramCodeHash());
+        DumpSmallDraw(is_indexed);
     }
 #endif
 
+    // A pixel of the target is several of the host's, which are all overwritten only by
+    // triangles that reach the edges of the viewport, not just the middle of its last pixels
+    const bool overwrites = covers_viewport && covers_exactly;
+    rasterizer->NoteDrawOverwrites(overwrites && may_overwrite.color,
+                                   overwrites && may_overwrite.depth);
+
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
+        rasterizer->NoteDrawOverwrites(false, false);
         CITRA_TRACE_COUNT(HwDraws);
         return;
     }
@@ -1145,13 +1238,14 @@ void PicaCore::DrawArrays(bool is_indexed) {
 
     // Draw emitted triangles.
     rasterizer->DrawTriangles();
+    rasterizer->NoteDrawOverwrites(false, false);
 
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
     }
 }
 
-bool PicaCore::CoversViewport(bool is_indexed) {
+bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
     using Topology = PipelineRegs::TriangleTopology;
     const auto& pipeline = regs.internal.pipeline;
     if (pipeline.use_gs != PipelineRegs::UseGS::No || !primitive_assembler.IsEmpty()) {
@@ -1189,6 +1283,9 @@ bool PicaCore::CoversViewport(bool is_indexed) {
     constexpr f32 MAX_INSIDE = 0.45f;
     constexpr f32 MAX_OUTSIDE = 1.f;
     constexpr f32 DEPTH_TOLERANCE = 1e-4f;
+    // How far inside still counts as at the corner itself
+    constexpr f32 MAX_INSIDE_EXACTLY = 0.01f;
+    bool at_corners = true;
 
     // Where each vertex ends up, in pixels from the corner it is at (positive to the outside),
     // and that corner: bit 0 for the right, bit 1 for the top
@@ -1228,6 +1325,8 @@ bool PicaCore::CoversViewport(bool is_indexed) {
         }
         offsets[index] = offset;
         corners[index] = (x > 0.f ? 1u : 0u) | (y > 0.f ? 2u : 0u);
+        at_corners =
+            at_corners && offset.x >= -MAX_INSIDE_EXACTLY && offset.y >= -MAX_INSIDE_EXACTLY;
     }
 
     const std::array<u32, 3> first{0, 1, 2};
@@ -1254,8 +1353,64 @@ bool PicaCore::CoversViewport(bool is_indexed) {
             }
         }
     }
+    if (exactly != nullptr) {
+        *exactly = at_corners;
+    }
     return true;
 }
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+void PicaCore::DumpSmallDraw(bool is_indexed) {
+    const auto& pipeline = regs.internal.pipeline;
+    const u32 count = pipeline.num_vertices;
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || count == 0 || count > 6) {
+        return;
+    }
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const u8* index_address_8 = memory.GetPhysicalPointer(base_address + index_info.offset);
+    if (is_indexed && index_address_8 == nullptr) {
+        return;
+    }
+    const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+    const bool index_u16 = index_info.format != 0;
+
+    const VertexLoader loader(memory, pipeline);
+    ShaderUnit shader_unit;
+    shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+
+    const auto& rasterizer = regs.internal.rasterizer;
+    const f32 width = f24::FromRaw(rasterizer.viewport_size_x).ToFloat32() * 2.f;
+    const f32 height = f24::FromRaw(rasterizer.viewport_size_y).ToFloat32() * 2.f;
+    std::string text =
+        "  draw vertices (pixel in the target; texture coordinates 0, 1, 2; colour; depth):";
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        shader_unit.LoadInput(regs.internal.vs, input);
+        shader_engine->Run(vs_setup, shader_unit);
+        AttributeBuffer output;
+        shader_unit.WriteOutput(regs.internal.vs, output);
+        const OutputVertex shaded{rasterizer, output};
+        const f32 w = shaded.pos.w.ToFloat32();
+        const f32 x = (shaded.pos.x.ToFloat32() / w + 1.f) * width / 2.f +
+                      static_cast<f32>(rasterizer.viewport_corner.x);
+        const f32 y = (shaded.pos.y.ToFloat32() / w + 1.f) * height / 2.f +
+                      static_cast<f32>(rasterizer.viewport_corner.y);
+        text += fmt::format(
+            " [{:.2f},{:.2f}; {:.4f},{:.4f}; {:.4f},{:.4f}; {:.4f},{:.4f}; "
+            "{:.3f},{:.3f},{:.3f},{:.3f}; {:.6f}]",
+            x, y, shaded.tc0.x.ToFloat32(), shaded.tc0.y.ToFloat32(), shaded.tc1.x.ToFloat32(),
+            shaded.tc1.y.ToFloat32(), shaded.tc2.x.ToFloat32(), shaded.tc2.y.ToFloat32(),
+            shaded.color.x.ToFloat32(), shaded.color.y.ToFloat32(), shaded.color.z.ToFloat32(),
+            shaded.color.w.ToFloat32(), shaded.pos.z.ToFloat32() / w);
+    }
+    VideoCore::FrameStateDump::Line(std::move(text));
+}
+#endif
 
 void PicaCore::LoadVertices(bool is_indexed) {
     // Read and validate vertex information from the loaders

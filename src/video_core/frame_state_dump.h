@@ -11,6 +11,12 @@
 // Trigger it by changing the system property `debug.azahar.dump_frame` to a new value while a
 // game is running; the next two VBlank periods are written to
 // /sdcard/Android/data/<package>/files/frame-dump-<value>.txt
+//
+// With a value that starts with "gpu" the dump covers four VBlank periods and also says how
+// long the GPU took over each render pass, copy and transfer: the renderer waits for the GPU
+// after each of them, so the frame itself takes much longer than usual meanwhile. With
+// "gpud" it waits after every draw instead, which then is a render pass of its own: the
+// times tell the draws of a pass apart, and add up to more than the pass takes as a whole.
 
 #include "common/common_types.h"
 
@@ -27,9 +33,21 @@ struct RegsInternal;
 namespace VideoCore::FrameStateDump {
 
 extern std::atomic_bool active;
+extern std::atomic_bool times_gpu;
+extern std::atomic_bool times_draws;
 
 inline bool IsActive() {
     return active.load(std::memory_order_relaxed);
+}
+
+/// Whether the dump being recorded also wants the GPU time of each piece of work.
+inline bool TimesGpu() {
+    return times_gpu.load(std::memory_order_relaxed);
+}
+
+/// Whether it wants the GPU time of each draw on its own.
+inline bool TimesDraws() {
+    return times_draws.load(std::memory_order_relaxed);
 }
 
 /// Appends one line to the dump being recorded.
@@ -55,9 +73,28 @@ void OnVBlank();
 
 #define CITRA_FRAME_DUMP_VBLANK() ::VideoCore::FrameStateDump::OnVBlank()
 
+/// In a dump with GPU times: waits until the GPU is done with everything recorded so far and
+/// notes how long that took, under the description given.
+#define CITRA_FRAME_DUMP_GPU_TIME(scheduler, ...)                                                  \
+    do {                                                                                           \
+        if (::VideoCore::FrameStateDump::TimesGpu()) [[unlikely]] {                                \
+            (scheduler).TimeGpuWork(fmt::format(__VA_ARGS__));                                     \
+        }                                                                                          \
+    } while (0)
+
+/// The same after a draw, in a dump that times every draw on its own.
+#define CITRA_FRAME_DUMP_GPU_TIME_OF_DRAW(scheduler)                                               \
+    do {                                                                                           \
+        if (::VideoCore::FrameStateDump::TimesDraws()) [[unlikely]] {                              \
+            (scheduler).TimeGpuWork("draw");                                                       \
+        }                                                                                          \
+    } while (0)
+
 #else
 
 #define CITRA_FRAME_DUMP(...) static_cast<void>(0)
 #define CITRA_FRAME_DUMP_VBLANK() static_cast<void>(0)
+#define CITRA_FRAME_DUMP_GPU_TIME(scheduler, ...) static_cast<void>(0)
+#define CITRA_FRAME_DUMP_GPU_TIME_OF_DRAW(scheduler) static_cast<void>(0)
 
 #endif

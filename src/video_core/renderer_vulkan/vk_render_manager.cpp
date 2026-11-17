@@ -2,9 +2,11 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <algorithm>
 #include <limits>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
+#include "common/trace_markers.h"
 #include "video_core/frame_state_dump.h"
 #include "video_core/rasterizer_cache/pixel_format.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -24,9 +26,11 @@ RenderManager::RenderManager(const Instance& instance, Scheduler& scheduler)
 
 RenderManager::~RenderManager() = default;
 
-void RenderManager::BeginRendering(const Framebuffer* framebuffer,
-                                   Common::Rectangle<u32> draw_rect) {
-    const vk::Rect2D render_area = {
+void RenderManager::BeginRendering(const Framebuffer* framebuffer, Common::Rectangle<u32> draw_rect,
+                                   bool overwrites_color, bool overwrites_depth) {
+    const bool legacy =
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyAttachments) != 0;
+    vk::Rect2D render_area = {
         .offset{
             .x = static_cast<s32>(draw_rect.left),
             .y = static_cast<s32>(draw_rect.bottom),
@@ -36,9 +40,53 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer,
             .height = draw_rect.GetHeight(),
         },
     };
+    // Games draw into one part of a target and then into another: a quad that clears a few
+    // pixels more than the scene after it covers, for one. Each draw is confined by its
+    // scissor, so the pass that is open goes on as long as its area holds the draw. Ending it
+    // has the GPU store everything and load it again. When it does have to be ended for a
+    // wider area, the new one takes the old area along, for the draws that go back to it.
+    const vk::Rect2D drawn_to = render_area;
+    if (pass.render_pass && !pass.do_clear && pass.framebuffer == framebuffer->Handle() &&
+        !legacy) {
+        const vk::Rect2D& open = pass.render_area;
+        const s32 left = std::min(open.offset.x, render_area.offset.x);
+        const s32 bottom = std::min(open.offset.y, render_area.offset.y);
+        const s32 right =
+            std::max(open.offset.x + static_cast<s32>(open.extent.width),
+                     render_area.offset.x + static_cast<s32>(render_area.extent.width));
+        const s32 top =
+            std::max(open.offset.y + static_cast<s32>(open.extent.height),
+                     render_area.offset.y + static_cast<s32>(render_area.extent.height));
+        render_area = vk::Rect2D{
+            .offset{.x = left, .y = bottom},
+            .extent{.width = static_cast<u32>(right - left),
+                    .height = static_cast<u32>(top - bottom)},
+        };
+        if (render_area == open) {
+            // Whatever it loaded when it began, the pass that is open is the one to go on with
+            num_draws++;
+            return;
+        }
+    }
+
+    // A pass first loads what its area holds, from memory into the GPU's tile buffer: a copy
+    // of every pixel, which is for nothing if the first draw overwrites them all. That is how
+    // games clear a buffer and how they run a full-screen effect.
+    vk::RenderPass render_pass = framebuffer->RenderPass();
+    if (!legacy && render_area == drawn_to && framebuffer->Samples() == 1) {
+        const VideoCore::PixelFormat color = framebuffer->Format(SurfaceType::Color);
+        const VideoCore::PixelFormat depth = framebuffer->Format(SurfaceType::Depth);
+        const bool discard_color = overwrites_color && color != PixelFormat::Invalid;
+        const bool discard_depth = overwrites_depth && depth != PixelFormat::Invalid;
+        if (discard_color || discard_depth) {
+            CITRA_FRAME_DUMP("  vk renderpass does not load:{}{}", discard_color ? " colour" : "",
+                             discard_depth ? " depth" : "");
+            render_pass = GetDiscardingRenderpass(color, depth, discard_color, discard_depth);
+        }
+    }
     const RenderPass new_pass = {
         .framebuffer = framebuffer->Handle(),
-        .render_pass = framebuffer->RenderPass(),
+        .render_pass = render_pass,
         .render_area = render_area,
         .clears = {},
         .do_clear = false,
@@ -56,6 +104,7 @@ void RenderManager::BeginRendering(const RenderPass& new_pass) {
     }
 
     EndRendering();
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "what came before this render pass");
     CITRA_FRAME_DUMP("vk renderpass begin fb={:X} area {},{} {}x{} clear={}",
                      reinterpret_cast<uintptr_t>(static_cast<VkFramebuffer>(new_pass.framebuffer)),
                      new_pass.render_area.offset.x, new_pass.render_area.offset.y,
@@ -137,6 +186,7 @@ void RenderManager::EndRendering() {
     images = {};
     aspects = {};
     shadow_rendering = false;
+    CITRA_FRAME_DUMP_GPU_TIME(scheduler, "render pass");
 
     // The Mali guide recommends flushing at the end of each major renderpass
     // Testing has shown this has a significant effect on rendering performance
@@ -177,14 +227,45 @@ vk::RenderPass RenderManager::GetRenderpass(VideoCore::PixelFormat color,
         renderpass = (sample_count > 1)
                          ? CreateRenderPassMSAA(color_format, depth_format, load_op,
                                                 static_cast<vk::SampleCountFlagBits>(sample_count))
-                         : CreateRenderPass(color_format, depth_format, load_op);
+                         : CreateRenderPass(color_format, depth_format, load_op, load_op);
     }
 
     return *renderpass;
 }
 
+vk::RenderPass RenderManager::GetDiscardingRenderpass(VideoCore::PixelFormat color,
+                                                      VideoCore::PixelFormat depth,
+                                                      bool discard_color, bool discard_depth) {
+    ASSERT(discard_color || discard_depth);
+    std::scoped_lock lock{cache_mutex};
+
+    const u32 color_index =
+        color == VideoCore::PixelFormat::Invalid ? NumColorFormats : static_cast<u32>(color);
+    const u32 depth_index =
+        depth == VideoCore::PixelFormat::Invalid
+            ? NumDepthFormats
+            : (static_cast<u32>(depth - VideoCore::PixelFormat::NumColorFormat));
+    ASSERT_MSG(color_index <= NumColorFormats && depth_index <= NumDepthFormats,
+               "Invalid color index {} and/or depth_index {}", color_index, depth_index);
+
+    const u32 which = (discard_color ? 1u : 0u) + (discard_depth ? 2u : 0u) - 1u;
+    vk::UniqueRenderPass& renderpass = discarding_renderpasses[color_index][depth_index][which];
+    if (!renderpass) {
+        const auto load_op = [](bool discard) {
+            return discard ? vk::AttachmentLoadOp::eDontCare : vk::AttachmentLoadOp::eLoad;
+        };
+        // Compatible with the pass that loads both, so framebuffers and pipelines made for
+        // that one go with this one as well
+        renderpass =
+            CreateRenderPass(instance.GetTraits(color).native, instance.GetTraits(depth).native,
+                             load_op(discard_color), load_op(discard_depth));
+    }
+    return *renderpass;
+}
+
 vk::UniqueRenderPass RenderManager::CreateRenderPass(vk::Format color, vk::Format depth,
-                                                     vk::AttachmentLoadOp load_op) const {
+                                                     vk::AttachmentLoadOp color_load_op,
+                                                     vk::AttachmentLoadOp depth_load_op) const {
 
     boost::container::static_vector<vk::AttachmentDescription, 2> attachments{};
     bool use_color = false;
@@ -196,7 +277,7 @@ vk::UniqueRenderPass RenderManager::CreateRenderPass(vk::Format color, vk::Forma
         attachments.emplace_back(vk::AttachmentDescription{
             .format = color,
             .samples = vk::SampleCountFlagBits::e1,
-            .loadOp = load_op,
+            .loadOp = color_load_op,
             .storeOp = vk::AttachmentStoreOp::eStore,
             .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
             .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
@@ -216,9 +297,9 @@ vk::UniqueRenderPass RenderManager::CreateRenderPass(vk::Format color, vk::Forma
         attachments.emplace_back(vk::AttachmentDescription{
             .format = depth,
             .samples = vk::SampleCountFlagBits::e1,
-            .loadOp = load_op,
+            .loadOp = depth_load_op,
             .storeOp = vk::AttachmentStoreOp::eStore,
-            .stencilLoadOp = load_op,
+            .stencilLoadOp = depth_load_op,
             .stencilStoreOp = vk::AttachmentStoreOp::eStore,
             .initialLayout = vk::ImageLayout::eGeneral,
             .finalLayout = vk::ImageLayout::eGeneral,

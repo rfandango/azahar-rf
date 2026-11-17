@@ -177,16 +177,98 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
     return std::make_pair(config_hash, shader);
 }
 
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+namespace {
+
+/// Marks every floating point result of a SPIR-V module as needing only relaxed precision, a
+/// measurement aid: it shows what a GPU makes of shaders that ask for less than full precision
+/// throughout, coordinates and depth included.
+std::vector<u32> RelaxPrecision(const std::vector<u32>& spirv) {
+    constexpr std::size_t HEADER_WORDS = 5;
+    constexpr u32 OP_EXT_INST = 12;
+    constexpr u32 OP_TYPE_VOID = 19;
+    constexpr u32 OP_TYPE_FLOAT = 22;
+    constexpr u32 OP_TYPE_VECTOR = 23;
+    constexpr u32 OP_FUNCTION_CALL = 57;
+    constexpr u32 OP_LOAD = 61;
+    constexpr u32 OP_DECORATE = 71;
+    constexpr u32 DECORATION_RELAXED_PRECISION = 0;
+    // Instructions whose first two operands are the type of their result and its id
+    const auto has_typed_result = [](u32 opcode) {
+        return opcode == OP_EXT_INST || opcode == OP_FUNCTION_CALL || opcode == OP_LOAD ||
+               (opcode >= 79 && opcode <= 83) ||   // vector shuffles and composites
+               (opcode >= 87 && opcode <= 95) ||   // image samples and fetches
+               opcode == 111 || opcode == 112 ||   // conversions to float
+               (opcode >= 127 && opcode <= 148) || // arithmetic
+               opcode == 169 ||                    // select
+               opcode == 207 || opcode == 208 ||   // derivatives
+               opcode == 245;                      // phi
+    };
+
+    std::vector<u32> float_types;
+    std::vector<u32> results;
+    std::size_t first_type = 0;
+    for (std::size_t at = HEADER_WORDS; at < spirv.size();) {
+        const u32 opcode = spirv[at] & 0xFFFF;
+        const u32 words = spirv[at] >> 16;
+        if (words == 0 || at + words > spirv.size()) {
+            return spirv;
+        }
+        if (first_type == 0 && opcode >= OP_TYPE_VOID && opcode < OP_FUNCTION_CALL - 3) {
+            first_type = at;
+        }
+        const auto is_float = [&float_types](u32 type) {
+            return std::ranges::find(float_types, type) != float_types.end();
+        };
+        if (opcode == OP_TYPE_FLOAT) {
+            float_types.push_back(spirv[at + 1]);
+        } else if (opcode == OP_TYPE_VECTOR && is_float(spirv[at + 2])) {
+            float_types.push_back(spirv[at + 1]);
+        } else if (words >= 3 && has_typed_result(opcode) && is_float(spirv[at + 1])) {
+            results.push_back(spirv[at + 2]);
+        }
+        at += words;
+    }
+    if (first_type == 0) {
+        return spirv;
+    }
+
+    std::vector<u32> relaxed;
+    relaxed.reserve(spirv.size() + results.size() * 3);
+    relaxed.insert(relaxed.end(), spirv.begin(), spirv.begin() + first_type);
+    for (const u32 result : results) {
+        relaxed.push_back((3u << 16) | OP_DECORATE);
+        relaxed.push_back(result);
+        relaxed.push_back(DECORATION_RELAXED_PRECISION);
+    }
+    relaxed.insert(relaxed.end(), spirv.begin() + first_type, spirv.end());
+    return relaxed;
+}
+
+} // Anonymous namespace
+#endif
+
 std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
-    const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
-    bool depth_from_viewport) {
+    const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user, bool depth_from_viewport,
+    bool host_scissor) {
 
     FSConfig fs_config{regs};
     fs_config.framebuffer.depth_from_viewport.Assign(depth_from_viewport);
+    // A scissor that keeps what is inside a rectangle is the host's own scissor test, which
+    // the rasterizer sets for the draw. A shader that tests it has to be able to drop
+    // fragments, and with such a shader the GPU tests depth only after shading: every hidden
+    // fragment is shaded in full first. Games leave this scissor on for whole scenes.
+    if (host_scissor &&
+        fs_config.framebuffer.scissor_test_mode == Pica::RasterizerRegs::ScissorMode::Include) {
+        fs_config.framebuffer.scissor_test_mode.Assign(Pica::RasterizerRegs::ScissorMode::Disabled);
+    }
     auto fs_config_hash = fs_config.Hash();
 
     // Experimental variants get their own in-memory entries and never reach the disk cache.
-    const u32 variant = Common::TraceMarkers::Experiments() & Common::TraceMarkers::DumpShaders;
+    const u32 variant =
+        Common::TraceMarkers::Experiments() &
+        (Common::TraceMarkers::DumpShaders | Common::TraceMarkers::RelaxedShaderPrecision |
+         Common::TraceMarkers::SkipLightingMath);
     if (variant != 0) {
         fs_config_hash = Common::HashCombine(fs_config_hash, u64{variant});
     }
@@ -206,6 +288,11 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
             const bool use_spirv = parent.profile.vk_use_spirv_generator;
             if (use_spirv && !fs_config.UsesSpirvIncompatibleConfig()) {
                 spirv = SPIRV::GenerateFragmentShader(fs_config, parent.profile);
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+                if (variant & Common::TraceMarkers::RelaxedShaderPrecision) {
+                    spirv = RelaxPrecision(spirv);
+                }
+#endif
                 shader.module = CompileSPV(spirv, parent.instance.GetDevice());
             } else {
                 const std::string code =

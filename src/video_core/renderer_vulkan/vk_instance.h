@@ -101,6 +101,11 @@ public:
         return present_queue;
     }
 
+    /// Whether images are handed to the display on another queue than rendering is submitted to
+    bool HasSeparatePresentQueue() const {
+        return separate_present_queue;
+    }
+
     /// Returns true when a known debugging tool is attached.
     bool HasDebuggingToolAttached() const {
         return has_renderdoc || has_nsight_graphics;
@@ -358,6 +363,7 @@ protected:
     u64 min_imported_host_pointer_alignment{};
     bool layered_rendering_supported{true};
     bool tooling_info{};
+    bool separate_present_queue{};
     bool debug_utils_supported{};
     bool has_nsight_graphics{};
     bool has_renderdoc{};

@@ -164,7 +164,17 @@ For more detail:
   once with the AGI desktop app). Render stages show each render pass on a GPU timeline.
   Counters show utilization, shader ALU and texture load, bandwidth and so on, depending on
   the GPU. Counter IDs differ per GPU; `./gpu-producer.sh list` prints what the device offers,
-  and `AZAHAR_GPU_COUNTERS=id,id,...` selects them.
+  and `AZAHAR_GPU_COUNTERS=id,id,...` selects them. Two things to know on Adreno: the game
+  has to be started after the producer for its render stages to arrive, and they stop
+  arriving once a save state is loaded (the renderer is created anew and the driver's
+  profiler does not follow). For a scene that is reached through a save state, use the
+  counters and a timed frame dump (below) instead.
+- **What the counters say a frame costs:** divide the rates by the game's frame rate. Memory
+  read and written per frame (`Read Total`, `Write Total`, `Texture Memory Read BW`) next to
+  `% Stalled on System Memory`, `% Texture Fetch Stall` and `% Shader ALU Capacity Utilized`
+  tell a frame that is short of arithmetic from one that is short of memory bandwidth. At
+  high resolution scales it is often the latter: every full-screen pass reads and writes
+  the whole target, and so does every copy the renderer makes on top.
 - **Android GPU Inspector (desktop app):** its System Profiler shows the same data with a GUI.
   Its Frame Profiler shows per-draw costs, but needs a debuggable app: use the
   `relWithDebInfo` build (`.debug` package), whose native code matches release.
@@ -185,16 +195,39 @@ two VBlanks as text to the app's external files directory:
     adb pull /sdcard/Android/data/org.azahar_emu.azahar.profile/files/frame-dump-<value>.txt
 
 The dump lists, in order, every PICA command list, draw (render target, viewport, depth,
-blend and lighting state, vertex shader, texture formats), memory fill, display transfer and
-texture copy, together with what the renderer did for them: render passes begun and ended,
-submissions, and every rasterizer cache copy, upload, reinterpretation and download. Things
-to look for:
+stencil, blend and lighting state, vertex shader, texture formats), memory fill, display
+transfer and texture copy, together with what the renderer did for them: render passes begun
+and ended, submissions, and every rasterizer cache copy, upload, reinterpretation and
+download. A draw of two triangles at the most is followed by a `draw vertices` line: where
+each vertex lands in the target, in the console's pixels, and its texture coordinates. That
+shows what a full-screen pass covers and which part of a texture it samples.
+
+With a value that starts with `gpu` the dump also has the GPU time of each piece of work:
+
+    adb shell setprop debug.azahar.dump_frame gpu$(date +%s)     # per render pass
+    adb shell setprop debug.azahar.dump_frame gpud$(date +%s)    # per draw
+
+The renderer then waits for the GPU after every render pass, copy, transfer and fill (or
+after every draw) and writes `gpu <ms>` lines, over four VBlanks instead of two. Each wait
+adds a fixed 0.2 to 0.4 ms, which the lines for work that does nothing show; take that off.
+The first VBlank also holds what the GPU still had to do from before. Per pass the times
+add up to about the real frame. Per draw they do not: every draw is a pass of its own, and
+the GPU lowers its clock over a frame that long, so compare draws that are near each other.
+
+Things to look for:
 
 - `cache DOWNLOAD` lines: the emulation thread waited for the GPU there. The lines before it
   show which guest operation needed the data.
 - The number of `vk renderpass begin` lines per frame. On tile-based GPUs each one costs a
   load and a store of the attachments, so a frame should have about as many as the game has
-  render targets, not as many as it has state changes.
+  render targets, not as many as it has state changes. A pass goes on while draws stay
+  within its area, and `vk renderpass does not load: ...` marks one that begins with a draw
+  that overwrites all of its area (a quad that clears, a full-screen effect), for which
+  nothing is loaded.
+- `vk tex0 is the colour target` lines: the draw samples the target it draws to. If it
+  overwrites every pixel of its area, the target `moves to its other image` and the draw
+  renders there while sampling the first, at the cost of copying what lies outside the area.
+  Otherwise it is `sampling a copy`, a `vk full-surface copy` of the whole target.
 - How many times the scene is drawn per VBlank, and at which target sizes. Games that render
   more than one frame per VBlank are running uncapped (see the "Simulate 3DS GPU timings"
   setting).
@@ -320,6 +353,17 @@ same build, in the same scene, without restarting:
 Some switches turn a new code path back into the old one for A/B measurements, some drop or
 simplify work to measure what it costs (those render incorrectly on purpose), and
 `DumpShaders` (16) saves every shader generated from then on under `files/shaders/`.
+`LegacyAttachments` (64) covers how render passes are kept going: with it a pass is restarted
+whenever the attachments or the area drawn to change, always loads what its area held, and a
+draw that samples its own target always gets a copy of all of it. `LegacyScissor`
+(33554432) has fragment shaders test the scissor again; it changes shaders, so wait for the
+pipelines to be rebuilt. `LegacyShadowMapScale` (67108864) renders shadow maps at the
+resolution scale again instead of at the size the game gave them. `RelaxedShaderPrecision`
+(134217728) marks all the arithmetic of fragment shaders as needing only half precision, which
+renders incorrectly and is there to measure what precision costs on a GPU. `SkipLightingMath`
+(268435456) leaves fragment lighting out of the shaders, to measure its share of a lit pixel.
+`LegacyTextureLod` (536870912) has shaders work out the level of detail for every texture
+sample again, also for textures with a single level.
 
 Two rules for trustworthy numbers:
 

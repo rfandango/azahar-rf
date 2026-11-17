@@ -563,8 +563,16 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         .pSignalSemaphores = &present_ready,
     };
 
+    // Handing the image to the display blocks until the display has taken the one before it,
+    // which with a busy GPU is most of the time. On a queue of its own that holds up nobody:
+    // the render thread goes on submitting the next frame meanwhile.
+    const bool own_queue =
+        instance.HasSeparatePresentQueue() &&
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyFrameHandoff) == 0;
     {
-        std::scoped_lock submit_lock{scheduler.submit_mutex, recreate_surface_mutex};
+        std::unique_lock submit_lock{scheduler.submit_mutex, std::defer_lock};
+        std::unique_lock surface_lock{recreate_surface_mutex, std::defer_lock};
+        std::lock(submit_lock, surface_lock);
 
         try {
             graphics_queue.submit(submit_info, frame->present_done);
@@ -574,7 +582,14 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         }
 
         Common::Hitches::NotePresentQueued(frame->present_id, frame->game_frame, frame->submitted);
-        swapchain.Present(frame->present_id, frame->desired_time);
+        if (own_queue) {
+            submit_lock.unlock();
+            // Another window may be presenting on that queue
+            std::scoped_lock present_lock{scheduler.present_mutex};
+            swapchain.Present(frame->present_id, frame->desired_time);
+        } else {
+            swapchain.Present(frame->present_id, frame->desired_time);
+        }
     }
 
     if (frame->present_id != 0) {

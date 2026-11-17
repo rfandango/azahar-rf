@@ -75,10 +75,15 @@ private:
         s64 target;
         s64 lead;
     };
+    struct HandedOver {
+        u32 present_id;
+        s64 time;
+    };
 
     s64 BoundaryAtOrAfter(s64 time) const;
     s64 NearestBoundary(s64 time) const;
     s64 LowestRecentLead() const;
+    s64 LowestRecentDelay() const;
     void ResetLocked();
 
     mutable std::mutex mutex;
@@ -114,6 +119,14 @@ private:
     s64 previous_scheduled_display{};
     std::array<Scheduled, 16> scheduled{};
     std::size_t next_scheduled{};
+
+    /// When the last images were handed over, and how long after that the display showed
+    /// them: what an image that has no slot to keep is given its time by
+    std::array<HandedOver, 16> handed_over_at{};
+    std::array<s64, 8> recent_delays{};
+    u32 delay_samples{};
+    /// The time the last image was given
+    s64 last_time_given{};
 
     std::atomic<double> speed_scale{1.0};
 };

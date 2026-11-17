@@ -93,6 +93,7 @@ private:
     void ConfigureRenderPipeline();
     void PrepareRendertarget();
     void LimitFramesAheadOfGpu() override;
+    bool AlwaysLimitsFramesAheadOfGpu() const override;
     void RenderScreenshot();
     void RenderScreenshotWithStagingCopy();
     bool TryRenderScreenshotWithHostMemory();

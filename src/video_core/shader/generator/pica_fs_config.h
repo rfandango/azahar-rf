@@ -184,6 +184,9 @@ struct TextureConfig {
         BitField<12, 3, Pica::TexturingRegs::FogMode> fog_mode;
         BitField<15, 1, u32> fog_flip;
         BitField<16, 1, u32> shadow_texture_orthographic;
+        /// A bit for each texture unit whose texture has one level only. Such a texture is
+        /// sampled at that level, with no level of detail to work out for every fragment.
+        BitField<17, 3, u32> single_level;
     };
     std::array<TextureBorder, 3> texture_border_color{};
     std::array<TevStageConfigRaw, 6> tev_stages{};
@@ -222,8 +225,8 @@ struct TextureConfig {
                                    FIELD_HASH(texture0_type), FIELD_HASH(texture2_use_coord1),
                                    FIELD_HASH(combiner_buffer_input), FIELD_HASH(fog_mode),
                                    FIELD_HASH(fog_flip), FIELD_HASH(shadow_texture_orthographic),
-                                   FIELD_HASH(texture_border_color), FIELD_HASH(tev_stages),
-                                   FIELD_HASH(requested_wrap),
+                                   FIELD_HASH(single_level), FIELD_HASH(texture_border_color),
+                                   FIELD_HASH(tev_stages), FIELD_HASH(requested_wrap),
 
                                    // nested layout
                                    TextureBorder::StructHash(), TevStageConfigRaw::StructHash(),
