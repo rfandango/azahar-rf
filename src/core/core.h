@@ -216,7 +216,17 @@ public:
 
     [[nodiscard]] PerfStats::Results GetLastPerfStats();
 
+    /// How many times longer than it should the emulation takes for a frame lately. Called
+    /// by the emulated sound hardware each time it produces sound, to do so that much more
+    /// often when it is to keep up with real time.
     double GetStableFrameTimeScale();
+
+    /// Whether sound is to be produced in step with real time rather than with emulated time,
+    /// so that it keeps its speed when the game does not
+    bool IsAudioRealtime() const;
+
+    /// How fast sound is being produced, relative to real time
+    double GetAudioProductionSpeed() const;
 
     /**
      * Gets a reference to the emulated CPU.
@@ -328,6 +338,10 @@ public:
 
     std::unique_ptr<PerfStats> perf_stats;
     FrameLimiter frame_limiter;
+
+    /// What GetStableFrameTimeScale() last returned, and when
+    std::atomic<double> audio_time_scale{1.0};
+    std::chrono::steady_clock::time_point audio_time_scale_updated{};
 
     /// The code the recompiler produced for the running title, where that is kept
     [[nodiscard]] JitCodeCache* GetJitCodeCache() const {

@@ -31,6 +31,8 @@ add_library(audio_core STATIC EXCLUDE_FROM_ALL
     interpolate.h
     null_input.h
     null_sink.h
+    output_pacer.cpp
+    output_pacer.h
     precompiled_headers.h
     sink.h
     sink_details.cpp

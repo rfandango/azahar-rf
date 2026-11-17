@@ -6,6 +6,8 @@
 #include <array>
 #include <cmath>
 #include <ctime>
+#include <iterator>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -232,6 +234,16 @@ struct SharedState {
 
 SharedState shared;
 std::atomic<u32> game_frame_seq{0};
+
+/// What the audio output reported lately: a ring written by the audio thread alone, which must
+/// not wait for a lock. Each entry packs four counts of frames and comes with its time.
+constexpr std::size_t AUDIO_RING_SIZE = 4096;
+std::array<std::atomic<u64>, AUDIO_RING_SIZE> audio_reports;
+/// The margin, and the speed in millionths
+std::array<std::atomic<u64>, AUDIO_RING_SIZE> audio_rates;
+std::array<std::atomic<Nanos>, AUDIO_RING_SIZE> audio_times;
+std::atomic<u32> audio_next{0};
+std::atomic<u32> audio_sample_rate{0};
 /// Time other threads waited in AnyThread scopes since the last VBlank
 std::atomic<Nanos> foreign_stall{0};
 
@@ -540,6 +552,8 @@ std::string FinishScreenFrame(u32 game_frame, u32 next_game_frame, Nanos duratio
 }
 
 /// Summary of recent hitches. The mutex of the shared state must be held.
+void SummarizeAudio(std::string& text, Clock::time_point now);
+
 std::string Summarize(Clock::time_point now) {
     if (shared.vblanks.Size() == 0) {
         return "hitches: waiting for frames";
@@ -705,7 +719,92 @@ std::string Summarize(Clock::time_point now) {
     fmt::format_to(out, "\nemu {} fps, vblank {:.1f} +-{:.1f} ms (max {:.1f}): {}", game_frames,
                    wall_mean, wall_jitter, ToMs(wall_max),
                    Breakdown(sums, static_cast<double>(vblank_count)));
+    SummarizeAudio(text, now);
     return text;
+}
+
+/// The audio output over the last ten seconds: how much sound was waiting each time the
+/// device asked for some, and how often there was not enough
+void SummarizeAudio(std::string& text, Clock::time_point now) {
+    const u32 next = audio_next.load(std::memory_order_acquire);
+    const u32 rate = audio_sample_rate.load(std::memory_order_relaxed);
+    if (next == 0 || rate == 0) {
+        return;
+    }
+    const Nanos since = ToNanos(now.time_since_epoch()) - 10'000'000'000;
+
+    std::array<u16, 2048> levels;
+    std::size_t count = 0;
+    u32 gaps = 0;
+    bool newer_had_gap = false;
+    u64 missing = 0;
+    u64 dropped = 0;
+    u64 wanted = 0;
+    u32 margin = 0;
+    u32 slowest = std::numeric_limits<u32>::max();
+    u32 fastest = 0;
+    Nanos newest = 0;
+    Nanos oldest = 0;
+    Nanos longest_gap = 0;
+    const u32 available = std::min<u32>(next, AUDIO_RING_SIZE - 1);
+    for (u32 back = 1; back <= available && count < levels.size(); back++) {
+        const std::size_t index = (next - back) % AUDIO_RING_SIZE;
+        const Nanos time = audio_times[index].load(std::memory_order_relaxed);
+        if (time < since) {
+            break;
+        }
+        const u64 report = audio_reports[index].load(std::memory_order_relaxed);
+        const u32 report_missing = static_cast<u32>((report >> 16) & 0xFFFF);
+        levels[count] = static_cast<u16>((report >> 32) & 0xFFFF);
+        wanted += report & 0xFFFF;
+        missing += report_missing;
+        // A gap is a stretch of requests that came up short, however many they were
+        if (report_missing == 0 && newer_had_gap) {
+            gaps++;
+        }
+        newer_had_gap = report_missing != 0;
+        dropped += (report >> 48) & 0xFFFF;
+        const u64 rates = audio_rates[index].load(std::memory_order_relaxed);
+        if (count == 0) {
+            margin = static_cast<u32>(rates >> 32);
+        }
+        slowest = std::min(slowest, static_cast<u32>(rates));
+        fastest = std::max(fastest, static_cast<u32>(rates));
+        if (count == 0) {
+            newest = time;
+        } else {
+            longest_gap = std::max(longest_gap, oldest - time);
+        }
+        oldest = time;
+        count++;
+    }
+    if (count == 0) {
+        text += "\naudio: the device is not asking for sound";
+        return;
+    }
+    const auto frames_to_ms = [rate](u64 frames) {
+        return 1000.0 * static_cast<double>(frames) / static_cast<double>(rate);
+    };
+    const auto [lowest, highest] = std::minmax_element(levels.begin(), levels.begin() + count);
+    const u16 low = *lowest;
+    const u16 high = *highest;
+    std::nth_element(levels.begin(), levels.begin() + count / 2, levels.begin() + count);
+    if (newer_had_gap) {
+        gaps++;
+    }
+    const double period = count > 1 ? ToMs(newest - oldest) / static_cast<double>(count - 1) : 0.0;
+    const auto out = std::back_inserter(text);
+    fmt::format_to(out, "\naudio: {:.0f}-{:.0f} ms waiting (usually {:.0f})", frames_to_ms(low),
+                   frames_to_ms(high), frames_to_ms(levels[count / 2]));
+    if (margin != 0) {
+        fmt::format_to(out, ", margin {:.0f} ms, speed {:.1f}-{:.1f}%", frames_to_ms(margin),
+                       slowest / 10000.0, fastest / 10000.0);
+    }
+    fmt::format_to(out,
+                   ", {} gaps of {:.0f} ms in all, {:.0f} ms thrown away, asked for {:.1f} ms "
+                   "every {:.1f} ms (longest {:.0f})",
+                   gaps, frames_to_ms(missing), frames_to_ms(dropped),
+                   frames_to_ms(wanted) / static_cast<double>(count), period, ToMs(longest_gap));
 }
 
 void LogLines(std::string_view text) {
@@ -879,6 +978,24 @@ void SetDisplayTiming(bool available, std::chrono::nanoseconds refresh_period,
 void SetPacing(const Pacing& pacing) {
     std::scoped_lock lock{shared.mutex};
     shared.pacing = pacing;
+}
+
+void NoteAudioOutput(const AudioOutput& output) {
+    if (!IsEnabled()) {
+        return;
+    }
+    const auto clamp = [](u32 frames) -> u64 { return std::min<u32>(frames, 0xFFFF); };
+    const u32 next = audio_next.load(std::memory_order_relaxed);
+    const std::size_t index = next % AUDIO_RING_SIZE;
+    audio_reports[index].store(clamp(output.wanted) | (clamp(output.missing) << 16) |
+                                   (clamp(output.buffered) << 32) | (clamp(output.dropped) << 48),
+                               std::memory_order_relaxed);
+    audio_rates[index].store((static_cast<u64>(output.margin) << 32) |
+                                 static_cast<u32>(std::clamp(output.rate, 0.0f, 4.0f) * 1e6f),
+                             std::memory_order_relaxed);
+    audio_times[index].store(ToNanos(Clock::now().time_since_epoch()), std::memory_order_relaxed);
+    audio_sample_rate.store(output.sample_rate, std::memory_order_relaxed);
+    audio_next.store(next + 1, std::memory_order_release);
 }
 
 void NotePresentQueued(u32 id, u32 game_frame, Clock::time_point submitted) {

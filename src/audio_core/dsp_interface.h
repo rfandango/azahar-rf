@@ -12,6 +12,7 @@
 #include <vector>
 #include <boost/serialization/access.hpp>
 #include "audio_core/audio_types.h"
+#include "audio_core/output_pacer.h"
 #include "audio_core/time_stretch.h"
 #include "common/common_types.h"
 #include "common/ring_buffer.h"
@@ -121,7 +122,8 @@ protected:
 private:
     void FlushResidualStretcherAudio();
     void OutputCallback(s16* buffer, std::size_t num_frames);
-    void DrainFifoBacklog(std::size_t num_frames);
+    /// Returns the number of frames it threw away
+    std::size_t DrainFifoBacklog(std::size_t num_frames);
     std::size_t PopResampled(s16* buffer, std::size_t num_frames, double ratio);
     void MixCsnd(std::span<std::array<s16, 2>> samples);
     void PushSamples(std::span<const std::array<s16, 2>> samples);
@@ -131,7 +133,8 @@ private:
     std::atomic<bool> enable_time_stretching = false;
     std::atomic<bool> performing_time_stretching = false;
     std::atomic<bool> flushing_time_stretcher = false;
-    Common::RingBuffer<s16, 0x2000, 2> fifo;
+    OutputFifo fifo;
+    OutputPacer output_pacer;
     std::array<s16, 2> last_frame{};
     std::size_t fifo_low_fill = std::numeric_limits<std::size_t>::max();
     std::size_t backlog_window_frames = 0;

@@ -473,8 +473,9 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # 0 (default): No, 1: Yes
 )") DECLARE_KEY(enable_audio_stretching) BOOST_HANA_STRING(R"(
 
-# Scales audio playback speed to account for drops in emulation framerate
-# 0 (default): No, 1: Yes
+# Keeps audio at full speed when the emulation framerate drops, instead of slowing it down
+# with the game. Sound can then run ahead of the picture.
+# 0: No, 1 (default): Yes
 )") DECLARE_KEY(enable_realtime_audio) BOOST_HANA_STRING(R"(
 
 # Simulates whether headphones are plugged in to the emulated 3DS system

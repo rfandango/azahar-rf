@@ -669,7 +669,7 @@ struct Values {
     bool audio_muted;
     SwitchableSetting<AudioEmulation> audio_emulation{AudioEmulation::HLE, Keys::audio_emulation};
     SwitchableSetting<bool> enable_audio_stretching{false, Keys::enable_audio_stretching};
-    SwitchableSetting<bool> enable_realtime_audio{false, Keys::enable_realtime_audio};
+    SwitchableSetting<bool> enable_realtime_audio{true, Keys::enable_realtime_audio};
     SwitchableSetting<float, true> volume{1.f, 0.f, 1.f, Keys::volume};
     Setting<AudioCore::SinkType> output_type{AudioCore::SinkType::Auto, Keys::output_type};
     Setting<std::string> output_device{"Auto", Keys::output_device};

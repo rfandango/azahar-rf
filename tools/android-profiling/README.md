@@ -275,6 +275,39 @@ in the same scene. To get to a scene without touching the device, the profiling 
 save state when `debug.azahar.load_state` changes: `adb shell setprop debug.azahar.load_state 1`
 (set it to 0 before the next request for the same slot).
 
+## Audio
+
+The last line of the hitch summary and overlay is about the audio output:
+
+    audio: 17-70 ms waiting (usually 50), margin 17 ms, speed 100.0-100.6%, 0 gaps of 0 ms in
+    all, 0 ms thrown away, asked for 8.6 ms every 8.6 ms (longest 20)
+
+- `waiting` is how much sound was queued each time the audio device asked for some, over the
+  last ten seconds. It swings by a video frame's worth, because the emulation produces sound
+  in bursts.
+- `margin` is what the output aims to still have at the lowest point of that swing, and
+  `speed` how fast it played the queue to keep it there (`AudioCore::OutputPacer`). The speed
+  follows the emulation's: sound is produced as emulated time passes, so a game at 90% speed
+  makes 90% of the sound. With "Enable Realtime Audio", which is the default, the emulated
+  sound hardware is clocked by real time instead and the speed stays near 100%.
+- `gaps` are the times the queue ran out and the device got silence, with their total length.
+- `asked for ... every ...` is the size and period of the device's requests, and `longest`
+  the longest pause between two.
+
+To look at the sound itself, any new value of `debug.azahar.record_audio` records the next
+twelve seconds of what is handed to the device:
+
+    adb shell setprop debug.azahar.record_audio $(date +%s)
+    adb pull /sdcard/Android/data/org.azahar_emu.azahar.profile/files/audio-<value>.raw
+
+The file is raw 16 bit stereo at 32728 Hz. A stretch of identical samples in the middle of
+sound is a gap that was filled by repeating the last sample, which is heard as a crack; a
+stretch of zeros is one that was faded out and in.
+
+Experiment switches for this: 1048576 hands the device what is queued as it comes, as before
+the output was paced; 2097152 holds the emulation up for 30 ms once a second, to hear what a
+late frame does; 4194304 forces "Enable Realtime Audio".
+
 ## Experiment switches
 
 `debug.azahar.experiment` holds a sum of the `Common::TraceMarkers::Experiment` values in

@@ -9,10 +9,23 @@
 #include "audio_core/sink.h"
 #include "audio_core/sink_details.h"
 #include "common/assert.h"
+#include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/dumping/backend.h"
+
+#if defined(CITRA_ENABLE_TRACE_MARKERS) && defined(ANDROID)
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <fmt/format.h>
+#include <sys/system_properties.h>
+#define CITRA_AUDIO_RECORDER 1
+#endif
 
 namespace AudioCore {
 
@@ -22,6 +35,84 @@ namespace {
 constexpr u32 CsndFramesBeforeDspIdle = 2;
 /// Max amount of CSND pending samples.
 constexpr std::size_t MaxCsndPendingSamples = samples_per_frame * 4;
+
+#ifdef CITRA_AUDIO_RECORDER
+/// Keeps what is handed to the audio device for a while, to look at it afterwards. Setting
+/// `debug.azahar.record_audio` to a new value records the next twelve seconds into
+/// files/audio-<value>.raw of the app's external directory: 16 bit stereo at the native rate.
+class OutputRecorder {
+public:
+    /// Called now and then on the emulation thread
+    void Poll() {
+        if (state.load(std::memory_order_acquire) == State::Full) {
+            Save();
+            state.store(State::Idle, std::memory_order_release);
+        }
+        char value[PROP_VALUE_MAX]{};
+        __system_property_get("debug.azahar.record_audio", value);
+        if (!initialized) {
+            // What the property holds when the game starts is an old request
+            request = value;
+            initialized = true;
+            return;
+        }
+        if (value[0] == 0 || request == value ||
+            state.load(std::memory_order_acquire) != State::Idle) {
+            return;
+        }
+        request = value;
+        samples.assign(SECONDS * native_sample_rate * 2, 0);
+        position.store(0, std::memory_order_relaxed);
+        state.store(State::Recording, std::memory_order_release);
+    }
+
+    /// Called on the audio thread with what goes to the device
+    void Write(const s16* buffer, std::size_t num_frames) {
+        if (state.load(std::memory_order_acquire) != State::Recording) [[likely]] {
+            return;
+        }
+        const std::size_t at = position.load(std::memory_order_relaxed);
+        const std::size_t count = std::min(num_frames * 2, samples.size() - at);
+        std::memcpy(samples.data() + at, buffer, count * sizeof(s16));
+        position.store(at + count, std::memory_order_relaxed);
+        if (at + count == samples.size()) {
+            state.store(State::Full, std::memory_order_release);
+        }
+    }
+
+private:
+    enum class State : u32 { Idle, Recording, Full };
+    static constexpr std::size_t SECONDS = 12;
+
+    void Save() {
+        std::string package;
+        if (std::FILE* file = std::fopen("/proc/self/cmdline", "r")) {
+            char data[256]{};
+            const std::size_t read = std::fread(data, 1, sizeof(data) - 1, file);
+            std::fclose(file);
+            package.assign(data, strnlen(data, read));
+        }
+        const std::string path =
+            fmt::format("/sdcard/Android/data/{}/files/audio-{}.raw", package, request);
+        if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(samples.data(), sizeof(s16), samples.size(), file);
+            std::fclose(file);
+            LOG_INFO(Audio, "Recorded the audio output to {}", path);
+        } else {
+            LOG_WARNING(Audio, "Cannot write {}", path);
+        }
+        samples = {};
+    }
+
+    std::atomic<State> state{State::Idle};
+    std::atomic<std::size_t> position{0};
+    std::vector<s16> samples;
+    std::string request;
+    bool initialized = false;
+};
+OutputRecorder output_recorder;
+u32 pushes_since_poll = 0;
+#endif
 } // namespace
 
 DspInterface::DspInterface(Core::System& system_) : system(system_) {}
@@ -110,6 +201,12 @@ void DspInterface::PushSamples(std::span<const std::array<s16, 2>> samples) {
     } else {
         fifo.Push(samples.data(), samples.size());
     }
+#ifdef CITRA_AUDIO_RECORDER
+    if (++pushes_since_poll >= 64) {
+        pushes_since_poll = 0;
+        output_recorder.Poll();
+    }
+#endif
 
     auto video_dumper = system.GetVideoDumper();
     if (video_dumper && video_dumper->IsDumping()) {
@@ -119,7 +216,7 @@ void DspInterface::PushSamples(std::span<const std::array<s16, 2>> samples) {
     }
 }
 
-void DspInterface::DrainFifoBacklog(std::size_t num_frames) {
+std::size_t DspInterface::DrainFifoBacklog(std::size_t num_frames) {
     // The emulation thread produces a video frame of audio at a time, so the FIFO only needs enough
     // headroom to smooth those bursts. Audio that stays in the FIFO for a whole window without
     // being needed remains queued during a stall or at stream start. That extra data delays all
@@ -130,15 +227,17 @@ void DspInterface::DrainFifoBacklog(std::size_t num_frames) {
     fifo_low_fill = std::min(fifo_low_fill, fifo.Size());
     backlog_window_frames += num_frames;
     if (backlog_window_frames < window_frames) {
-        return;
+        return 0;
     }
+    std::size_t excess = 0;
     if (fifo_low_fill > 2 * kept_frames) {
-        const std::size_t excess = fifo_low_fill - kept_frames;
+        excess = fifo_low_fill - kept_frames;
         fifo.Pop(excess);
         LOG_DEBUG(Audio, "Dropped {} frames of audio backlog", excess);
     }
     fifo_low_fill = std::numeric_limits<std::size_t>::max();
     backlog_window_frames = 0;
+    return excess;
 }
 
 std::size_t DspInterface::PopResampled(s16* buffer, std::size_t num_frames, double ratio) {
@@ -204,7 +303,14 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
     }
     performing_time_stretching = enable_time_stretching.load();
 
+    std::size_t buffered = fifo.Size();
+    std::size_t dropped = 0;
     std::size_t frames_written = 0;
+    // Set where the sound is not simply handed over as it comes
+    bool paced = false;
+    std::size_t silent = 0;
+    double rate = 1.0;
+    std::size_t margin = 0;
     if (performing_time_stretching) {
         const std::vector<s16> in{fifo.Pop()};
         const std::size_t num_in{in.size() / 2};
@@ -219,20 +325,51 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
             // so that they do not bleed into the next time the stretcher is enabled.
             time_stretcher.Clear();
         }
-        // The presentation backend may run the emulation a fraction of a percent faster or
-        // slower to keep it in step with the display. The audio it produces is then played at
-        // that speed too, rather than piling up or running out.
-        const double ratio =
-            Settings::values.enable_realtime_audio ? 1.0 : system.frame_limiter.GetPacingScale();
-        if (ratio != 1.0 && ratio > 0.98 && ratio < 1.02) {
-            frames_written +=
-                PopResampled(buffer + 2 * frames_written, num_frames - frames_written, ratio);
+        if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyAudioOutput) {
+            // The presentation backend may run the emulation a fraction of a percent faster
+            // or slower to keep it in step with the display. The audio it produces is then
+            // played at that speed too, rather than piling up or running out.
+            const double ratio = Settings::values.enable_realtime_audio
+                                     ? 1.0
+                                     : system.frame_limiter.GetPacingScale();
+            if (ratio != 1.0 && ratio > 0.98 && ratio < 1.02) {
+                frames_written +=
+                    PopResampled(buffer + 2 * frames_written, num_frames - frames_written, ratio);
+            } else {
+                resampling = false;
+                frames_written += fifo.Pop(buffer, num_frames - frames_written);
+            }
+            dropped = DrainFifoBacklog(num_frames);
         } else {
+            // Played at the speed it is produced at, with a margin for when it comes late.
+            // Sound is produced as emulated time passes, or more often than that to keep it
+            // in step with real time.
+            const double production_speed = system.GetAudioProductionSpeed();
+            const OutputPacer::Result result = output_pacer.Render(
+                fifo, buffer + 2 * frames_written, num_frames - frames_written, production_speed);
+            paced = true;
+            silent = result.silent_frames;
+            rate = result.rate;
+            margin = result.margin;
+            buffered = result.waiting;
+            frames_written = num_frames;
             resampling = false;
-            frames_written += fifo.Pop(buffer, num_frames - frames_written);
         }
-        DrainFifoBacklog(num_frames);
     }
+
+    Common::Hitches::NoteAudioOutput({
+        .sample_rate = native_sample_rate,
+        .wanted = static_cast<u32>(num_frames),
+        .missing = static_cast<u32>(paced ? silent : num_frames - frames_written),
+        .buffered = static_cast<u32>(buffered),
+        .dropped = static_cast<u32>(dropped),
+        .margin = static_cast<u32>(margin),
+        .rate = static_cast<float>(rate),
+    });
+    CITRA_TRACE_SET_COUNTER("azahar.audio_waiting_ms", buffered * 1000 / native_sample_rate);
+    CITRA_TRACE_SET_COUNTER("azahar.audio_missing_frames",
+                            paced ? silent : num_frames - frames_written);
+    CITRA_TRACE_SET_COUNTER("azahar.audio_rate_permille", static_cast<s64>(rate * 1000.0));
 
     if (frames_written > 0) {
         std::memcpy(&last_frame[0], buffer + 2 * (frames_written - 1), 2 * sizeof(s16));
@@ -253,6 +390,9 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
             buffer[i * 2 + 1] = static_cast<s16>(buffer[i * 2 + 1] * volume_scale_factor);
         }
     }
+#ifdef CITRA_AUDIO_RECORDER
+    output_recorder.Write(buffer, num_frames);
+#endif
 }
 
 } // namespace AudioCore

@@ -497,7 +497,7 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
 
     // Reschedule recurrent event
     const double time_scale =
-        Settings::values.enable_realtime_audio
+        Core::System::GetInstance().IsAudioRealtime()
             ? std::max(0.01, // Arbitrary small value to prevent time_scale from approaching zero
                        Core::System::GetInstance().GetStableFrameTimeScale())
             : 1.0;

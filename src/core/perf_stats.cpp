@@ -14,6 +14,7 @@
 #include "common/file_util.h"
 #include "common/hitch_tracker.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/core_timing.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
@@ -244,6 +245,14 @@ void FrameLimiter::WaitOnce() {
 }
 
 void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
+    if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::InjectHitches) [[unlikely]] {
+        static u32 frames_since_hitch = 0;
+        if (++frames_since_hitch >= 60) {
+            frames_since_hitch = 0;
+            std::this_thread::sleep_for(30ms);
+        }
+    }
+
     if (frame_advancing_enabled) {
         // Frame advancing is enabled: wait on event instead of doing framelimiting
         WaitForFrameAdvance();
@@ -255,6 +264,7 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
         Settings::GetFrameLimit() / 100.0 * pacing_scale.load(std::memory_order_relaxed);
 
     if (Settings::GetFrameLimit() == 0) {
+        MeasureSpeed(now, current_system_time_us, false, 0.0);
         return;
     }
 
@@ -270,7 +280,8 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
     frame_limiting_delta_err =
         std::clamp(frame_limiting_delta_err, -max_lag_time_us, max_lag_time_us);
 
-    if (frame_limiting_delta_err > microseconds::zero()) {
+    const bool on_schedule = frame_limiting_delta_err > microseconds::zero();
+    if (on_schedule) {
         const microseconds wanted = frame_limiting_delta_err;
         if (wait_callback) {
             wait_callback(std::chrono::steady_clock::now() + frame_limiting_delta_err);
@@ -286,9 +297,69 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
         }
         now = now_after_sleep;
     }
+    MeasureSpeed(now, current_system_time_us, on_schedule, sleep_scale);
 
     previous_system_time_us = current_system_time_us;
     previous_walltime = now;
+}
+
+void FrameLimiter::MeasureSpeed(Clock::time_point now, microseconds emulated_time, bool on_schedule,
+                                double limit) {
+    using Seconds = std::chrono::duration<double>;
+    if (speed_stretch_start == Clock::time_point{} || emulated_time < speed_stretch_emulated) {
+        // The first frame, or emulated time started over
+        speed_stretch_start = now;
+        speed_stretch_emulated = emulated_time;
+        speed_previous_frame = now;
+        return;
+    }
+
+    // Games do their work in some frames and next to none in others, so the emulation falls
+    // behind and catches up all the time. Where it waited for real time it is not behind at
+    // all, and after a frame no longer than most it is as little behind as it gets. Between
+    // two such points emulated time and real time can be compared; between any two frames
+    // the comparison would be off by however much the emulation happened to be behind.
+    const double frame_time = Seconds(now - speed_previous_frame).count();
+    speed_previous_frame = now;
+    std::array<double, 8> sorted_times = speed_frame_times;
+    std::sort(sorted_times.begin(), sorted_times.end());
+    const bool short_frame = frame_time <= sorted_times[sorted_times.size() / 2];
+    speed_frame_times[speed_frame_count++ % speed_frame_times.size()] = frame_time;
+
+    constexpr double SHORTEST_STRETCH = 0.1;
+    constexpr double LONGEST_STRETCH = 0.3;
+    const double elapsed = Seconds(now - speed_stretch_start).count();
+    if (elapsed < SHORTEST_STRETCH || (!on_schedule && !short_frame && elapsed < LONGEST_STRETCH)) {
+        return;
+    }
+    const double stretch_speed = Seconds(emulated_time - speed_stretch_emulated).count() / elapsed;
+    speed_stretches[speed_stretch_count++ % speed_stretches.size()] =
+        std::clamp(stretch_speed, 0.1, 8.0);
+    speed_stretch_start = now;
+    speed_stretch_emulated = emulated_time;
+
+    // The average of the last few without the slowest two: a stretch with a long frame in it
+    // does not make the emulation slow, most of them being slow does. Two fast stretches in a
+    // row make it fast again right away.
+    if (speed_stretch_count >= 3) {
+        std::array<double, 9> sorted = speed_stretches;
+        const std::size_t count = std::min(speed_stretch_count, sorted.size());
+        std::sort(sorted.begin(), sorted.begin() + count);
+        const std::size_t left_out = std::min<std::size_t>(2, count / 3);
+        const double average =
+            std::accumulate(sorted.begin() + left_out, sorted.begin() + count, 0.0) /
+            static_cast<double>(count - left_out);
+        const std::size_t size = speed_stretches.size();
+        const double last = speed_stretches[(speed_stretch_count - 1) % size];
+        const double before = speed_stretches[(speed_stretch_count - 2) % size];
+        double speed = std::max(average, std::min(last, before));
+        if (limit > 0.0) {
+            // After falling behind the emulation runs faster than it is held to for a moment,
+            // to catch up. It cannot keep that up, so it does not count.
+            speed = std::min(speed, limit);
+        }
+        emulation_speed.store(speed, std::memory_order_relaxed);
+    }
 }
 
 bool FrameLimiter::IsFrameAdvancing() const {

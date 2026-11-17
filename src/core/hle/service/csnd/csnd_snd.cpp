@@ -170,9 +170,8 @@ void CSND_SND::AudioTickCallback(s64 cycles_late) {
     }
 
     // Keep in sync with the DSP audio frames (see DspHle::Impl::AudioTickCallback).
-    const double time_scale = Settings::values.enable_realtime_audio
-                                  ? std::max(0.01, system.GetStableFrameTimeScale())
-                                  : 1.0;
+    const double time_scale =
+        system.IsAudioRealtime() ? std::max(0.01, system.GetStableFrameTimeScale()) : 1.0;
     frame_length_ticks = std::max<s64>(static_cast<s64>(AudioFrameTicks / time_scale), 1);
     frame_start_ticks = system.CoreTiming().GetTicks() - cycles_late;
     system.CoreTiming().ScheduleEvent(frame_length_ticks - cycles_late, audio_tick_event);

@@ -565,7 +565,41 @@ PerfStats::Results System::GetLastPerfStats() {
 }
 
 double System::GetStableFrameTimeScale() {
-    return perf_stats->GetStableFrameTimeScale();
+    if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyAudioOutput) {
+        return perf_stats->GetStableFrameTimeScale();
+    }
+    // From the speed over the last second or so rather than the length of the last two frames,
+    // which swings with every frame a game does more of its work in.
+    //
+    // Producing sound more often takes it from the game faster than the game means to give
+    // it. A game that runs a little slow copes with that; one that stood still for a moment
+    // must not have its sound drained to make up for it. So the scale has a ceiling, below
+    // which sound slows down with the game after all, and it only rises gradually: by the
+    // time it could have risen far, the pause that made the speed look low is forgotten.
+    constexpr double HIGHEST = 1.6;
+    constexpr double RISE_PER_SECOND = 0.5;
+    constexpr double LONGEST_STEP = 0.02;
+
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::min(
+        std::chrono::duration<double>(now - audio_time_scale_updated).count(), LONGEST_STEP);
+    audio_time_scale_updated = now;
+
+    const double wanted = std::clamp(1.0 / frame_limiter.GetEmulationSpeed(), 0.1, HIGHEST);
+    double scale = audio_time_scale.load(std::memory_order_relaxed);
+    scale = wanted > scale ? std::min(wanted, scale + RISE_PER_SECOND * elapsed) : wanted;
+    audio_time_scale.store(scale, std::memory_order_relaxed);
+    return scale;
+}
+
+double System::GetAudioProductionSpeed() const {
+    const double speed = frame_limiter.GetEmulationSpeed();
+    return IsAudioRealtime() ? speed * audio_time_scale.load(std::memory_order_relaxed) : speed;
+}
+
+bool System::IsAudioRealtime() const {
+    return Settings::values.enable_realtime_audio.GetValue() ||
+           (Common::TraceMarkers::Experiments() & Common::TraceMarkers::RealtimeAudio) != 0;
 }
 
 void System::Reschedule() {

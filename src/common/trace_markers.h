@@ -57,6 +57,12 @@ enum Experiment : std::uint32_t {
     LegacyRightEyeSkip = 524288,   ///< "Disable right eye render" goes by the order of command
                                    ///< lists and transfers, as before, not by which results
                                    ///< reach the screen
+    LegacyAudioOutput = 1048576,   ///< The audio device is handed what is queued as it comes,
+                                   ///< and the last sample again when nothing is, as before
+    InjectHitches = 2097152,       ///< Hold the emulation up for 30 ms once a second, to see how
+                                   ///< what depends on its pace copes with frames that come late
+    RealtimeAudio = 4194304,       ///< As the "Enable Realtime Audio" setting: sound is produced in
+                                   ///< step with real time, however slowly the game runs
 };
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS

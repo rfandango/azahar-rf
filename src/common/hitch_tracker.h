@@ -132,6 +132,21 @@ void NotePresentQueued(u32 present_id, u32 game_frame,
 /// never reported are taken as dropped.
 void NotePresentShown(u32 present_id, u64 display_time_ns, u64 margin_ns);
 
+/// What the audio output did when the device asked it for sound, counted in frames (a sample
+/// for each channel).
+struct AudioOutput {
+    u32 sample_rate; ///< Frames per second
+    u32 wanted;      ///< Frames the device asked for
+    u32 missing;     ///< Frames of those that were not there to give
+    u32 buffered;    ///< Frames that were waiting when it asked
+    u32 dropped;     ///< Frames thrown away afterwards to shorten the delay
+    u32 margin;      ///< Frames the output aims to have left at the least, zero if it has no aim
+    float rate;      ///< Speed the sound was played at, relative to the nominal one
+};
+/// Called by the audio output each time the device asks for sound. May be called on any
+/// thread and does not block.
+void NoteAudioOutput(const AudioOutput& output);
+
 /// Multi-line summary of recent hitches for an on-screen overlay.
 std::string OverlayText();
 

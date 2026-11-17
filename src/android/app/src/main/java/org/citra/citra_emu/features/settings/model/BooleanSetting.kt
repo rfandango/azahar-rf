@@ -104,7 +104,7 @@ enum class BooleanSetting(
         CitraSettings.SECTION_AUDIO,
         false
     ),
-    ENABLE_REALTIME_AUDIO(SettingKeys.enable_realtime_audio(), CitraSettings.SECTION_AUDIO, false),
+    ENABLE_REALTIME_AUDIO(SettingKeys.enable_realtime_audio(), CitraSettings.SECTION_AUDIO, true),
     SIMULATE_HEADPHONES_PLUGGED(
         SettingKeys.simulate_headphones_plugged(),
         CitraSettings.SECTION_AUDIO,

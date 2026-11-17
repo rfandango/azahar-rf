@@ -225,8 +225,20 @@ public:
         return pacing_scale.load(std::memory_order_relaxed);
     }
 
+    /**
+     * How fast emulated time has been passing lately, relative to real time: 1 when the
+     * emulation keeps up, less when it does not. Measured over a second or so in a way that
+     * leaves out the odd long frame: only being slow most of the time counts as slow.
+     */
+    double GetEmulationSpeed() const {
+        return emulation_speed.load(std::memory_order_relaxed);
+    }
+
 private:
     void WaitForFrameAdvance();
+    /// `limit` is the speed the emulation is held to, zero if it is not held to any
+    void MeasureSpeed(Clock::time_point now, std::chrono::microseconds emulated_time,
+                      bool on_schedule, double limit);
 
     WaitCallback wait_callback;
 
@@ -243,6 +255,17 @@ private:
 
     /// Factor on the speed limit, see SetPacingScale
     std::atomic<double> pacing_scale{1.0};
+
+    // Measuring the speed of the emulation: over stretches of emulated frames that begin and
+    // end where the emulation is least behind
+    std::atomic<double> emulation_speed{1.0};
+    Clock::time_point speed_stretch_start{};
+    std::chrono::microseconds speed_stretch_emulated{0};
+    Clock::time_point speed_previous_frame{};
+    std::array<double, 8> speed_frame_times{};
+    std::size_t speed_frame_count = 0;
+    std::array<double, 9> speed_stretches{};
+    std::size_t speed_stretch_count = 0;
 
     /// Event to advance the frame when frame advancing is enabled
     Common::Event frame_advance_event;
