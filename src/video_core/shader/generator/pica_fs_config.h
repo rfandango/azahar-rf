@@ -89,6 +89,10 @@ struct FramebufferConfig {
         /// The renderer maps depth through the viewport (see GetViewportDepthRange), so the
         /// shader must not write depth itself. Set by renderers that support it.
         BitField<12, 1, u32> depth_from_viewport;
+        /// Nothing reads the colour the shader would compute: no colour is written and the
+        /// alpha test passes whatever it is. The shader then only places the fragment
+        /// (scissor) and gives it its depth. See FSConfig::KeepDepthOnly.
+        BitField<13, 1, u32> color_unused;
     };
     BlendConfig requested_rgb_blend{};
     BlendConfig requested_alpha_blend{};
@@ -110,7 +114,8 @@ struct FramebufferConfig {
             // fields
             FIELD_HASH(alpha_test_func), FIELD_HASH(scissor_test_mode), FIELD_HASH(depthmap_enable),
             FIELD_HASH(logic_op), FIELD_HASH(shadow_rendering), FIELD_HASH(alphablend_enable),
-            FIELD_HASH(depth_from_viewport), FIELD_HASH(requested_rgb_blend),
+            FIELD_HASH(depth_from_viewport), FIELD_HASH(color_unused),
+            FIELD_HASH(requested_rgb_blend),
             FIELD_HASH(requested_alpha_blend), FIELD_HASH(requested_logic_op),
 
             // nested layout
@@ -436,6 +441,13 @@ struct FSConfig {
         framebuffer.ApplyProfile(profile);
         texture.ApplyProfile(profile);
     }
+
+    /// For a draw whose colour nobody reads (FramebufferConfig::color_unused): drops everything
+    /// that only shapes the colour, so that all such draws share one small shader for each way
+    /// of doing scissor and depth. Games draw stencil masks and depth-only geometry with the
+    /// lighting and combiner state of the scene still set, and a GPU that cannot tell the
+    /// result is unused runs that whole program for every pixel of the mask.
+    void KeepDepthOnly();
 
     bool operator==(const FSConfig& other) const noexcept {
         return std::memcmp(this, &other, sizeof(FSConfig)) == 0;

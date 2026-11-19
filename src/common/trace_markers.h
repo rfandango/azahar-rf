@@ -80,6 +80,13 @@ enum Experiment : std::uint32_t {
     /// Fragment shaders work out the level of detail for every texture sample, also of
     /// textures that have one level only, as before
     LegacyTextureLod = 536870912,
+    /// Vulkan: every RGBA8 surface is created with storage usage and an R32 view format, in
+    /// case it becomes a shadow map, as before. Read when a surface is created, so set it
+    /// before the game starts.
+    LegacyStorageUsage = 1073741824,
+    /// Vulkan: a draw that writes no colour keeps the fragment shader of its lighting and
+    /// combiner state, as before
+    LegacyColourlessShader = 2147483648,
 };
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS

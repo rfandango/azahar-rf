@@ -5,6 +5,8 @@
 #pragma once
 
 #include <span>
+#include <utility>
+#include <vector>
 #include "video_core/rasterizer_cache/framebuffer_base.h"
 #include "video_core/rasterizer_cache/rasterizer_cache_base.h"
 #include "video_core/rasterizer_cache/surface_base.h"
@@ -141,6 +143,13 @@ public:
     /// Submits and waits for current GPU work.
     void Finish();
 
+    /// Takes an image that was replaced while commands that use it may still be on their way
+    /// to the GPU. It is destroyed by FreeRetired once the GPU is past them.
+    void Retire(Handle&& handle);
+
+    /// Destroys the retired images the GPU is done with. Called once a frame.
+    void FreeRetired();
+
     /// Maps an internal staging buffer of the provided size for pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
 
@@ -191,6 +200,8 @@ private:
     StreamBuffer upload_buffer;
     StreamBuffer download_buffer;
     u32 num_swapchain_images;
+    /// Replaced images and the tick they were last used in, see Retire
+    std::vector<std::pair<Handle, u64>> retired;
 };
 
 class Surface : public VideoCore::SurfaceBase {
@@ -267,6 +278,20 @@ public:
     vk::ImageView StencilView() noexcept {
         return ImageView(ViewType::Stencil);
     }
+
+    /// Whether the images of the surface can be bound as storage images and viewed as R32
+    bool HasStorageUsage() const noexcept {
+        return has_image_params &&
+               static_cast<bool>(image_usage & vk::ImageUsageFlagBits::eStorage);
+    }
+
+    /// Gives the surface images that can be bound as storage images and viewed as R32, with
+    /// what the ones it had held, if it has none such yet: what a shadow map and the output of
+    /// a conversion done in a compute shader need, and what costs framebuffer compression on
+    /// some GPUs, so that surfaces are not created with it. Ends the render pass. Views and
+    /// framebuffers obtained before are for the old images. Returns whether images changed;
+    /// a surface made from a texture pack stays as it is, see HasStorageUsage.
+    bool MakeStorageCapable();
 
     /// Returns the R32 image view used for atomic load/store.
     vk::ImageView StorageView() noexcept {

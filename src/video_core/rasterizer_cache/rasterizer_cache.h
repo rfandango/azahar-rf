@@ -907,6 +907,8 @@ template <class T>
 typename RasterizerCache<T>::Framebuffer* RasterizerCache<T>::RefreshFramebuffer(
     FramebufferParams fb_params) {
     fb_params.color_swapped = fb_params.color_id && slot_surfaces[fb_params.color_id].swapped;
+    fb_params.color_generation =
+        fb_params.color_id ? slot_surfaces[fb_params.color_id].image_generation : u8(0);
 
     auto [it, new_framebuffer] = framebuffers.try_emplace(fb_params);
     if (new_framebuffer) {

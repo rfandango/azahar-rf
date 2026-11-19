@@ -250,11 +250,9 @@ FormatTraits Instance::DetermineTraits(VideoCore::PixelFormat pixel_format, vk::
                           ? vk::ImageUsageFlagBits::eDepthStencilAttachment
                           : vk::ImageUsageFlagBits::eColorAttachment;
     }
-    // Storage flag is only needed for shadow rendering with RGBA8 texture.
-    // Keeping it disables can boost performance on mobile drivers.
-    if (supports_storage && pixel_format == VideoCore::PixelFormat::RGBA8) {
-        best_usage |= vk::ImageUsageFlagBits::eStorage;
-    }
+    // Storage usage is not among them: only a shadow map and the output of a conversion done
+    // in a compute shader need it, and an image with it gets no framebuffer compression on
+    // some GPUs. Surfaces add it when they need it, see Surface::MakeStorageCapable.
 
     return FormatTraits{
         .transfer_support = supports_transfer,

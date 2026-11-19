@@ -2,6 +2,7 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <cstring>
 #include "common/trace_markers.h"
 #include "video_core/pica_types.h"
 #include "video_core/shader/generator/pica_fs_config.h"
@@ -251,6 +252,21 @@ ProcTexConfig::ProcTexConfig(const Pica::TexturingRegs& regs) {
 
 FSConfig::FSConfig(const Pica::RegsInternal& regs)
     : framebuffer{regs}, texture{regs.texturing}, lighting{regs.lighting}, proctex{regs.texturing} {
+}
+
+void FSConfig::KeepDepthOnly() {
+    const auto scissor = framebuffer.scissor_test_mode.Value();
+    const auto depthmap = framebuffer.depthmap_enable.Value();
+    const u32 from_viewport = framebuffer.depth_from_viewport.Value();
+    // The configuration is hashed and compared as bytes
+    std::memset(static_cast<void*>(this), 0, sizeof(*this));
+    framebuffer.scissor_test_mode.Assign(scissor);
+    framebuffer.depthmap_enable.Assign(depthmap);
+    framebuffer.depth_from_viewport.Assign(from_viewport);
+    framebuffer.alpha_test_func.Assign(Pica::FramebufferRegs::CompareFunc::Always);
+    framebuffer.logic_op.Assign(Pica::FramebufferRegs::LogicOp::Copy);
+    framebuffer.requested_logic_op = Pica::FramebufferRegs::LogicOp::Copy;
+    framebuffer.color_unused.Assign(1);
 }
 
 } // namespace Pica::Shader

@@ -144,6 +144,15 @@ vec4 secondary_fragment_color = vec4(0.0);
     WriteScissor();
     WriteDepth();
 
+    if (config.framebuffer.color_unused) {
+        // Nobody reads the colour: where the fragment is and how deep is all that is left
+        if (!config.framebuffer.depth_from_viewport) {
+            out += "gl_FragDepth = depth;\n";
+        }
+        out += '}';
+        return out;
+    }
+
     // Write shader source to emulate all enabled PICA lights
     WriteLighting();
 

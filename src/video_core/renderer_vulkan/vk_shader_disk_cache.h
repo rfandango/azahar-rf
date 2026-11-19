@@ -35,7 +35,7 @@ public:
         const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, const VertexLayout& layout);
     std::optional<std::pair<u64, Shader* const>> UseFragmentShader(
         const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
-        bool depth_from_viewport, bool host_scissor);
+        bool depth_from_viewport, bool host_scissor, bool color_unused);
     std::optional<std::pair<u64, Shader* const>> UseFixedGeometryShader(
         const Pica::RegsInternal& regs);
 

@@ -29,7 +29,9 @@ struct FramebufferParams {
     bool shadow_rendering;
     /// Which of its two images the colour surface is in, see SurfaceBase::swapped
     bool color_swapped;
-    INSERT_PADDING_BYTES(2);
+    /// The images of the colour surface the framebuffer is for, see SurfaceBase::image_generation
+    u8 color_generation;
+    INSERT_PADDING_BYTES(1);
 
     bool operator==(const FramebufferParams& params) const noexcept {
         return std::memcmp(this, &params, sizeof(FramebufferParams)) == 0;

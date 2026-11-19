@@ -250,7 +250,7 @@ std::vector<u32> RelaxPrecision(const std::vector<u32>& spirv) {
 
 std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
     const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user, bool depth_from_viewport,
-    bool host_scissor) {
+    bool host_scissor, bool color_unused) {
 
     FSConfig fs_config{regs};
     fs_config.framebuffer.depth_from_viewport.Assign(depth_from_viewport);
@@ -261,6 +261,9 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
     if (host_scissor &&
         fs_config.framebuffer.scissor_test_mode == Pica::RasterizerRegs::ScissorMode::Include) {
         fs_config.framebuffer.scissor_test_mode.Assign(Pica::RasterizerRegs::ScissorMode::Disabled);
+    }
+    if (color_unused) {
+        fs_config.KeepDepthOnly();
     }
     auto fs_config_hash = fs_config.Hash();
 

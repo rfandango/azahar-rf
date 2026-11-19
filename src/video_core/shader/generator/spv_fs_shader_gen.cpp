@@ -52,6 +52,14 @@ void FragmentModule::Generate() {
     WriteDepth();
     WriteScissor();
 
+    if (config.framebuffer.color_unused) {
+        // Nobody reads the colour: where the fragment is and how deep is all that is left
+        // (WriteDepth has stored the depth if the shader is the one to set it)
+        OpReturn();
+        OpFunctionEnd();
+        return;
+    }
+
     // Write shader bytecode to emulate all enabled PICA lights
     WriteLighting();
 

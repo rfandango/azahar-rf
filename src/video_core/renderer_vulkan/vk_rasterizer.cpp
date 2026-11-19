@@ -158,6 +158,7 @@ void RasterizerVulkan::TickFrame() {
     }
 #endif
     res_cache.TickFrame();
+    runtime.FreeRetired();
 }
 
 void RasterizerVulkan::LoadDefaultDiskResources(
@@ -665,7 +666,20 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     const bool host_scissor =
         regs.rasterizer.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Include &&
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyScissor) == 0;
-    pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value(), host_scissor);
+    // A draw that writes no colour (a stencil mask, depth-only geometry) still has the scene's
+    // lighting and combiner state set. Unless the alpha test can drop fragments by it, or the
+    // shader writes a shadow map itself, what that state computes goes nowhere: such a draw
+    // gets a shader without it. A GPU that cannot leave an unused fragment shader out runs it
+    // for every pixel otherwise (an Adreno 6xx does: 1.9 ms for one mask of 1.2 million pixels
+    // in Luigi's Mansion: Dark Moon at 5x).
+    const auto& alpha_test = regs.framebuffer.output_merger.alpha_test;
+    const bool color_unused =
+        !write_color_fb && !shadow_rendering &&
+        (alpha_test.enable == 0 ||
+         alpha_test.func == Pica::FramebufferRegs::CompareFunc::Always) &&
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyColourlessShader) == 0;
+    pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value(), host_scissor,
+                                     color_unused);
     pipeline_info.dynamic_info.depth_min = depth_range ? depth_range->min_depth : 0.f;
     pipeline_info.dynamic_info.depth_max = depth_range ? depth_range->max_depth : 1.f;
 

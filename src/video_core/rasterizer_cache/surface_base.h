@@ -99,6 +99,9 @@ public:
     /// sampled, flip this when the two change places: what was made for one image of the
     /// surface, a framebuffer for one, is not for the other.
     bool swapped{};
+    /// Counts the times a renderer gave the surface new images in place of the ones it had
+    /// (wraps around): what was made for the old ones is not for these.
+    u8 image_generation{};
     const Material* material = nullptr;
     SurfaceRegions invalid_regions;
     u32 fill_size = 0;

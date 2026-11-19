@@ -15,6 +15,7 @@ import java.lang.IllegalStateException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipException
 import java.util.zip.ZipInputStream
+import org.citra.citra_emu.BuildConfig
 import org.citra.citra_emu.CitraApplication
 import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.utils.FileUtil.asDocumentFile
@@ -56,6 +57,12 @@ object GpuDriverHelper {
         // Initialize directories.
         initializeDirectories()
 
+        // Profiling builds take a driver package left for them, so that driver builds can be
+        // tried without going through the driver manager.
+        if (BuildConfig.BUILD_TYPE == "profile") {
+            installTestDriver()
+        }
+
         // Initialize hook libraries directory.
         hookLibPath = CitraApplication.appContext.applicationInfo.nativeLibraryDir + "/"
 
@@ -66,6 +73,30 @@ object GpuDriverHelper {
             customDriverData.libraryName,
             fileRedirectionPath
         )
+    }
+
+    /**
+     * Installs test_driver.zip from the app's external files folder (where adb can put it:
+     * /sdcard/Android/data/<package>/files) in place of the current driver, once: the file is
+     * removed afterwards. An empty file of that name goes back to the system driver.
+     */
+    private fun installTestDriver() {
+        val zip = File(CitraApplication.appContext.getExternalFilesDir(null), "test_driver.zip")
+        if (!zip.isFile) {
+            return
+        }
+        try {
+            val installation = File(driverInstallationPath!!)
+            installation.deleteRecursively()
+            installation.mkdirs()
+            if (zip.length() > 0) {
+                FileUtil.unzipToInternalStorage(BufferedInputStream(zip.inputStream()), installation)
+            }
+            Log.info("[GpuDriverHelper] Test driver installed from ${zip.path} (${zip.length()} bytes)")
+        } catch (e: Exception) {
+            Log.error("[GpuDriverHelper] Test driver ${zip.path} not installed: $e")
+        }
+        zip.delete()
     }
 
     fun getDrivers(): MutableList<Pair<Uri, GpuDriverMetadata>> {

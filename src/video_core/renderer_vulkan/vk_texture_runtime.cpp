@@ -20,6 +20,7 @@
 #include "common/literals.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
+#include "common/trace_markers.h"
 #include "video_core/custom_textures/material.h"
 #include "video_core/frame_state_dump.h"
 #include "video_core/rasterizer_cache/texture_codec.h"
@@ -327,6 +328,26 @@ void TextureRuntime::Finish() {
     scheduler.Flush();
 }
 
+void TextureRuntime::Retire(Handle&& handle) {
+    retired.emplace_back(std::move(handle), GetResourceTick());
+}
+
+void TextureRuntime::FreeRetired() {
+    if (retired.empty()) {
+        return;
+    }
+    // As for the surfaces the cache has sentenced: one used in a tick the GPU has not finished
+    // stays. Destroyed before it is dropped from the list, because moving a Handle onto
+    // another does not release what the other holds.
+    const u64 free_tick = GetResourceFreeTick();
+    for (auto& [handle, last_used_tick] : retired) {
+        if (free_tick > last_used_tick) {
+            handle.Destroy();
+        }
+    }
+    std::erase_if(retired, [](const auto& entry) { return !entry.first; });
+}
+
 bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
                                  const VideoCore::TextureCopy& copy) {
     const PixelFormat src_format = source.pixel_format;
@@ -340,6 +361,11 @@ bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
     }
 
     if (src_format == PixelFormat::D24S8 && dst_format == PixelFormat::RGBA8) {
+        // The conversion writes the destination as a storage image.
+        dest.MakeStorageCapable();
+        if (!dest.HasStorageUsage()) {
+            return false;
+        }
         return blit_helper.ConvertDS24S8ToRGBA8(source, dest, copy);
     }
 
@@ -621,6 +647,8 @@ bool TextureRuntime::CanRelayoutTextures(const Surface& source,
 
 bool TextureRuntime::RelayoutTextures(Surface& source, Surface& dest,
                                       const VideoCore::TextureRelayout& relayout) {
+    // The conversion writes the destination as a storage image.
+    dest.MakeStorageCapable();
     return blit_helper.Relayout(source, dest, relayout);
 }
 
@@ -786,16 +814,24 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
         return;
     }
 
-    bool is_mutable = traits.native == vk::Format::eR8G8B8A8Unorm;
-
     if (True(flags & VideoCore::SurfaceFlagBits::ShadowSource) &&
         traits.native != vk::Format::eR8G8B8A8Unorm) {
         // If the surface is a shadow source, it needs conversion
         // to be forced as it always has to be RGBA8
         traits = instance.GetTraits(VideoCore::PixelFormat::RGBA8);
         traits.needs_conversion = true;
-        is_mutable = true;
     }
+
+    // A shadow map is read through an R32 view and written as a storage image. An image
+    // created for that gets no framebuffer compression on some GPUs (an Adreno 6xx leaves it
+    // off for an image with storage usage, and for one with a view format of another kind),
+    // and compression is worth a third of the frame where memory traffic is the limit. So only
+    // a surface known to be a shadow source starts out that way; any other gets such images
+    // when it turns out to need them, see MakeStorageCapable.
+    const bool is_mutable =
+        traits.native == vk::Format::eR8G8B8A8Unorm &&
+        (True(flags & VideoCore::SurfaceFlagBits::ShadowSource) ||
+         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyStorageUsage) != 0);
 
     const vk::Format format = traits.native;
 
@@ -819,9 +855,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
     if (is_color) {
         usage |= vk::ImageUsageFlagBits::eColorAttachment;
     }
-    if (traits.native == vk::Format::eR8G8B8A8Unorm && traits.storage_support) {
-        // Add Storage-usage support when available in case it is found out later that this is a
-        // shadow-source texture that will get used in the utility descriptor-set
+    if (is_mutable && traits.storage_support) {
         usage |= vk::ImageUsageFlagBits::eStorage;
     }
 
@@ -1177,7 +1211,12 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
 }
 
 void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
-    const bool is_mutable = pixel_format == VideoCore::PixelFormat::RGBA8;
+    // Of the kind the surface's images are, see the constructor
+    const bool is_mutable =
+        has_image_params &&
+        static_cast<bool>(image_flags & vk::ImageCreateFlagBits::eMutableFormat);
+    const vk::ImageUsageFlags scaled_usage = has_image_params ? image_usage : traits.usage;
+    const bool format_list = has_image_params && image_format_list;
 
     vk::ImageCreateFlags flags{};
     if (texture_type == VideoCore::TextureType::CubeMap) {
@@ -1192,8 +1231,8 @@ void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
         res_scale = new_scale;
 
         handles[Type::Scaled].Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type,
-                                     traits.native, vk::SampleCountFlagBits::e1, traits.usage,
-                                     flags, traits.aspect, false, DebugName(true));
+                                     traits.native, vk::SampleCountFlagBits::e1, scaled_usage,
+                                     flags, traits.aspect, format_list, DebugName(true));
         current = Type::Scaled;
 
         handles[Type::Copy].Destroy();
@@ -1278,6 +1317,113 @@ vk::PipelineStageFlags Surface::PipelineStageFlags() const noexcept {
            (is_framebuffer ? attachment_flags : vk::PipelineStageFlagBits::eNone) |
            (is_storage ? vk::PipelineStageFlagBits::eComputeShader
                        : vk::PipelineStageFlagBits::eNone);
+}
+
+bool Surface::MakeStorageCapable() {
+    if (HasStorageUsage() || !has_image_params || !traits.storage_support ||
+        traits.native != vk::Format::eR8G8B8A8Unorm) {
+        return false;
+    }
+    runtime.renderpass_cache.EndRendering();
+
+    image_usage |= vk::ImageUsageFlagBits::eStorage;
+    image_flags |= vk::ImageCreateFlagBits::eMutableFormat;
+    image_format_list = instance.IsImageFormatListSupported();
+
+    // The second image holds nothing that lasts: it is made again when it is needed
+    if (handles[Type::Copy]) {
+        runtime.Retire(std::move(handles[Type::Copy]));
+    }
+    for (const Type type : {Type::Base, Type::Scaled}) {
+        Handle& handle = handles[type];
+        if (!handle) {
+            continue;
+        }
+        Handle fresh{instance};
+        fresh.Create(handle.width, handle.height, handle.levels, texture_type, traits.native,
+                     vk::SampleCountFlagBits::e1, image_usage, image_flags, traits.aspect,
+                     image_format_list, DebugName(type == Type::Scaled));
+
+        const RecordParams params = {
+            .aspect = Aspect(),
+            .pipeline_flags = PipelineStageFlags(),
+            .src_access = AccessFlags(),
+            .src_image = handle.image,
+            .dst_image = fresh.image,
+        };
+        scheduler.Record([params, levels = handle.levels, layers = handle.layers,
+                          width = handle.width, height = handle.height](vk::CommandBuffer cmdbuf) {
+            const vk::ImageSubresourceRange range = {
+                .aspectMask = params.aspect,
+                .baseMipLevel = 0,
+                .levelCount = levels,
+                .baseArrayLayer = 0,
+                .layerCount = layers,
+            };
+            const std::array pre_barriers = {
+                vk::ImageMemoryBarrier{
+                    .srcAccessMask = params.src_access,
+                    .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                    .oldLayout = vk::ImageLayout::eGeneral,
+                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = params.src_image,
+                    .subresourceRange = range,
+                },
+                vk::ImageMemoryBarrier{
+                    .srcAccessMask = vk::AccessFlagBits::eNone,
+                    .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                    .oldLayout = vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = params.dst_image,
+                    .subresourceRange = range,
+                },
+            };
+            const vk::ImageMemoryBarrier post_barrier = {
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = params.src_access,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = params.dst_image,
+                .subresourceRange = range,
+            };
+            boost::container::small_vector<vk::ImageCopy, 3> image_copies;
+            for (u32 level = 0; level < levels; level++) {
+                const vk::ImageSubresourceLayers subresource = {
+                    .aspectMask = params.aspect,
+                    .mipLevel = level,
+                    .baseArrayLayer = 0,
+                    .layerCount = layers,
+                };
+                image_copies.push_back(vk::ImageCopy{
+                    .srcSubresource = subresource,
+                    .srcOffset = {0, 0, 0},
+                    .dstSubresource = subresource,
+                    .dstOffset = {0, 0, 0},
+                    .extent = {std::max(width >> level, 1u), std::max(height >> level, 1u), 1},
+                });
+            }
+            cmdbuf.pipelineBarrier(params.pipeline_flags, vk::PipelineStageFlagBits::eTransfer,
+                                   vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
+            cmdbuf.copyImage(params.src_image, vk::ImageLayout::eTransferSrcOptimal,
+                             params.dst_image, vk::ImageLayout::eTransferDstOptimal, image_copies);
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, params.pipeline_flags,
+                                   vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+        });
+
+        // Commands recorded so far use the old image, and so may views handed out for it
+        runtime.Retire(std::move(handle));
+        handle = std::move(fresh);
+    }
+    image_generation++;
+    LOG_INFO(Render_Vulkan, "Surface {}x{} @{:08X} was given images a shadow map can use",
+             GetScaledWidth(), GetScaledHeight(), addr);
+    return true;
 }
 
 bool Surface::EnsureCopyHandle() {
@@ -1528,6 +1674,8 @@ vk::ImageView Surface::ImageView(ViewType view_type, Type type) noexcept {
         ASSERT_MSG(traits.storage_support,
                    "Creating a storage-view for format({}) which doesn't have storage-support!",
                    vk::to_string(traits.native));
+        // The surface's images change here if they are not of the kind that has such a view
+        MakeStorageCapable();
         is_storage = true;
     }
     if (view_type == ViewType::Depth || view_type == ViewType::Stencil) {
@@ -1723,6 +1871,7 @@ Framebuffer::Framebuffer(TextureRuntime& runtime, const VideoCore::FramebufferPa
         height = extent.height;
         render_pass = renderpass_cache.GetRenderpass(PixelFormat::Invalid, PixelFormat::Invalid,
                                                      false, sample_count);
+        color->MakeStorageCapable();
         images[0] = color->Image();
         image_views[0] = color->StorageView();
         aspects[0] = vk::ImageAspectFlagBits::eColor;
