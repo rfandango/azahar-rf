@@ -296,6 +296,13 @@ private:
 
         bool SwitchMode(CacheOpMode mode);
 
+        /// Cuts off what follows the last complete entry of the file. An entry that was
+        /// being appended when the process was killed, which on Android can be at any
+        /// moment, is left half written, and a file that does not end in a whole entry is
+        /// taken for malformed and started afresh: everything the game had gathered in it,
+        /// gone for one entry.
+        void DropTornTail();
+
     private:
         bool ReadFromFileCached(void* dst, size_t absolute_pos, size_t size);
 

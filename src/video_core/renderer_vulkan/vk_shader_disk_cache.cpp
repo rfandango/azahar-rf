@@ -614,6 +614,57 @@ void ShaderDiskCache::CacheFile::Append(CacheEntryType type, u64 id, std::span<c
     });
 }
 
+void ShaderDiskCache::CacheFile::DropTornTail() {
+    constexpr u32 headers_size =
+        sizeof(CacheEntry::CacheEntryHeader) + sizeof(CacheEntry::CacheEntryFooter);
+    u64 good_end = 0;
+    u64 size = 0;
+    {
+        FileUtil::IOFile whole{filepath, "rb"};
+        if (!whole.IsGood()) {
+            return;
+        }
+        size = whole.GetSize();
+        if (size < headers_size) {
+            return;
+        }
+        // A file that ends in a footer is whole: nothing to look for. (ReadAtArray says how
+        // many bytes it read.)
+        CacheEntry::CacheEntryFooter last{};
+        if (whole.ReadAtArray(&last, 1, size - sizeof(last)) == sizeof(last) &&
+            last.version == CacheEntry::CacheEntryFooter::ENTRY_VERSION) {
+            return;
+        }
+        // Entry by entry from the start, as far as they are complete
+        while (good_end + headers_size <= size) {
+            CacheEntry::CacheEntryHeader header{};
+            if (whole.ReadAtArray(&header, 1, good_end) != sizeof(header) || !header.Valid() ||
+                good_end + header.entry_size > size) {
+                break;
+            }
+            CacheEntry::CacheEntryFooter footer{};
+            if (whole.ReadAtArray(&footer, 1, good_end + header.entry_size - sizeof(footer)) !=
+                    sizeof(footer) ||
+                footer.version != CacheEntry::CacheEntryFooter::ENTRY_VERSION ||
+                footer.entry_size != header.entry_size) {
+                break;
+            }
+            good_end += header.entry_size;
+        }
+    }
+    if (good_end == 0 || good_end >= size) {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Shader cache {} ends in an entry that was not written out: {} bytes dropped, "
+                "{} kept",
+                filepath, size - good_end, good_end);
+    FileUtil::IOFile whole{filepath, "r+b"};
+    if (!whole.IsGood() || !whole.Resize(good_end)) {
+        LOG_ERROR(Render_Vulkan, "Could not cut the shader cache {} back", filepath);
+    }
+}
+
 bool ShaderDiskCache::CacheFile::SwitchMode(CacheOpMode mode) {
     if (curr_mode == mode) {
         return true;
@@ -627,6 +678,8 @@ bool ShaderDiskCache::CacheFile::SwitchMode(CacheOpMode mode) {
         next_entry_id = SIZE_MAX; // Force reading entries again
         cached_file_data_start = 0;
         cached_file_data.clear();
+        file.Close();
+        DropTornTail();
         file = FileUtil::IOFile(filepath, "rb");
         bool is_open = file.IsGood();
         if (is_open) {
