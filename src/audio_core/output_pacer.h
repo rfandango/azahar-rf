@@ -45,11 +45,39 @@ public:
         double rate;               ///< Speed the queue was read at, relative to the nominal one
         std::size_t margin;        ///< Frames aimed for in the queue at its lowest
         std::size_t waiting;       ///< Frames that were waiting, in the queue and here
+        std::size_t ahead_frames;  ///< Frames that had to be asked for, see Refill
+        std::size_t spare_frames;  ///< Frames there are too many of, for the source of the
+                                   ///< sound to leave out as many of what it makes next
+    };
+
+    /**
+     * A way to have another frame of sound queued at once, for when the queue would run out
+     * before the emulation fills it: see DspInterface::ProduceFrameAhead. `queue_frame` returns
+     * whether a frame was queued.
+     *
+     * With it the speed is held. Without, the queue has to be read at the speed it is filled
+     * at, which is heard as the pitch giving way whenever the emulation runs a little slow, and
+     * a reserve has to be rebuilt after every hold-up by playing slower for a while. With it
+     * the sound is read at the speed the emulation is meant to run at (`production_speed` is
+     * then that, and within a fraction of a percent of one), what is missing is asked for, and
+     * what is too much is reported back for the source to leave out.
+     */
+    struct Refill {
+        bool (*queue_frame)(void* context);
+        void* context;
+
+        explicit operator bool() const {
+            return queue_frame != nullptr;
+        }
+        bool operator()() const {
+            return queue_frame(context);
+        }
     };
 
     /// Fills `buffer` with `num_frames` stereo frames from the queue, which is being filled at
     /// `production_speed` times the nominal rate. Audio thread.
-    Result Render(OutputFifo& fifo, s16* buffer, std::size_t num_frames, double production_speed);
+    Result Render(OutputFifo& fifo, s16* buffer, std::size_t num_frames, double production_speed,
+                  Refill refill = Refill{nullptr, nullptr});
 
 private:
     enum class State {
@@ -101,6 +129,8 @@ private:
     bool skip_ahead = false;
     /// The least the queue held lately, as the speed was last set by
     double lowest_lately = 0.0;
+    /// Whether frames can be asked for, and the speed is held: see Refill
+    bool steady = false;
 };
 
 } // namespace AudioCore

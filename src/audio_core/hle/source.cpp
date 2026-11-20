@@ -14,15 +14,71 @@
 
 namespace AudioCore::HLE {
 
+namespace {
+/// Frames a source that waited for more goes on waiting once the emulation runs again
+constexpr u32 FRAMES_TO_WAIT = 8;
+/// Samples over which a source goes silent when it starts to wait, and comes back
+constexpr std::size_t WAIT_RAMP = 32;
+} // namespace
+
 SourceStatus::Status Source::Tick(SourceConfiguration::Configuration& config,
                                   const s16_le (&adpcm_coeffs)[16]) {
     ParseConfig(config, adpcm_coeffs);
 
     if (state.enabled) {
-        GenerateFrame();
+        const bool would_run_out = (frames_to_wait != 0 || waiting) && WouldRunOut();
+        if (frames_to_wait != 0 && would_run_out) {
+            // The application has only just been told how far this source got
+            frames_to_wait--;
+            WaitFrame();
+        } else {
+            if (waiting) {
+                wait_outcome = would_run_out ? WaitOutcome::Ended : WaitOutcome::WentOn;
+            }
+            frames_to_wait = 0;
+            GenerateFrame();
+        }
     }
 
     return GetCurrentStatus();
+}
+
+void Source::TickAhead() {
+    if (!state.enabled) {
+        return;
+    }
+    if (WouldRunOut()) {
+        frames_to_wait = FRAMES_TO_WAIT;
+        WaitFrame();
+    } else {
+        GenerateFrame();
+    }
+}
+
+bool Source::WouldRunOut() const {
+    if (!state.input_queue.empty()) {
+        // More is queued. A buffer that loops goes back into the queue when it is taken out.
+        return false;
+    }
+    // What the interpolation takes in for a frame, and the samples it keeps back
+    const auto needed =
+        static_cast<std::size_t>(state.rate_multiplier * static_cast<float>(samples_per_frame)) + 4;
+    return state.current_buffer.size() < needed;
+}
+
+void Source::WaitFrame() {
+    const std::array<s16, 2> last = current_frame.back();
+    current_frame.fill({});
+    if (!waiting) {
+        for (std::size_t i = 0; i < WAIT_RAMP; i++) {
+            const s32 weight = static_cast<s32>(WAIT_RAMP - i);
+            current_frame[i] = {
+                static_cast<s16>(last[0] * weight / static_cast<s32>(WAIT_RAMP)),
+                static_cast<s16>(last[1] * weight / static_cast<s32>(WAIT_RAMP)),
+            };
+        }
+    }
+    waiting = true;
 }
 
 void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
@@ -64,6 +120,8 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
 void Source::Reset() {
     current_frame.fill({});
     state = {};
+    frames_to_wait = 0;
+    waiting = false;
 }
 
 void Source::Sleep() {
@@ -399,6 +457,7 @@ void Source::GenerateFrame() {
         state.buffer_update = true;
         state.last_buffer_id = state.current_buffer_id;
         state.current_buffer_id = 0;
+        waiting = false;
         return;
     }
 
@@ -438,6 +497,18 @@ void Source::GenerateFrame() {
     }
 
     state.filters.ProcessFrame(current_frame);
+
+    if (waiting) {
+        // Back from a frame it waited in
+        waiting = false;
+        for (std::size_t i = 0; i < WAIT_RAMP; i++) {
+            const s32 weight = static_cast<s32>(i);
+            current_frame[i] = {
+                static_cast<s16>(current_frame[i][0] * weight / static_cast<s32>(WAIT_RAMP)),
+                static_cast<s16>(current_frame[i][1] * weight / static_cast<s32>(WAIT_RAMP)),
+            };
+        }
+    }
 }
 
 bool Source::DequeueBuffer() {

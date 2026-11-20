@@ -43,6 +43,9 @@ public:
     void LoadComponent(std::span<const u8> buffer) override;
     void UnloadComponent() override;
 
+protected:
+    bool ProduceFrameAhead() override;
+
 private:
     struct Impl;
     friend struct Impl;

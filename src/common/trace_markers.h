@@ -103,6 +103,21 @@ enum Experiment2 : std::uint32_t {
     /// A title that asks for the New 3DS's 804 MHz processor clock gets as much emulated CPU
     /// time as one for the Old 3DS, as before. Read when the title starts.
     LegacyProcessorClock = 4,
+    /// When the emulation is late with the sound, the device goes without until it comes, as
+    /// before: no frames are mixed ahead of it
+    NoAudioAhead = 8,
+    /// The audio device is closed and opened again each time settings are applied anew, as
+    /// before
+    LegacySinkReload = 16,
+};
+
+/// A hold-up of the emulation asked for through `debug.azahar.stall`, as
+/// "<milliseconds>/<every so many VBlanks>": "150/180" holds it up for 150 ms every three
+/// seconds, "12/1" makes a game that runs slow all the time. For seeing how what depends on
+/// the emulation's pace, the sound above all, copes with it. Zero when none is asked for.
+struct InjectedStall {
+    std::uint32_t milliseconds;
+    std::uint32_t every;
 };
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS
@@ -110,12 +125,17 @@ enum Experiment2 : std::uint32_t {
 std::uint32_t Experiments();
 /// Currently active Experiment2 flags.
 std::uint32_t Experiments2();
+/// The hold-up currently asked for.
+InjectedStall Stall();
 #else
 constexpr std::uint32_t Experiments() {
     return 0;
 }
 constexpr std::uint32_t Experiments2() {
     return 0;
+}
+constexpr InjectedStall Stall() {
+    return {};
 }
 #endif
 

@@ -42,6 +42,39 @@ DspStatus Mixers::Tick(DspConfiguration& config, const IntermediateMixSamples& r
     return GetCurrentStatus();
 }
 
+namespace {
+/// Samples over which an auxiliary bus goes silent and comes back
+constexpr std::size_t AUX_RAMP = 32;
+} // namespace
+
+void Mixers::TickAhead(const std::array<QuadFrame32, 3>& input) {
+    state.intermediate_mix_buffer[0] = input[0];
+    for (std::size_t bus = 0; bus < 2; bus++) {
+        QuadFrame32& buffer = state.intermediate_mix_buffer[bus + 1];
+        if (!state.aux_bus_enable[bus]) {
+            buffer = input[bus + 1];
+            continue;
+        }
+        // Down from where the last frame ended, rather than at once
+        const std::array<s32, 4> last = buffer.back();
+        buffer = {};
+        if (!aux_silent[bus]) {
+            for (std::size_t sample = 0; sample < AUX_RAMP; sample++) {
+                const s64 weight = static_cast<s64>(AUX_RAMP - sample);
+                for (std::size_t channel = 0; channel < 4; channel++) {
+                    buffer[sample][channel] =
+                        static_cast<s32>(last[channel] * weight / static_cast<s64>(AUX_RAMP));
+                }
+            }
+        }
+        aux_silent[bus] = true;
+    }
+
+    ApplyEffects();
+
+    MixCurrentFrame();
+}
+
 void Mixers::ParseConfig(DspConfiguration& config) {
     if (!config.dirty_raw) {
         return;
@@ -49,14 +82,22 @@ void Mixers::ParseConfig(DspConfiguration& config) {
 
     if (config.aux_bus_enable_0_dirty) {
         config.aux_bus_enable_0_dirty.Assign(0);
-        state.aux_bus_enable[0] = config.aux_bus_enable[0] != 0;
-        LOG_TRACE(Audio_DSP, "mixers aux_bus_enable[0] = {}", config.aux_bus_enable[0]);
+        const bool enable = config.aux_bus_enable[0] != 0;
+        if (enable != state.aux_bus_enable[0]) {
+            LOG_INFO(Audio_DSP, "Auxiliary bus 0 {} by way of the application",
+                     enable ? "goes" : "no longer goes");
+        }
+        state.aux_bus_enable[0] = enable;
     }
 
     if (config.aux_bus_enable_1_dirty) {
         config.aux_bus_enable_1_dirty.Assign(0);
-        state.aux_bus_enable[1] = config.aux_bus_enable[1] != 0;
-        LOG_TRACE(Audio_DSP, "mixers aux_bus_enable[1] = {}", config.aux_bus_enable[1]);
+        const bool enable = config.aux_bus_enable[1] != 0;
+        if (enable != state.aux_bus_enable[1]) {
+            LOG_INFO(Audio_DSP, "Auxiliary bus 1 {} by way of the application",
+                     enable ? "goes" : "no longer goes");
+        }
+        state.aux_bus_enable[1] = enable;
     }
 
     if (config.master_volume_dirty) {
@@ -185,6 +226,25 @@ void Mixers::AuxReturn(const IntermediateMixSamples& read_samples) {
             for (std::size_t channel = 0; channel < 4; channel++) {
                 state.intermediate_mix_buffer[2][sample][channel] =
                     read_samples.mix2.pcm32[channel][sample];
+            }
+        }
+    }
+
+    // Back from frames mixed ahead of the application, in which the bus was silent
+    for (std::size_t bus = 0; bus < 2; bus++) {
+        if (!aux_silent[bus]) {
+            continue;
+        }
+        aux_silent[bus] = false;
+        if (!state.aux_bus_enable[bus]) {
+            continue;
+        }
+        QuadFrame32& buffer = state.intermediate_mix_buffer[bus + 1];
+        for (std::size_t sample = 0; sample < AUX_RAMP; sample++) {
+            for (std::size_t channel = 0; channel < 4; channel++) {
+                buffer[sample][channel] =
+                    static_cast<s32>(static_cast<s64>(buffer[sample][channel]) *
+                                     static_cast<s64>(sample) / static_cast<s64>(AUX_RAMP));
             }
         }
     }

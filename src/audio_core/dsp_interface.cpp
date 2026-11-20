@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <thread>
+#include <utility>
 #include <vector>
 #include "audio_core/dsp_interface.h"
 #include "audio_core/sink.h"
@@ -15,6 +17,7 @@
 #include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/dumping/backend.h"
+#include "core/movie.h"
 
 #if defined(CITRA_ENABLE_TRACE_MARKERS) && defined(ANDROID)
 #include <atomic>
@@ -119,14 +122,28 @@ DspInterface::DspInterface(Core::System& system_) : system(system_) {}
 
 DspInterface::~DspInterface() = default;
 
-void DspInterface::SetSink(AudioCore::SinkType sink_type, std::string_view audio_device) {
+void DspInterface::SetSink(AudioCore::SinkType sink_type_, std::string_view audio_device) {
+    // Settings are applied anew whenever one of them changes, the layout of the screens for one.
+    // Closing the device and opening it again each time cuts the sound for as long as that
+    // takes and leaves the output stage to find its footing again.
+    const bool as_before =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacySinkReload) != 0;
+    if (sink && sink_type == sink_type_ && sink_device == audio_device && !as_before) {
+        return;
+    }
+
+    // The emulation thread asks the sink how it takes its samples each time it queues some
+    std::scoped_lock lock{production_mutex};
+
     // Dispose of the current sink first to avoid contention.
     sink.reset();
 
-    sink = AudioCore::GetSinkDetails(sink_type).create_sink(audio_device);
+    sink = AudioCore::GetSinkDetails(sink_type_).create_sink(audio_device);
     sink->SetCallback(
         [this](s16* buffer, std::size_t num_frames) { OutputCallback(buffer, num_frames); });
     time_stretcher.SetOutputSampleRate(sink->GetNativeSampleRate());
+    sink_type = sink_type_;
+    sink_device = audio_device;
 }
 
 Sink& DspInterface::GetSink() {
@@ -139,19 +156,54 @@ void DspInterface::EnableStretching(bool enable) {
 }
 
 void DspInterface::OutputFrame(StereoFrame16 frame) {
+    std::scoped_lock lock{production_mutex};
+    OutputFrameLocked(std::move(frame));
+}
+
+void DspInterface::OutputFrameLocked(StereoFrame16 frame, bool ahead) {
     std::scoped_lock lock{csnd_mutex};
     MixCsnd(frame);
-    PushSamples(frame);
+    PushSamples(frame, ahead);
 }
 
 void DspInterface::OutputSample(std::array<s16, 2> sample) {
-    std::scoped_lock lock{csnd_mutex};
+    std::scoped_lock lock{production_mutex, csnd_mutex};
     MixCsnd({&sample, 1});
     PushSamples({&sample, 1});
 }
 
+bool DspInterface::QueueFrameAhead() {
+    if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::NoAudioAhead) != 0 ||
+        !ahead_allowed.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    // The emulation thread holds this for as long as it takes to mix one frame, so it is worth
+    // a short wait. Not a long one: this is the audio thread.
+    std::unique_lock lock{production_mutex, std::try_to_lock};
+    for (int tries = 0; !lock.owns_lock() && tries < 200; tries++) {
+        std::this_thread::yield();
+        lock.try_lock();
+    }
+    if (!lock.owns_lock() || !ProduceFrameAhead()) {
+        return false;
+    }
+    // Frames that were to be left out are not, now that some are missing
+    spare_frames.store(0, std::memory_order_relaxed);
+    return true;
+}
+
+bool DspInterface::TakeSpareFrame() {
+    u32 spare = spare_frames.load(std::memory_order_relaxed);
+    while (spare != 0) {
+        if (spare_frames.compare_exchange_weak(spare, spare - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void DspInterface::OutputCsndFrame(const StereoFrame16& frame) {
-    std::scoped_lock lock{csnd_mutex};
+    std::scoped_lock lock{production_mutex, csnd_mutex};
 
     if (dsp_samples_since_csnd_frame == 0) {
         csnd_frames_without_dsp++;
@@ -191,7 +243,7 @@ void DspInterface::MixCsnd(std::span<std::array<s16, 2>> samples) {
     }
 }
 
-void DspInterface::PushSamples(std::span<const std::array<s16, 2>> samples) {
+void DspInterface::PushSamples(std::span<const std::array<s16, 2>> samples, bool ahead) {
     if (!sink) {
         return;
     }
@@ -201,6 +253,10 @@ void DspInterface::PushSamples(std::span<const std::array<s16, 2>> samples) {
     } else {
         fifo.Push(samples.data(), samples.size());
     }
+    if (ahead) {
+        // On the audio thread: the rest is the emulation thread's
+        return;
+    }
 #ifdef CITRA_AUDIO_RECORDER
     if (++pushes_since_poll >= 64) {
         pushes_since_poll = 0;
@@ -209,11 +265,19 @@ void DspInterface::PushSamples(std::span<const std::array<s16, 2>> samples) {
 #endif
 
     auto video_dumper = system.GetVideoDumper();
-    if (video_dumper && video_dumper->IsDumping()) {
+    const bool dumping = video_dumper && video_dumper->IsDumping();
+    if (dumping) {
         for (const auto& sample : samples) {
             video_dumper->AddAudioSample(sample);
         }
     }
+
+    // Frames mixed ahead depend on how the host happens to run. A recording of the game's
+    // sound, and a movie that has to play back the same way each time, do without them.
+    const Core::Movie::PlayMode movie = system.Movie().GetPlayMode();
+    const bool replayed =
+        movie == Core::Movie::PlayMode::Recording || movie == Core::Movie::PlayMode::Playing;
+    ahead_allowed.store(!dumping && !replayed, std::memory_order_relaxed);
 }
 
 std::size_t DspInterface::DrainFifoBacklog(std::size_t num_frames) {
@@ -309,6 +373,7 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
     // Set where the sound is not simply handed over as it comes
     bool paced = false;
     std::size_t silent = 0;
+    std::size_t ahead = 0;
     double rate = 1.0;
     std::size_t margin = 0;
     if (performing_time_stretching) {
@@ -344,10 +409,35 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
             // Played at the speed it is produced at, with a margin for when it comes late.
             // Sound is produced as emulated time passes, or more often than that to keep it
             // in step with real time.
-            const double production_speed = system.GetAudioProductionSpeed();
-            const OutputPacer::Result result = output_pacer.Render(
-                fifo, buffer + 2 * frames_written, num_frames - frames_written, production_speed);
+            // Where frames can be mixed ahead of the emulation and left out, the speed is
+            // held at what the emulation is meant to run at: full speed but for what keeps it
+            // in step with the display. Not while it is told to run at another speed: sound
+            // that kept its own pace then would hold up a game that waits for it to end.
+            const bool steady =
+                ahead_allowed.load(std::memory_order_relaxed) &&
+                Settings::GetFrameLimit() == 100.0 &&
+                (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::NoAudioAhead) == 0;
+            const double production_speed =
+                steady ? system.frame_limiter.GetPacingScale() : system.GetAudioProductionSpeed();
+            constexpr auto queue_frame = [](void* self) {
+                return static_cast<DspInterface*>(self)->QueueFrameAhead();
+            };
+            const OutputPacer::Refill refill{steady ? +queue_frame : nullptr, this};
+            const OutputPacer::Result result =
+                output_pacer.Render(fifo, buffer + 2 * frames_written, num_frames - frames_written,
+                                    production_speed, refill);
             paced = true;
+            ahead = result.ahead_frames;
+            if (result.spare_frames != 0) {
+                // No more than a quarter of a second of them: a count that grew while the
+                // emulation stood still is not to be worked off when it runs again
+                constexpr u32 MOST_SPARE = 50;
+                const u32 frames = static_cast<u32>(result.spare_frames / samples_per_frame);
+                const u32 before = spare_frames.load(std::memory_order_relaxed);
+                spare_frames.store(std::min(before + frames, MOST_SPARE),
+                                   std::memory_order_relaxed);
+                dropped = result.spare_frames;
+            }
             silent = result.silent_frames;
             rate = result.rate;
             margin = result.margin;
@@ -363,6 +453,7 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
         .missing = static_cast<u32>(paced ? silent : num_frames - frames_written),
         .buffered = static_cast<u32>(buffered),
         .dropped = static_cast<u32>(dropped),
+        .ahead = static_cast<u32>(ahead),
         .margin = static_cast<u32>(margin),
         .rate = static_cast<float>(rate),
     });

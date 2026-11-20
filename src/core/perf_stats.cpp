@@ -252,6 +252,13 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
             std::this_thread::sleep_for(30ms);
         }
     }
+    if (const auto stall = Common::TraceMarkers::Stall(); stall.milliseconds != 0) [[unlikely]] {
+        static u32 vblanks_since_stall = 0;
+        if (++vblanks_since_stall >= stall.every) {
+            vblanks_since_stall = 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds{stall.milliseconds});
+        }
+    }
 
     if (frame_advancing_enabled) {
         // Frame advancing is enabled: wait on event instead of doing framelimiting

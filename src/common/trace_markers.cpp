@@ -33,6 +33,22 @@ std::uint32_t ReadExperiments(const char* property = EXPERIMENT_PROPERTY) {
 std::atomic<std::uint32_t> experiments{ReadExperiments()};
 std::atomic<std::uint32_t> experiments2{ReadExperiments(EXPERIMENT2_PROPERTY)};
 
+constexpr const char* STALL_PROPERTY = "debug.azahar.stall";
+
+/// "<milliseconds>/<every>" as one number: the milliseconds in the upper half
+std::uint64_t ReadStall() {
+    char value[PROP_VALUE_MAX]{};
+    if (__system_property_get(STALL_PROPERTY, value) <= 0) {
+        return 0;
+    }
+    char* rest = nullptr;
+    const std::uint64_t milliseconds = std::strtoul(value, &rest, 10);
+    const std::uint64_t every = rest && *rest == '/' ? std::strtoul(rest + 1, nullptr, 10) : 0;
+    return milliseconds == 0 || every == 0 ? 0 : (milliseconds << 32) | (every & 0xFFFFFFFF);
+}
+
+std::atomic<std::uint64_t> stall{0};
+
 constexpr std::array<const char*, static_cast<std::size_t>(Counter::Count)> COUNTER_NAMES{
     "azahar.draws_hw",        "azahar.draws_sw",        "azahar.vertices_sw",
     "azahar.command_lists",   "azahar.shader_compiles", "azahar.shader_jit_compiles",
@@ -110,9 +126,15 @@ std::uint32_t Experiments2() {
     return experiments2.load(std::memory_order_relaxed);
 }
 
+InjectedStall Stall() {
+    const std::uint64_t value = stall.load(std::memory_order_relaxed);
+    return {static_cast<std::uint32_t>(value >> 32), static_cast<std::uint32_t>(value)};
+}
+
 void EndFrame() {
     experiments.store(ReadExperiments(), std::memory_order_relaxed);
     experiments2.store(ReadExperiments(EXPERIMENT2_PROPERTY), std::memory_order_relaxed);
+    stall.store(ReadStall(), std::memory_order_relaxed);
 
     if (!IsEnabled(Level::Frame)) {
         return;

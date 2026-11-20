@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <vector>
 #include <boost/serialization/access.hpp>
 #include "audio_core/audio_types.h"
@@ -116,17 +117,54 @@ public:
     void OutputCsndFrame(const StereoFrame16& frame);
 
 protected:
+    /// Queues sound for the device. The form with Locked in its name is for a caller that
+    /// holds production_mutex; `ahead` says the frame is one mixed ahead of the emulation, on
+    /// the audio thread.
     void OutputFrame(StereoFrame16 frame);
+    void OutputFrameLocked(StereoFrame16 frame, bool ahead = false);
     void OutputSample(std::array<s16, 2> sample);
+
+    /**
+     * Mixes one more frame from what the application has handed over so far and queues it, ahead
+     * of the emulation.
+     *
+     * Sound is mixed as emulated time passes, so an emulation that is held up, by a pipeline
+     * that has to be built or by anything else the host makes it wait for, leaves the device
+     * without sound for as long as that takes. The real DSP is a processor of its own that goes
+     * on playing what it was given while the application is busy, and this is what lets ours
+     * do the same.
+     *
+     * Called on the audio thread with production_mutex held. Returns false when there is
+     * nothing to mix from, or when this has gone on for too long to be a hold-up.
+     */
+    virtual bool ProduceFrameAhead() {
+        return false;
+    }
+
+    /**
+     * Whether the frame that is due should be left out: the device has more sound waiting than
+     * it needs, which happens when the emulation makes up for a hold-up that frames mixed ahead
+     * already covered, or when it makes more sound than time passes. Takes one frame off what
+     * the output stage reported as too much. A source that can mix ahead leaves the frame out
+     * rather than have the output stage play faster or cut. Emulation thread.
+     */
+    bool TakeSpareFrame();
+
+    /// Guards what produces sound: the state frames are mixed from and the writing end of the
+    /// queue to the device. Held by the emulation thread while it mixes or queues, and by the
+    /// audio thread while it mixes a frame ahead of the emulation.
+    std::mutex production_mutex;
 
 private:
     void FlushResidualStretcherAudio();
     void OutputCallback(s16* buffer, std::size_t num_frames);
+    /// For the output stage, when the queue is about to run out. Audio thread.
+    bool QueueFrameAhead();
     /// Returns the number of frames it threw away
     std::size_t DrainFifoBacklog(std::size_t num_frames);
     std::size_t PopResampled(s16* buffer, std::size_t num_frames, double ratio);
     void MixCsnd(std::span<std::array<s16, 2>> samples);
-    void PushSamples(std::span<const std::array<s16, 2>> samples);
+    void PushSamples(std::span<const std::array<s16, 2>> samples, bool ahead = false);
 
     Core::System& system;
 
@@ -147,6 +185,14 @@ private:
     std::vector<s16> resample_input;
     TimeStretcher time_stretcher;
     std::unique_ptr<Sink> sink;
+    /// Whether frames may be mixed ahead of the emulation, as the emulation thread last found
+    std::atomic<bool> ahead_allowed = false;
+    /// Frames the output stage has too many of, for the source to leave out
+    std::atomic<u32> spare_frames = 0;
+    /// What the sink was made for, to tell whether settings that were applied anew ask for
+    /// another one
+    SinkType sink_type{};
+    std::string sink_device;
 
     std::mutex csnd_mutex;
     StereoBuffer16 csnd_pending;

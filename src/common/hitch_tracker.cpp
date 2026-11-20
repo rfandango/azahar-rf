@@ -259,7 +259,7 @@ std::atomic<u32> game_frame_seq{0};
 /// not wait for a lock. Each entry packs four counts of frames and comes with its time.
 constexpr std::size_t AUDIO_RING_SIZE = 4096;
 std::array<std::atomic<u64>, AUDIO_RING_SIZE> audio_reports;
-/// The margin, and the speed in millionths
+/// The margin and the frames mixed ahead, sixteen bits each, and the speed in millionths
 std::array<std::atomic<u64>, AUDIO_RING_SIZE> audio_rates;
 std::array<std::atomic<Nanos>, AUDIO_RING_SIZE> audio_times;
 std::atomic<u32> audio_next{0};
@@ -822,6 +822,9 @@ void SummarizeAudio(std::string& text, Clock::time_point now) {
     std::size_t count = 0;
     u32 gaps = 0;
     bool newer_had_gap = false;
+    u32 late_stretches = 0;
+    bool newer_was_ahead = false;
+    u64 ahead = 0;
     u64 missing = 0;
     u64 dropped = 0;
     u64 wanted = 0;
@@ -851,8 +854,15 @@ void SummarizeAudio(std::string& text, Clock::time_point now) {
         dropped += (report >> 48) & 0xFFFF;
         const u64 rates = audio_rates[index].load(std::memory_order_relaxed);
         if (count == 0) {
-            margin = static_cast<u32>(rates >> 32);
+            margin = static_cast<u32>(rates >> 48);
         }
+        // Like a gap, a stretch of requests for which frames had to be mixed ahead
+        const u32 report_ahead = static_cast<u32>((rates >> 32) & 0xFFFF);
+        ahead += report_ahead;
+        if (report_ahead == 0 && newer_was_ahead) {
+            late_stretches++;
+        }
+        newer_was_ahead = report_ahead != 0;
         slowest = std::min(slowest, static_cast<u32>(rates));
         fastest = std::max(fastest, static_cast<u32>(rates));
         if (count == 0) {
@@ -877,6 +887,9 @@ void SummarizeAudio(std::string& text, Clock::time_point now) {
     if (newer_had_gap) {
         gaps++;
     }
+    if (newer_was_ahead) {
+        late_stretches++;
+    }
     const double period = count > 1 ? ToMs(newest - oldest) / static_cast<double>(count - 1) : 0.0;
     const auto out = std::back_inserter(text);
     fmt::format_to(out, "\naudio: {:.0f}-{:.0f} ms waiting (usually {:.0f})", frames_to_ms(low),
@@ -890,6 +903,10 @@ void SummarizeAudio(std::string& text, Clock::time_point now) {
                    "every {:.1f} ms (longest {:.0f})",
                    gaps, frames_to_ms(missing), frames_to_ms(dropped),
                    frames_to_ms(wanted) / static_cast<double>(count), period, ToMs(longest_gap));
+    if (ahead != 0) {
+        fmt::format_to(out, ", {:.0f} ms mixed ahead of a late emulation {} times",
+                       frames_to_ms(ahead), late_stretches);
+    }
 }
 
 void LogLines(std::string_view text) {
@@ -1111,7 +1128,7 @@ void NoteAudioOutput(const AudioOutput& output) {
     audio_reports[index].store(clamp(output.wanted) | (clamp(output.missing) << 16) |
                                    (clamp(output.buffered) << 32) | (clamp(output.dropped) << 48),
                                std::memory_order_relaxed);
-    audio_rates[index].store((static_cast<u64>(output.margin) << 32) |
+    audio_rates[index].store((clamp(output.margin) << 48) | (clamp(output.ahead) << 32) |
                                  static_cast<u32>(std::clamp(output.rate, 0.0f, 4.0f) * 1e6f),
                              std::memory_order_relaxed);
     audio_times[index].store(ToNanos(Clock::now().time_since_epoch()), std::memory_order_relaxed);

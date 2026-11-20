@@ -17,6 +17,8 @@
 #include "common/settings.h"
 #include "common/trace_markers.h"
 #ifdef CITRA_ENABLE_TRACE_MARKERS
+#include <thread>
+#include <utility>
 #include <sys/system_properties.h>
 #endif
 #include "core/core.h"
@@ -26,6 +28,7 @@
 #include "jni/id_cache.h"
 #include "jni/input_manager.h"
 #include "network/network.h"
+#include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 
 bool EmuWindow_Android::OnSurfaceChanged(ANativeWindow* surface) {
@@ -142,6 +145,55 @@ void PollLoadStateRequest() {
         Core::System::GetInstance().SendSignal(Core::System::Signal::Load, slot);
     }
 }
+
+/// Applies the settings anew when `debug.azahar.reapply` changes, as the app does on another
+/// thread when one of them is changed while a game runs, the layout of the screens for one.
+void PollReapplyRequest() {
+    static int last_request = 0;
+    char value[PROP_VALUE_MAX]{};
+    const int request =
+        __system_property_get("debug.azahar.reapply", value) > 0 ? std::atoi(value) : 0;
+    if (request == last_request) {
+        return;
+    }
+    last_request = request;
+    if (request > 0) {
+        LOG_INFO(Frontend, "Applying the settings anew on request");
+        std::thread([] { Core::System::GetInstance().ApplySettings(); }).detach();
+    }
+}
+
+/// Switches the layout of the screens when `debug.azahar.layout` changes, between the single
+/// screen and what it was, the way the app does it for a layout picked in game: on another
+/// thread, the settings applied anew and the framebuffer layout updated.
+void PollLayoutRequest() {
+    static int last_request = 0;
+    static Settings::LayoutOption other = Settings::LayoutOption::SingleScreen;
+    char value[PROP_VALUE_MAX]{};
+    const int request =
+        __system_property_get("debug.azahar.layout", value) > 0 ? std::atoi(value) : 0;
+    if (request == last_request) {
+        return;
+    }
+    last_request = request;
+    if (request <= 0) {
+        return;
+    }
+    const Settings::LayoutOption current = Settings::values.layout_option.GetValue();
+    if (current == other) {
+        other = Settings::LayoutOption::LargeScreen;
+    }
+    LOG_INFO(Frontend, "Switching the screen layout from {} to {} on request",
+             static_cast<u32>(current), static_cast<u32>(other));
+    Settings::values.layout_option = std::exchange(other, current);
+    std::thread([] {
+        auto& system = Core::System::GetInstance();
+        system.ApplySettings();
+        if (system.IsPoweredOn()) {
+            system.GPU().Renderer().UpdateCurrentFramebufferLayout(false);
+        }
+    }).detach();
+}
 #endif
 
 } // Anonymous namespace
@@ -153,6 +205,8 @@ void EmuWindow_Android::ReportFrameWork() {
     KeepOffSlowCores();
 #ifdef CITRA_ENABLE_TRACE_MARKERS
     PollLoadStateRequest();
+    PollReapplyRequest();
+    PollLayoutRequest();
 #endif
     auto& system = Core::System::GetInstance();
     if (!system.perf_stats) {

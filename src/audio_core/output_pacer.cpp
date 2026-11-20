@@ -83,6 +83,21 @@ constexpr double SPEED_SMOOTHING_SLOW = FramesIn(3000.0);
 constexpr double SPEED_SMOOTHING_FAST = FramesIn(300.0);
 constexpr double CLEARLY_ANOTHER_SPEED = 0.03;
 
+// With frames to be had on request, see Refill: the speed is held
+/// What the queue should hold at its lowest
+constexpr double STEADY_TARGET = FramesIn(14.0);
+/// Change of speed for each frame the lowest level is off that, and the most of it: a third of
+/// a percent, which is not heard, to settle the level and to take up what the two clocks differ
+/// by
+constexpr double STEADY_GAIN = 0.002 / FramesIn(10.0);
+constexpr double STEADY_MOST = 0.003;
+/// Most the speed changes from one request of the device to the next
+constexpr double STEADY_STEP = 0.0002;
+/// With this much over the target at its lowest, the queue holds frames to spare: they are
+/// reported, down to this much over it
+constexpr double STEADY_SPARE_FROM = FramesIn(30.0);
+constexpr double STEADY_SPARE_KEEP = FramesIn(8.0);
+
 /// Frames over which the sound is faded out and in
 constexpr std::size_t FADE_FRAMES = 96;
 
@@ -181,6 +196,20 @@ void OutputPacer::UpdateRate(std::size_t waiting, std::size_t num_frames, double
     const double off = lowest - margin;
     lowest_lately = lowest;
 
+    if (steady) {
+        // Held at the speed the emulation is meant to run at
+        speed = measured;
+        trim = 0.0;
+        const double correction =
+            std::clamp(STEADY_GAIN * (lowest - STEADY_TARGET), -STEADY_MOST, STEADY_MOST);
+        rate_target =
+            std::clamp(measured * (1.0 + correction), rate - STEADY_STEP, rate + STEADY_STEP);
+        CITRA_TRACE_SET_COUNTER("azahar.audio_rate_e5", static_cast<s64>(rate_target * 1e5));
+        CITRA_TRACE_SET_COUNTER("azahar.audio_lowest_us",
+                                static_cast<s64>(lowest * 1e6 / native_sample_rate));
+        return;
+    }
+
     if (std::abs(off) < PLAINLY_TOO_MUCH) {
         trim = std::clamp(trim + TRIM_GAIN * off * static_cast<double>(num_frames), -TRIM_MOST,
                           TRIM_MOST);
@@ -211,6 +240,15 @@ void OutputPacer::UpdateMargin(std::size_t left, std::size_t num_frames) {
     recent_left[recent_next] = left;
     recent_next = (recent_next + 1) % recent_left.size();
 
+    if (steady) {
+        // Nothing to learn: a hold-up costs no sound, so there is no reserve to keep for one
+        margin = STEADY_TARGET;
+        frames_since_raise = 0;
+        frames_since_review = 0;
+        lowest_since_review = std::numeric_limits<std::size_t>::max();
+        return;
+    }
+
     frames_since_raise += num_frames;
     if (state == State::Playing && static_cast<double>(left) < CLOSE_CALL &&
         static_cast<double>(frames_since_raise) >= RAISE_INTERVAL) {
@@ -232,7 +270,13 @@ void OutputPacer::UpdateMargin(std::size_t left, std::size_t num_frames) {
 }
 
 OutputPacer::Result OutputPacer::Render(OutputFifo& fifo, s16* buffer, std::size_t num_frames,
-                                        double production_speed) {
+                                        double production_speed, Refill refill) {
+    if (steady != static_cast<bool>(refill)) {
+        steady = static_cast<bool>(refill);
+        if (steady) {
+            margin = STEADY_TARGET;
+        }
+    }
     std::size_t waiting = fifo.Size() + (input_end - input_next);
     const double restart = std::min(margin, RESTART_MARGIN) + static_cast<double>(num_frames);
 
@@ -286,7 +330,7 @@ OutputPacer::Result OutputPacer::Render(OutputFifo& fifo, s16* buffer, std::size
             }
             std::memset(buffer, 0, num_frames * 2 * sizeof(s16));
             UpdateMargin(waiting, num_frames);
-            return {num_frames, rate, static_cast<std::size_t>(margin), waiting};
+            return {num_frames, rate, static_cast<std::size_t>(margin), waiting, 0, 0};
         }
         // The emulation paused for longer than the margin. A short pause is worth covering the
         // next time; a long one, or the silence before the first sound, is not.
@@ -298,7 +342,7 @@ OutputPacer::Result OutputPacer::Render(OutputFifo& fifo, s16* buffer, std::size
         started = true;
         frames_waiting = 0;
         state = State::Playing;
-        rate = rate_target = std::clamp(speed, RATE_LEAST, RATE_MOST);
+        rate = rate_target = std::clamp(steady ? production_speed : speed, RATE_LEAST, RATE_MOST);
         recent_left.fill(waiting);
     } else if (state == State::Fading && !skip_ahead && static_cast<double>(waiting) >= restart) {
         // More came before the sound was gone
@@ -306,6 +350,20 @@ OutputPacer::Result OutputPacer::Render(OutputFifo& fifo, s16* buffer, std::size
     }
 
     UpdateRate(waiting, num_frames, production_speed);
+
+    // More than enough at its lowest: the emulation caught up after a hold-up that was covered
+    // by frames mixed ahead, or made more sound than time passed. Rather than play it down
+    // faster, or cut it, the source is told to leave as much out of what it makes next. The
+    // levels on record are lowered by as much, so that the same frames are not reported twice.
+    std::size_t spare_frames = 0;
+    if (steady && state == State::Playing && lowest_lately > STEADY_TARGET + STEADY_SPARE_FROM) {
+        const double spare = lowest_lately - (STEADY_TARGET + STEADY_SPARE_KEEP);
+        spare_frames = static_cast<std::size_t>(spare) / samples_per_frame * samples_per_frame;
+        for (std::size_t& left : recent_left) {
+            left -= std::min(left, spare_frames);
+        }
+        lowest_lately -= static_cast<double>(spare_frames);
+    }
 
     // Bring in what this request can take at the most
     const std::size_t pending = input_end - input_next;
@@ -319,6 +377,30 @@ OutputPacer::Result OutputPacer::Render(OutputFifo& fifo, s16* buffer, std::size
     if (wanted > pending) {
         input.resize(std::max(input.size(), 2 * wanted));
         input_end += fifo.Pop(input.data() + 2 * pending, wanted - pending);
+    }
+    // Not enough for this request and a little beyond it, because the emulation is late: the
+    // frames that are missing are asked for, instead of letting the sound fade away. Enough
+    // is left over for this not to be taken for the end of the sound further down.
+    std::size_t ahead_frames = 0;
+    if (refill && state != State::Waiting && !skip_ahead) {
+        constexpr std::size_t KEPT = FADE_FRAMES + TAPS + 1;
+        // No more than would fill what is missing, should the frames not end up in the queue
+        const std::size_t most = wanted + KEPT + samples_per_frame;
+        bool refused = false;
+        while (input_end + fifo.Size() < wanted + KEPT && ahead_frames < most) {
+            if (!refill()) {
+                refused = true;
+                break;
+            }
+            ahead_frames += samples_per_frame;
+        }
+        if (ahead_frames != 0 && input_end < wanted) {
+            input_end += fifo.Pop(input.data() + 2 * input_end, wanted - input_end);
+        }
+        if (!refused && state == State::Fading) {
+            // It was running out, and it no longer is
+            state = State::Playing;
+        }
     }
     const std::size_t left_in_fifo = fifo.Size();
 
@@ -376,7 +458,14 @@ OutputPacer::Result OutputPacer::Render(OutputFifo& fifo, s16* buffer, std::size
     }
 
     UpdateMargin(left_in_fifo + (input_end - input_next), num_frames);
-    return {silent_frames, rate, static_cast<std::size_t>(margin), waiting};
+    return Result{
+        .silent_frames = silent_frames,
+        .rate = rate,
+        .margin = static_cast<std::size_t>(margin),
+        .waiting = waiting,
+        .ahead_frames = ahead_frames,
+        .spare_frames = spare_frames,
+    };
 }
 
 } // namespace AudioCore

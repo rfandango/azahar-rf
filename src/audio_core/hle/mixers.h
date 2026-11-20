@@ -26,6 +26,17 @@ public:
     DspStatus Tick(DspConfiguration& config, const IntermediateMixSamples& read_samples,
                    IntermediateMixSamples& write_samples, const std::array<QuadFrame32, 3>& input);
 
+    /// Mixes a frame the application has not been asked for yet, see Source::TickAhead. An
+    /// auxiliary bus that goes by way of the application is silent for it: the application has
+    /// had nothing to send back.
+    void TickAhead(const std::array<QuadFrame32, 3>& input);
+
+    /// As Tick, without a frame: see Source::TickWithoutFrame.
+    DspStatus TickWithoutFrame(DspConfiguration& config) {
+        ParseConfig(config);
+        return GetCurrentStatus();
+    }
+
     StereoFrame16 GetOutput() const {
         return current_frame;
     }
@@ -61,6 +72,10 @@ private:
 
     MixerState state;
     MixerState backup_state;
+
+    /// Whether an auxiliary bus was silent in the last frame for being mixed ahead of the
+    /// application, see TickAhead. Not part of a save state: it lasts for a hold-up.
+    std::array<bool, 2> aux_silent = {};
 
     /// INTERNAL: Update our internal state based on the current config.
     void ParseConfig(DspConfiguration& config);

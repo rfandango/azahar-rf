@@ -37,6 +37,8 @@ DspHle::DspHle(Core::System& system) : DspHle(system, system.Memory(), system.Co
 template <class Archive>
 void DspHle::serialize(Archive& ar, const unsigned int) {
     ar& boost::serialization::base_object<DspInterface>(*this);
+    // The audio thread mixes from this state too, when the emulation is late
+    std::scoped_lock lock{production_mutex};
     ar&* impl.get();
 }
 SERIALIZE_IMPL(DspHle)
@@ -64,7 +66,23 @@ public:
     void SetInterruptHandler(
         std::function<void(Service::DSP::InterruptType type, DspPipe pipe)> handler);
 
+    /// See DspInterface::ProduceFrameAhead. Audio thread, with the production mutex held.
+    bool MixFrameAhead();
+
 private:
+    /// Frames the audio thread may mix between two ticks of the emulation: half a second of
+    /// them. An emulation that stands still for longer than that is paused, or loading a
+    /// state, and sound that goes on by itself would be out of place.
+    static constexpr u32 MOST_FRAMES_AHEAD = 100;
+    /// The last of them, over which the sound goes down rather than be cut off at the end, and
+    /// how much of it comes back with each frame once the emulation ticks again
+    static constexpr u32 FADING_FRAMES_AHEAD = 30;
+    static constexpr float GAIN_BACK_PER_FRAME = 0.25f;
+
+    /// Takes a frame from the gain the last one ended at to another
+    void ApplyOutputGain(StereoFrame16& frame, float target);
+
+    void SetState(DspState state);
     void Initialize();
     void Sleep();
     void Wakeup();
@@ -79,10 +97,32 @@ private:
     HLE::SharedMemory& WriteRegion();
 
     StereoFrame16 GenerateCurrentFrame();
+    void TickWithoutFrame();
     bool Tick();
     void AudioTickCallback(s64 cycles_late);
 
+    /// Written with the production mutex held: the audio thread reads it
     DspState dsp_state = DspState::Off;
+    /// Frames the audio thread mixed since the emulation's last tick
+    u32 frames_ahead = 0;
+    /// What the last frame was multiplied by at its end: one, but around the limit of frames
+    /// mixed ahead
+    float output_gain = 1.0f;
+    /// Since they were last reported: frames mixed ahead, those of them in which a source
+    /// waited for more, and ticks
+    u32 reported_ahead = 0;
+    u32 reported_waits = 0;
+    u32 reported_went_on = 0;
+    u32 reported_ended = 0;
+    u32 ticks_since_report = 0;
+    /// In the frames mixed ahead since the last report: the most sources that played in one,
+    /// the most of them that had nothing more queued, and the fewest frames one of those had
+    /// left before the frame was mixed
+    u32 reported_playing = 0;
+    u32 reported_unqueued = 0;
+    s32 reported_closest = -1;
+    /// Frames left out since the last report, see DspInterface::TakeSpareFrame
+    u32 reported_left_out = 0;
     std::array<std::vector<u8>, num_dsp_pipe> pipe_data{};
 
     // On hardware, the DSP firmware enters sleep at its next audio frame, only then sending the
@@ -251,17 +291,17 @@ void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
             LOG_INFO(Audio_DSP, "Application has requested initialization of DSP hardware");
             Initialize();
             AudioPipeWriteStructAddresses();
-            dsp_state = DspState::On;
+            SetState(DspState::On);
             break;
         case StateChange::Shutdown:
             LOG_INFO(Audio_DSP, "Application has requested shutdown of DSP hardware");
-            dsp_state = DspState::Off;
+            SetState(DspState::Off);
             break;
         case StateChange::Wakeup:
             LOG_INFO(Audio_DSP, "Application has requested wakeup of DSP hardware");
             Wakeup();
             AudioPipeWriteStructAddresses();
-            dsp_state = DspState::On;
+            SetState(DspState::On);
             break;
         case StateChange::Sleep:
             LOG_INFO(Audio_DSP, "Application has requested sleep of DSP hardware");
@@ -271,7 +311,7 @@ void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
             LOG_ERROR(Audio_DSP,
                       "Application has requested unknown state transition of DSP hardware {}",
                       buffer[0]);
-            dsp_state = DspState::Off;
+            SetState(DspState::Off);
             break;
         }
 
@@ -311,15 +351,23 @@ void DspHle::Impl::SetInterruptHandler(
     interrupt_handler = handler;
 }
 
+void DspHle::Impl::SetState(DspState state) {
+    std::scoped_lock lock{parent.production_mutex};
+    dsp_state = state;
+}
+
 void DspHle::Impl::Initialize() {
     // TODO(PabloMK7): This is NOT the right way to do this,
     // but it is close enough. This makes sure the DSP state
     // is clean and consistent every time the HW is initialized,
     // but what is exactly reset needs to be figured out.
-    dsp_memory->raw_memory.fill(0);
-    mixers.Reset();
-    for (auto& s : sources) {
-        s.Reset();
+    {
+        std::scoped_lock lock{parent.production_mutex};
+        dsp_memory->raw_memory.fill(0);
+        mixers.Reset();
+        for (auto& s : sources) {
+            s.Reset();
+        }
     }
     aac_decoder->Reset();
     ResetPipes();
@@ -329,6 +377,7 @@ void DspHle::Impl::Sleep() {
     // TODO(PabloMK7): This is NOT the right way to do this,
     // but it is close enough. What state is saved on
     // real hardware still not figured out.
+    std::scoped_lock lock{parent.production_mutex};
     backup_dsp_memory.raw_memory = dsp_memory->raw_memory;
     mixers.Sleep();
     for (auto& s : sources) {
@@ -345,18 +394,21 @@ void DspHle::Impl::FinishPendingSleep() {
     sleep_pending = false;
     Sleep();
     AudioPipeWriteStructAddresses();
-    dsp_state = DspState::Sleeping;
+    SetState(DspState::Sleeping);
 }
 
 void DspHle::Impl::Wakeup() {
     // TODO(PabloMK7): This is NOT the right way to do this,
     // but it is close enough. What state is restored on
     // real hardware still not figured out.
-    dsp_memory->raw_memory = backup_dsp_memory.raw_memory;
-    backup_dsp_memory.raw_memory.fill(0);
-    mixers.Wakeup();
-    for (auto& s : sources) {
-        s.Wakeup();
+    {
+        std::scoped_lock lock{parent.production_mutex};
+        dsp_memory->raw_memory = backup_dsp_memory.raw_memory;
+        backup_dsp_memory.raw_memory.fill(0);
+        mixers.Wakeup();
+        for (auto& s : sources) {
+            s.Wakeup();
+        }
     }
     aac_decoder->Reset();
     ResetPipes();
@@ -470,16 +522,139 @@ bool DspHle::Impl::Tick() {
     bool is_on = GetDspState() == DspState::On;
 
     if (is_on) {
+        // The audio thread mixes frames too, when this one is late with them
+        std::scoped_lock lock{parent.production_mutex};
+        frames_ahead = 0;
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+        if (++ticks_since_report >= 1024) {
+            // Every five seconds or so
+            if (reported_left_out != 0) {
+                LOG_INFO(Audio_DSP, "{} frames left out: the device had more than enough",
+                         reported_left_out);
+                reported_left_out = 0;
+            }
+            if (reported_ahead != 0) {
+                LOG_INFO(Audio_DSP,
+                         "{} frames mixed ahead of the emulation, with a source waiting for more "
+                         "in {}; of the sources that waited {} went on with more and {} ended; "
+                         "up to {} sources played, up to {} of them with nothing more queued, the "
+                         "closest to its end {} frames from it",
+                         reported_ahead, reported_waits, reported_went_on, reported_ended,
+                         reported_playing, reported_unqueued, reported_closest);
+            }
+            reported_ahead = 0;
+            reported_waits = 0;
+            reported_went_on = 0;
+            reported_ended = 0;
+            reported_playing = 0;
+            reported_unqueued = 0;
+            reported_closest = -1;
+            ticks_since_report = 0;
+        }
+        for (auto& source : sources) {
+            switch (source.TakeWaitOutcome()) {
+            case HLE::Source::WaitOutcome::WentOn:
+                reported_went_on++;
+                break;
+            case HLE::Source::WaitOutcome::Ended:
+                reported_ended++;
+                break;
+            default:
+                break;
+            }
+        }
+#endif
+
+        if (parent.TakeSpareFrame()) {
+            // The device has more than enough waiting. The application is heard and answered,
+            // and the sound stays where it is for this tick.
+            TickWithoutFrame();
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+            reported_left_out++;
+#endif
+            return is_on;
+        }
+
         StereoFrame16 current_frame = {};
 
         // TODO: Check dsp::DSP semaphore (which indicates emulated application has finished writing
         // to shared memory region)
         current_frame = GenerateCurrentFrame();
 
-        parent.OutputFrame(std::move(current_frame));
+        ApplyOutputGain(current_frame, std::min(1.0f, output_gain + GAIN_BACK_PER_FRAME));
+        parent.OutputFrameLocked(std::move(current_frame));
     }
 
     return is_on;
+}
+
+void DspHle::Impl::ApplyOutputGain(StereoFrame16& frame, float target) {
+    if (output_gain == 1.0f && target == 1.0f) {
+        return;
+    }
+    const float step = (target - output_gain) / static_cast<float>(frame.size());
+    float gain = output_gain;
+    for (auto& sample : frame) {
+        gain += step;
+        sample[0] = static_cast<s16>(static_cast<float>(sample[0]) * gain);
+        sample[1] = static_cast<s16>(static_cast<float>(sample[1]) * gain);
+    }
+    output_gain = target;
+}
+
+void DspHle::Impl::TickWithoutFrame() {
+    HLE::SharedMemory& read = ReadRegion();
+    HLE::SharedMemory& write = WriteRegion();
+
+    for (std::size_t i = 0; i < HLE::num_sources; i++) {
+        write.source_statuses.status[i] = sources[i].TickWithoutFrame(
+            read.source_configurations.config[i], read.adpcm_coefficients.coeff[i]);
+    }
+    write.dsp_status = mixers.TickWithoutFrame(read.dsp_configuration);
+}
+
+bool DspHle::Impl::MixFrameAhead() {
+    if (dsp_state != DspState::On || frames_ahead >= MOST_FRAMES_AHEAD) {
+        return false;
+    }
+    frames_ahead++;
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    u32 playing = 0;
+    u32 unqueued = 0;
+    for (const auto& source : sources) {
+        playing += source.IsEnabled() ? 1 : 0;
+        if (const s32 left = source.FramesLeft(); left >= 0) {
+            unqueued++;
+            reported_closest = reported_closest < 0 ? left : std::min(reported_closest, left);
+        }
+    }
+    reported_playing = std::max(reported_playing, playing);
+    reported_unqueued = std::max(reported_unqueued, unqueued);
+#endif
+
+    // As GenerateCurrentFrame, without the application: its configuration is as the last tick
+    // left it, and what it is told about the sources it reads at the next one
+    std::array<QuadFrame32, 3> intermediate_mixes = {};
+    for (auto& source : sources) {
+        source.TickAhead();
+        for (std::size_t mix = 0; mix < 3; mix++) {
+            source.MixInto(intermediate_mixes[mix], mix);
+        }
+    }
+    mixers.TickAhead(intermediate_mixes);
+
+    reported_ahead++;
+    if (std::ranges::any_of(sources, &HLE::Source::IsWaiting)) {
+        reported_waits++;
+    }
+
+    // Down to nothing over the last frames before this stops
+    const float left = static_cast<float>(MOST_FRAMES_AHEAD - frames_ahead);
+    StereoFrame16 frame = mixers.GetOutput();
+    ApplyOutputGain(frame, std::min(1.0f, left / static_cast<float>(FADING_FRAMES_AHEAD)));
+    parent.OutputFrameLocked(std::move(frame), true);
+    return true;
 }
 
 void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
@@ -507,7 +682,16 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
 
 DspHle::DspHle(Core::System& system, Memory::MemorySystem& memory, Core::Timing& timing)
     : DspInterface(system), impl(std::make_unique<Impl>(*this, memory, timing)) {}
-DspHle::~DspHle() = default;
+
+DspHle::~DspHle() {
+    // The audio thread may be about to mix a frame: the device is only closed further up
+    std::scoped_lock lock{production_mutex};
+    impl.reset();
+}
+
+bool DspHle::ProduceFrameAhead() {
+    return impl && impl->MixFrameAhead();
+}
 
 u16 DspHle::RecvData(u32 register_number) {
     return impl->RecvData(register_number);

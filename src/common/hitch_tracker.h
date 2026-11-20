@@ -154,6 +154,7 @@ struct AudioOutput {
     u32 missing;     ///< Frames of those that were not there to give
     u32 buffered;    ///< Frames that were waiting when it asked
     u32 dropped;     ///< Frames thrown away afterwards to shorten the delay
+    u32 ahead;       ///< Frames mixed ahead of the emulation, which was late with them
     u32 margin;      ///< Frames the output aims to have left at the least, zero if it has no aim
     float rate;      ///< Speed the sound was played at, relative to the nominal one
 };

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <utility>
 #include <vector>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/deque.hpp>
@@ -58,6 +59,58 @@ public:
      */
     SourceStatus::Status Tick(SourceConfiguration::Configuration& config,
                               const s16_le (&adpcm_coeffs)[16]);
+
+    /**
+     * Generates a frame the application has not been asked for yet, from what it has handed
+     * over so far: the emulation is held up and the device would go without sound otherwise.
+     *
+     * The application could not hand over more in the meantime. So a source that would use up
+     * the last of what it has stays where it is and is silent for the frame, rather than be
+     * reported as having run out, and it keeps waiting for a few frames once the emulation
+     * runs again, which is when a stream gets its next block. A sound that was at its end
+     * anyway ends that little later.
+     */
+    void TickAhead();
+
+    /// As Tick, without a frame: the configuration is taken and the status given, and the
+    /// source stays where it is. For a frame that is left out, see
+    /// DspInterface::TakeSpareFrame.
+    SourceStatus::Status TickWithoutFrame(SourceConfiguration::Configuration& config,
+                                          const s16_le (&adpcm_coeffs)[16]) {
+        ParseConfig(config, adpcm_coeffs);
+        return GetCurrentStatus();
+    }
+
+    /// Whether the source waited in the last frame for more from the application
+    bool IsWaiting() const {
+        return state.enabled && waiting;
+    }
+
+    /// Whether the source is playing
+    bool IsEnabled() const {
+        return state.enabled;
+    }
+
+    /// Frames the source can still fill from what it has, when nothing more is queued for it.
+    /// Negative when more is queued, or it is not playing.
+    s32 FramesLeft() const {
+        if (!state.enabled || !state.input_queue.empty()) {
+            return -1;
+        }
+        const float per_frame = state.rate_multiplier * static_cast<float>(samples_per_frame);
+        return static_cast<s32>(static_cast<float>(state.current_buffer.size()) / per_frame);
+    }
+
+    /// What became of a wait
+    enum class WaitOutcome : u8 {
+        None,
+        WentOn, ///< The application gave it more to play
+        Ended,  ///< Nothing came: it played what it had left and ran out
+    };
+    /// The outcome of a wait that ended since this was last asked
+    WaitOutcome TakeWaitOutcome() {
+        return std::exchange(wait_outcome, WaitOutcome::None);
+    }
 
     /**
      * Mix this source's output into dest, using the gains for the `intermediate_mix_id`-th
@@ -200,7 +253,21 @@ private:
     SourceState state;
     SourceState backup_state;
 
+    /// Frames for which the source still waits for more from the application rather than use
+    /// up the last of what it has, see TickAhead. Not part of a save state: it is over within
+    /// a few frames.
+    u32 frames_to_wait = 0;
+    /// Whether the last frame was one it waited in
+    bool waiting = false;
+    WaitOutcome wait_outcome = WaitOutcome::None;
+
     // Internal functions
+
+    /// INTERNAL: Whether generating a frame now would use up all there is to play.
+    bool WouldRunOut() const;
+    /// INTERNAL: Makes the current frame one in which the source waits: silence, reached
+    /// from where the last frame ended.
+    void WaitFrame();
 
     /// INTERNAL: Update our internal state based on the current config.
     void ParseConfig(SourceConfiguration::Configuration& config, const s16_le (&adpcm_coeffs)[16]);
