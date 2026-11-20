@@ -190,6 +190,8 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     std::size_t num_worker_threads;
     Common::ThreadWorker pipeline_workers;
+    /// Build the pipelines that a draw waits for, so that those never queue behind the rest
+    Common::ThreadWorker urgent_pipeline_workers;
     Common::ThreadWorker shader_workers;
     /// Builds in one piece, at its leisure, the pipelines that were put together from parts
     Common::ThreadWorker pipeline_optimizer;

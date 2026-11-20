@@ -365,7 +365,8 @@ public:
     explicit GraphicsPipeline(const Instance& instance, RenderManager& renderpass_cache,
                               const PipelineInfo& info, vk::PipelineCache pipeline_cache,
                               vk::PipelineLayout layout, std::array<Shader*, 3> stages,
-                              Common::ThreadWorker* worker, PipelineParts* parts = nullptr);
+                              Common::ThreadWorker* worker, PipelineParts* parts = nullptr,
+                              Common::ThreadWorker* urgent_worker = nullptr);
     ~GraphicsPipeline();
 
     /// `for_draw` is false when the pipeline is built ahead of any draw, from the disk cache
@@ -388,6 +389,9 @@ private:
     const Instance& instance;
     RenderManager& renderpass_cache;
     Common::ThreadWorker* worker;
+    /// Builds what a draw waits for, apart from the workers that have the pipelines of
+    /// draws that can go without on their lists
+    Common::ThreadWorker* urgent_worker;
     PipelineParts* parts;
 
     vk::UniquePipeline pipeline;

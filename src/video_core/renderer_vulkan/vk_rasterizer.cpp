@@ -564,9 +564,23 @@ bool RasterizerVulkan::SmallDrawMustShow(bool is_indexed) {
     // after it builds on; less is a sprite, a glyph or a particle
     constexpr float PASS_SHARE = 0.25f;
     const float share = pica.SmallDrawViewportShare(is_indexed);
-    LOG_SHADER_TIMING("Small draw {} its pipeline: {:.0f}% of the viewport",
-                      share >= PASS_SHARE ? "waits for" : "left out without", share * 100.f);
-    return share >= PASS_SHARE;
+    if (share >= PASS_SHARE) {
+        // Unless all it does is lay something over what is there: blended with the picture
+        // below and leaving depth and stencil as they are, a fade, a tint or a glow comes a
+        // frame late as unnoticed as a sprite does. What replaces the picture cannot.
+        const auto& blending = pipeline_info.state.blending;
+        const bool overlay =
+            blending.blend_enable != 0 &&
+            blending.dst_color_blend_factor != Pica::FramebufferRegs::BlendFactor::Zero &&
+            !pipeline_info.IsDepthWriteEnabled();
+        LOG_SHADER_TIMING("Small draw {} its pipeline: {:.0f}% of the viewport{}",
+                          overlay ? "left out without" : "waits for", share * 100.f,
+                          overlay ? ", laid over what is there" : "");
+        return !overlay;
+    }
+    LOG_SHADER_TIMING("Small draw left out without its pipeline: {:.0f}% of the viewport",
+                      share * 100.f);
+    return false;
 }
 
 void RasterizerVulkan::SetupIndexArray() {

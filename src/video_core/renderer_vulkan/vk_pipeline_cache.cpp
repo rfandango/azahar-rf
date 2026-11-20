@@ -95,6 +95,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       update_queue{update_queue_},
       num_worker_threads{std::max(std::thread::hardware_concurrency(), 2U) / 2},
       pipeline_workers{num_worker_threads, "Pipeline workers"},
+      urgent_pipeline_workers{2, "Pipeline urgent"},
       shader_workers{num_worker_threads, "Shader workers"},
       pipeline_optimizer{1, "Pipeline optimizer"},
       descriptor_heaps{
@@ -163,6 +164,7 @@ void PipelineCache::BuildLayout() {
 
 PipelineCache::~PipelineCache() {
     pipeline_workers.WaitForRequests();
+    urgent_pipeline_workers.WaitForRequests();
     pipeline_optimizer.WaitForRequests();
     shader_workers.WaitForRequests();
     SaveDriverPipelineDiskCache();
@@ -398,6 +400,10 @@ void PipelineCache::SaveDriverPipelineDiskCacheWhenDue() {
 void PipelineCache::LoadDiskCache(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) {
 
+    // Pipelines of the caches that go may still be on the workers' lists
+    pipeline_workers.WaitForRequests();
+    urgent_pipeline_workers.WaitForRequests();
+    pipeline_optimizer.WaitForRequests();
     disk_caches.clear();
     curr_disk_cache =
         disk_caches.emplace_back(std::make_shared<ShaderDiskCache>(*this, GetProgramID()));
@@ -440,6 +446,7 @@ void PipelineCache::SwitchDiskCache(u64 title_id, const std::atomic_bool& stop_l
     // have on their lists: built in one piece after their parts, a pipeline is on the
     // optimizer's for seconds
     pipeline_workers.WaitForRequests();
+    urgent_pipeline_workers.WaitForRequests();
     pipeline_optimizer.WaitForRequests();
 
     bool prev_applet = curr_disk_cache ? is_applet(curr_disk_cache->GetProgramID()) : false;

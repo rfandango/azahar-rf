@@ -78,8 +78,10 @@ Shader::~Shader() {
 GraphicsPipeline::GraphicsPipeline(const Instance& instance_, RenderManager& renderpass_cache_,
                                    const PipelineInfo& info_, vk::PipelineCache pipeline_cache_,
                                    vk::PipelineLayout layout_, std::array<Shader*, 3> stages_,
-                                   Common::ThreadWorker* worker_, PipelineParts* parts_)
-    : instance{instance_}, renderpass_cache{renderpass_cache_}, worker{worker_}, parts{parts_},
+                                   Common::ThreadWorker* worker_, PipelineParts* parts_,
+                                   Common::ThreadWorker* urgent_worker_)
+    : instance{instance_}, renderpass_cache{renderpass_cache_}, worker{worker_},
+      urgent_worker{urgent_worker_ ? urgent_worker_ : worker_}, parts{parts_},
       pipeline_layout{layout_}, pipeline_cache{pipeline_cache_}, info{info_}, stages{stages_} {}
 
 GraphicsPipeline::~GraphicsPipeline() = default;
@@ -131,7 +133,12 @@ bool GraphicsPipeline::TryBuild(bool wait_built, bool for_draw) {
 
     // Fallback to (a)synchronous compilation
     queued = ShaderTiming::Clock::now();
-    worker->QueueWork([this] {
+    // A draw that waits has the render thread stand still until this is built, and when the
+    // scene has just changed the workers have dozens of other pipelines on their lists and
+    // each of them is in the middle of one: such a build goes to workers kept for it, and
+    // starts at once (measured: 5 and 16 ms before a worker was free, with fragment stages
+    // of 14 and 16 ms to build after that)
+    (wait_built ? urgent_worker : worker)->QueueWork([this] {
         if (!build_claimed.test_and_set()) {
             Build();
         }
