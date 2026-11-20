@@ -13,7 +13,7 @@ enum class BooleanSetting(
 ) : AbstractSetting<Boolean> {
     EXPAND_TO_CUTOUT_AREA(SettingKeys.expand_to_cutout_area(), CitraSettings.SECTION_LAYOUT, false),
     SPIRV_SHADER_GEN(SettingKeys.spirv_shader_gen(), CitraSettings.SECTION_RENDERER, true),
-    ASYNC_SHADERS(SettingKeys.async_shader_compilation(), CitraSettings.SECTION_RENDERER, false),
+    ASYNC_SHADERS(SettingKeys.async_shader_compilation(), CitraSettings.SECTION_RENDERER, true),
     DISABLE_SPIRV_OPTIMIZER(
         SettingKeys.disable_spirv_optimizer(),
         CitraSettings.SECTION_RENDERER,
@@ -130,7 +130,7 @@ enum class BooleanSetting(
     DISABLE_RIGHT_EYE_RENDER(
         SettingKeys.disable_right_eye_render(),
         CitraSettings.SECTION_RENDERER,
-        false
+        true
     ),
     USE_ARTIC_BASE_CONTROLLER(
         SettingKeys.use_artic_base_controller(),

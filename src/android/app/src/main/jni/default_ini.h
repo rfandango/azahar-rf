@@ -258,7 +258,7 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 
 # Disables rendering the right eye image
 # Greatly improves performance in some games, but can cause flickering in others.
-# 0 : Enable right eye rendering, 1: Disable right eye rendering
+# 0 : Enable right eye rendering, 1 (default): Disable right eye rendering
 )") DECLARE_KEY(disable_right_eye_render) BOOST_HANA_STRING(R"(
 
 # Perform presentation on separate threads
