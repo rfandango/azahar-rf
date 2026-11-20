@@ -3,6 +3,11 @@
 // Refer to the LICENSE.txt file included.
 
 #include <boost/container/static_vector.hpp>
+#ifdef __ANDROID__
+#include <cerrno>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 #include "common/alignment.h"
 #include "common/hash.h"
@@ -86,6 +91,28 @@ GraphicsPipeline::GraphicsPipeline(const Instance& instance_, RenderManager& ren
 
 GraphicsPipeline::~GraphicsPipeline() = default;
 
+namespace {
+
+/// Puts the calling worker thread ahead of threads of ordinary priority, once. It builds
+/// what a draw is waiting for, while the other build workers, as many as there are fast
+/// cores, are busy with a dozen pipelines the scene just brought: sharing the cores with
+/// them a fragment stage of 4 ms was seen to take 15 to 39.
+void RunAheadOfOtherBuilds() {
+#ifdef __ANDROID__
+    static thread_local bool done = false;
+    if (!done) {
+        done = true;
+        // The level Android gives the threads that draw the display
+        constexpr int AHEAD = -8;
+        if (setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), AHEAD) != 0) {
+            LOG_WARNING(Render_Vulkan, "Could not raise a build worker's priority: {}", errno);
+        }
+    }
+#endif
+}
+
+} // Anonymous namespace
+
 bool GraphicsPipeline::TryBuild(bool wait_built, bool for_draw) {
     if (for_draw) {
         if (first_asked == ShaderTiming::Clock::time_point{}) {
@@ -138,7 +165,11 @@ bool GraphicsPipeline::TryBuild(bool wait_built, bool for_draw) {
     // each of them is in the middle of one: such a build goes to workers kept for it, and
     // starts at once (measured: 5 and 16 ms before a worker was free, with fragment stages
     // of 14 and 16 ms to build after that)
-    (wait_built ? urgent_worker : worker)->QueueWork([this] {
+    const bool waited_for = wait_built && urgent_worker != worker;
+    (wait_built ? urgent_worker : worker)->QueueWork([this, waited_for] {
+        if (waited_for) {
+            RunAheadOfOtherBuilds();
+        }
         if (!build_claimed.test_and_set()) {
             Build();
         }
