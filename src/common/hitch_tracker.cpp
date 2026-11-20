@@ -6,11 +6,14 @@
 #include <array>
 #include <cmath>
 #include <ctime>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <fmt/format.h>
 #include "common/hitch_tracker.h"
@@ -160,9 +163,26 @@ T Median(std::array<T, N>& values, std::size_t count) {
     return *middle;
 }
 
+/// Cores of the emulated system whose load is told apart
+constexpr std::size_t GUEST_CORES = 4;
+/// Ticks of the emulated system's clock in a millisecond of its time
+constexpr double GUEST_TICKS_PER_MS = 268111.856;
+
+using GuestTicks = std::array<u64, GUEST_CORES>;
+
+/// A thread of the game and the emulated time it ran for in a game frame
+struct GuestThread {
+    u32 id;
+    u32 priority;
+    u32 core;
+    u64 ticks;
+};
+
 struct VBlankSample {
     Nanos wall;
     CategoryTimes times;
+    /// Share of the period each emulated core was running a thread, in percent
+    std::array<u8, GUEST_CORES> guest_load;
 };
 
 struct FrameSample {
@@ -263,8 +283,16 @@ struct ThreadState {
 
     Clock::time_point vblank_start;
     Nanos vblank_cpu{};
+    /// Emulated time each core of the emulated system ran threads for, and had none to run,
+    /// in the current VBlank period
+    GuestTicks guest_busy{};
+    GuestTicks guest_idle{};
 
     // The game frame in progress
+    GuestTicks frame_guest_busy{};
+    GuestTicks frame_guest_idle{};
+    std::array<GuestThread, 12> frame_guest_threads;
+    u32 frame_guest_thread_count{};
     CategoryTimes frame_times{};
     Nanos frame_wall{};
     Nanos frame_longest_vblank{};
@@ -343,7 +371,34 @@ const FrameSample* FindFrame(u32 id) {
     return nullptr;
 }
 
+/// Share of its time each emulated core was running a thread, as "97% 12% 0% 40%"
+std::string GuestLoad(const GuestTicks& busy, const GuestTicks& idle) {
+    std::string text;
+    for (std::size_t i = 0; i < GUEST_CORES; i++) {
+        const u64 total = busy[i] + idle[i];
+        fmt::format_to(std::back_inserter(text), "{}{}%", i == 0 ? "" : " ",
+                       total == 0 ? 0 : busy[i] * 100 / total);
+    }
+    return text;
+}
+
+/// The threads of the game that ran for the longest in the frame in progress, in emulated time
+std::string GuestThreads(ThreadState& ts) {
+    const auto threads = std::span{ts.frame_guest_threads}.first(ts.frame_guest_thread_count);
+    std::ranges::sort(threads, std::greater{}, &GuestThread::ticks);
+    std::string text;
+    for (const GuestThread& thread : threads.first(std::min<std::size_t>(threads.size(), 4))) {
+        fmt::format_to(std::back_inserter(text), "{}{} (priority {}, core {}) {:.1f} ms",
+                       text.empty() ? "" : ", ", thread.id, thread.priority, thread.core,
+                       static_cast<double>(thread.ticks) / GUEST_TICKS_PER_MS);
+    }
+    return text;
+}
+
 void ResetFrame(ThreadState& ts) {
+    ts.frame_guest_busy = {};
+    ts.frame_guest_idle = {};
+    ts.frame_guest_thread_count = 0;
     ts.frame_times = {};
     ts.frame_wall = 0;
     ts.frame_longest_vblank = 0;
@@ -370,6 +425,8 @@ void BeginSession(ThreadState& ts, Clock::time_point now, Nanos cpu) {
 
     ts.tracked = true;
     ts.times = {};
+    ts.guest_busy = {};
+    ts.guest_idle = {};
     ts.vblank_start = now;
     ts.vblank_cpu = cpu;
     ts.last_game_frame = game_frame_seq.load(std::memory_order_relaxed);
@@ -468,10 +525,12 @@ std::string FinishFrame(ThreadState& ts, u32 id, Clock::time_point now) {
         if (MayLog(now)) {
             log_line = fmt::format(
                 "Hitch: frame {} took {:.1f} ms over {} vblanks (usual {:.1f} over {}): {} +{:.1f} "
-                "ms | {} | longest vblank {:.1f}, pipeline stall {:.1f}, cores {:#x}",
+                "ms | {} | longest vblank {:.1f}, pipeline stall {:.1f}, cores {:#x} | emulated "
+                "cores busy {} | threads {}",
                 id, ToMs(frame.interval), frame.vblanks, ToMs(usual->interval), usual->vblanks,
                 CAUSE_NAMES[frame.cause], ToMs(cause_time), Breakdown(ts.frame_times),
-                ToMs(ts.frame_longest_vblank), ToMs(ts.frame_pipeline_stall), ts.frame_cores);
+                ToMs(ts.frame_longest_vblank), ToMs(ts.frame_pipeline_stall), ts.frame_cores,
+                GuestLoad(ts.frame_guest_busy, ts.frame_guest_idle), GuestThreads(ts));
         }
     } else if (ts.has_baseline) {
         for (std::size_t i = 0; i < NUM_CATEGORIES; i++) {
@@ -719,6 +778,32 @@ std::string Summarize(Clock::time_point now) {
     fmt::format_to(out, "\nemu {} fps, vblank {:.1f} +-{:.1f} ms (max {:.1f}): {}", game_frames,
                    wall_mean, wall_jitter, ToMs(wall_max),
                    Breakdown(sums, static_cast<double>(vblank_count)));
+
+    // The emulated system: how much of its own time each of its cores was busy for
+    std::array<u32, GUEST_CORES> load_sums{};
+    std::array<u8, GUEST_CORES> load_max{};
+    std::array<u32, GUEST_CORES> load_full{};
+    for (std::size_t i = 0; i < vblank_count; i++) {
+        for (std::size_t core = 0; core < GUEST_CORES; core++) {
+            const u8 load = shared.vblanks[i].guest_load[core];
+            load_sums[core] += load;
+            load_max[core] = std::max(load_max[core], load);
+            load_full[core] += load >= 99 ? 1 : 0;
+        }
+    }
+    text += "\nemulated cores busy:";
+    for (std::size_t core = 0; core < GUEST_CORES; core++) {
+        fmt::format_to(out, " {}%", load_sums[core] / vblank_count);
+    }
+    text += ", at most";
+    for (std::size_t core = 0; core < GUEST_CORES; core++) {
+        fmt::format_to(out, " {}%", load_max[core]);
+    }
+    fmt::format_to(out, ", all of a vblank in");
+    for (std::size_t core = 0; core < GUEST_CORES; core++) {
+        fmt::format_to(out, " {}", load_full[core]);
+    }
+    fmt::format_to(out, " of {}", vblank_count);
     SummarizeAudio(text, now);
     return text;
 }
@@ -878,6 +963,33 @@ void MoveTime(Category from, Category to, std::chrono::nanoseconds time) {
     ts.times[Index(to)] += time.count();
 }
 
+void Detail::NoteGuestSlice(u32 core, bool idle, u32 thread, u32 priority, u64 ticks) {
+    ThreadState& ts = thread_state;
+    if (!ts.tracked || core >= GUEST_CORES) {
+        return;
+    }
+    if (idle) {
+        ts.guest_idle[core] += ticks;
+        return;
+    }
+    ts.guest_busy[core] += ticks;
+    for (u32 i = 0; i < ts.frame_guest_thread_count; i++) {
+        GuestThread& known = ts.frame_guest_threads[i];
+        if (known.id == thread) {
+            known.ticks += ticks;
+            return;
+        }
+    }
+    if (ts.frame_guest_thread_count < ts.frame_guest_threads.size()) {
+        ts.frame_guest_threads[ts.frame_guest_thread_count++] = GuestThread{
+            .id = thread,
+            .priority = priority,
+            .core = core,
+            .ticks = ticks,
+        };
+    }
+}
+
 void NoteGameFrame() {
     game_frame_seq.fetch_add(1, std::memory_order_relaxed);
 }
@@ -907,6 +1019,8 @@ void EndVBlank() {
     ts.vblank_cpu = cpu;
     CategoryTimes times = ts.times;
     ts.times = {};
+    const GuestTicks guest_busy = std::exchange(ts.guest_busy, {});
+    const GuestTicks guest_idle = std::exchange(ts.guest_idle, {});
     const Nanos pipeline_stall = foreign_stall.exchange(0, std::memory_order_relaxed);
     const u32 game_frame = game_frame_seq.load(std::memory_order_relaxed);
 
@@ -934,6 +1048,13 @@ void EndVBlank() {
     for (std::size_t i = 0; i < NUM_CATEGORIES; i++) {
         ts.frame_times[i] += times[i];
     }
+    std::array<u8, GUEST_CORES> guest_load{};
+    for (std::size_t i = 0; i < GUEST_CORES; i++) {
+        const u64 total = guest_busy[i] + guest_idle[i];
+        guest_load[i] = total == 0 ? 0 : static_cast<u8>(guest_busy[i] * 100 / total);
+        ts.frame_guest_busy[i] += guest_busy[i];
+        ts.frame_guest_idle[i] += guest_idle[i];
+    }
     ts.frame_wall += wall;
     ts.frame_longest_vblank = std::max(ts.frame_longest_vblank, wall);
     ts.frame_pipeline_stall += pipeline_stall;
@@ -948,7 +1069,7 @@ void EndVBlank() {
     std::string summary;
     {
         std::scoped_lock lock{shared.mutex};
-        shared.vblanks.Push(VBlankSample{.wall = wall, .times = times});
+        shared.vblanks.Push(VBlankSample{.wall = wall, .times = times, .guest_load = guest_load});
         if (game_frame != ts.last_game_frame) {
             ts.last_game_frame = game_frame;
             hitch_line = FinishFrame(ts, game_frame, now);

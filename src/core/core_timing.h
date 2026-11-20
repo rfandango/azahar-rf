@@ -235,6 +235,8 @@ public:
         // Stores a scaling for the internal clockspeed. Changing this number results in
         // under/overclocking the guest cpu
         double cpu_clock_scale = 1.0;
+        // Part of a tick that instructions have taken and that is not yet counted
+        double tick_remainder = 0.0;
 
         template <class Archive>
         void serialize(Archive& ar, const unsigned int) {
@@ -281,6 +283,13 @@ public:
      */
     void UpdateClockSpeed(u32 cpu_clock_percentage);
 
+    /**
+     * Sets how many times the clock of the Old 3DS's processor the emulated one runs at: 3 for
+     * a title that runs at the New 3DS's 804 MHz. The system's own clock, which timers and
+     * svcGetSystemTick go by, ticks on as before: the instructions take less of it.
+     */
+    void SetProcessorClockMultiplier(u32 multiplier);
+
     std::chrono::microseconds GetGlobalTimeUs() const;
 
     std::shared_ptr<Timer> GetTimer(std::size_t cpu_id);
@@ -300,6 +309,11 @@ private:
 
     std::vector<std::shared_ptr<Timer>> timers;
     Timer* current_timer = nullptr;
+
+    // What the scaling of the timers is made of. Neither is part of a save state: the first is
+    // a setting and the second follows from the state of the kernel.
+    u32 clock_percentage = 100;
+    u32 processor_clock_multiplier = 1;
 
     // When true, the event queue can't be modified. Used while deserializing to workaround
     // destructor side effects.

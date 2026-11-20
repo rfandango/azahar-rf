@@ -94,6 +94,20 @@ private:
 /// Moves time of the current VBlank period from one category to another. Emulation thread only.
 void MoveTime(Category from, Category to, std::chrono::nanoseconds time);
 
+namespace Detail {
+void NoteGuestSlice(u32 core, bool idle, u32 thread, u32 priority, u64 ticks);
+} // namespace Detail
+
+/// A core of the emulated system spent `ticks` of its clock running the thread of the game
+/// with the given ID and priority, or with no thread to run if `idle`. A game that takes more
+/// VBlanks for a frame with one of its cores busy all the time has run out of emulated CPU time,
+/// which no speed of the host makes up for. Emulation thread only.
+inline void NoteGuestSlice(u32 core, bool idle, u32 thread, u32 priority, u64 ticks) {
+    if (IsEnabled()) [[unlikely]] {
+        Detail::NoteGuestSlice(core, idle, thread, priority, ticks);
+    }
+}
+
 /// The game submitted a frame (top screen buffer swap). Emulation thread only.
 void NoteGameFrame();
 

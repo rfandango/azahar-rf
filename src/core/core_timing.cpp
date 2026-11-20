@@ -44,9 +44,15 @@ s64 Timing::GenerateBaseTicks() {
 }
 
 void Timing::UpdateClockSpeed(u32 cpu_clock_percentage) {
+    clock_percentage = cpu_clock_percentage;
     for (auto& timer : timers) {
-        timer->cpu_clock_scale = 100.0 / cpu_clock_percentage;
+        timer->cpu_clock_scale = 100.0 / (clock_percentage * processor_clock_multiplier);
     }
+}
+
+void Timing::SetProcessorClockMultiplier(u32 multiplier) {
+    processor_clock_multiplier = std::max<u32>(multiplier, 1);
+    UpdateClockSpeed(clock_percentage);
 }
 
 TimingEventType* Timing::RegisterEvent(const std::string& name, TimedCallback callback) {
@@ -176,7 +182,17 @@ u64 Timing::Timer::GetTicks() const {
 }
 
 void Timing::Timer::AddTicks(u64 ticks) {
-    downcount -= static_cast<u64>(ticks * cpu_clock_scale);
+    if (cpu_clock_scale == 1.0) {
+        downcount -= ticks;
+        return;
+    }
+    // What is left of a tick counts with the next ones. Dropped, a loop of a few instructions
+    // would take no time at all at a fast clock, and one that waits for an event would never
+    // see it come.
+    const double scaled = static_cast<double>(ticks) * cpu_clock_scale + tick_remainder;
+    const u64 whole = static_cast<u64>(scaled);
+    tick_remainder = scaled - static_cast<double>(whole);
+    downcount -= whole;
 }
 
 u64 Timing::Timer::GetIdleTicks() const {

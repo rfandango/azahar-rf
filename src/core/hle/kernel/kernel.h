@@ -370,9 +370,7 @@ public:
         return memory_mode;
     }
 
-    void SetRunning804MHz(bool enable) {
-        running_804MHz = enable;
-    }
+    void SetRunning804MHz(bool enable);
 
     bool GetRunning804MHz() const {
         return running_804MHz;

@@ -9,6 +9,7 @@
 #include "audio_core/hle/hle.h"
 #include "audio_core/lle/lle.h"
 #include "common/arch.h"
+#include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -269,6 +270,10 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             kernel->SetRunningCPU(running_core);
         }
         Kernel::Thread* thread = kernel->GetCurrentThreadManager().GetCurrentThread();
+        const u64 start_ticks = current_core_to_execute->GetTimer().GetTicks();
+        // The thread may be gone once it has run
+        const u32 thread_id = thread ? thread->GetThreadId() : 0;
+        const u32 thread_priority = thread ? thread->GetPriority() : 0;
         if (thread == nullptr) {
             LOG_TRACE(Core_ARM11, "Core {} idling", current_core_to_execute->GetID());
             current_core_to_execute->GetTimer().Idle();
@@ -276,6 +281,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         } else {
             ExecuteCore(*current_core_to_execute, thread, tight_loop);
         }
+        Common::Hitches::NoteGuestSlice(
+            static_cast<u32>(current_core_to_execute->GetID()), thread == nullptr, thread_id,
+            thread_priority, current_core_to_execute->GetTimer().GetTicks() - start_ticks);
         Reschedule();
     } else {
         // Now all cores are at the same global time. So we will run them one after the other
@@ -300,6 +308,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             // If we don't have a currently active thread then don't execute instructions,
             // instead advance to the next event and try to yield to the next thread
             Kernel::Thread* thread = kernel->GetCurrentThreadManager().GetCurrentThread();
+            // The thread may be gone once it has run
+            const u32 thread_id = thread ? thread->GetThreadId() : 0;
+            const u32 thread_priority = thread ? thread->GetPriority() : 0;
             if (thread == nullptr) {
                 LOG_TRACE(Core_ARM11, "Core {} idling", cpu_core->GetID());
                 cpu_core->GetTimer().Idle();
@@ -310,6 +321,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 ExecuteCore(*cpu_core, thread, tight_loop);
             }
             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
+            Common::Hitches::NoteGuestSlice(static_cast<u32>(cpu_core->GetID()), thread == nullptr,
+                                            thread_id, thread_priority, max_slice);
             Reschedule();
         }
     }

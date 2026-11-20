@@ -6,8 +6,11 @@
 #include <boost/serialization/unordered_map.hpp>
 #include <boost/serialization/vector.hpp>
 #include "common/archives.h"
+#include "common/logging/log.h"
 #include "common/serialization/atomic.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/client_port.h"
 #include "core/hle/kernel/config_mem.h"
 #include "core/hle/kernel/handle_table.h"
@@ -179,6 +182,21 @@ void KernelSystem::ResetThreadIDs() {
     next_thread_id = 0;
 }
 
+void KernelSystem::SetRunning804MHz(bool enable) {
+    running_804MHz = enable;
+
+    // The processor then runs at three times the clock of the Old 3DS's, with the clock of the
+    // system left as it is. A title made for that speed does not get its frames done in time
+    // with a third of it.
+    constexpr u32 NEW_3DS_MULTIPLIER = 3;
+    const bool as_before =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyProcessorClock) != 0;
+    const u32 multiplier = enable && !as_before ? NEW_3DS_MULTIPLIER : 1;
+    LOG_INFO(Kernel, "Processor clock: {} MHz{}", 268 * multiplier,
+             enable && as_before ? " (804 MHz asked for)" : "");
+    timing.SetProcessorClockMultiplier(multiplier);
+}
+
 void KernelSystem::UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
                                            New3dsHwCapabilities n3ds_hw_cap) {
     if (Settings::values.is_new_3ds) {
@@ -257,6 +275,8 @@ void KernelSystem::serialize(Archive& ar, const unsigned int) {
             SetCurrentProcess(stored_processes[current_cpu->GetID()]);
         }
         timing.SetCurrentTimer(current_cpu->GetID());
+        // The clock of the processor is no part of the timing's own state
+        SetRunning804MHz(running_804MHz);
     }
 }
 SERIALIZE_IMPL(KernelSystem)

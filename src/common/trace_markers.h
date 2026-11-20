@@ -100,6 +100,9 @@ enum Experiment2 : std::uint32_t {
     /// Work nobody sees: copies, transfers and fills that come up more than once are told
     /// apart by counting from where the frame began, as before
     LegacyWorkNaming = 2,
+    /// A title that asks for the New 3DS's 804 MHz processor clock gets as much emulated CPU
+    /// time as one for the Old 3DS, as before. Read when the title starts.
+    LegacyProcessorClock = 4,
 };
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS
