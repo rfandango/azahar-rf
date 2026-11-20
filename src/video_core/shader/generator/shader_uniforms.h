@@ -62,9 +62,12 @@ struct FSUniformData {
     alignas(16) Common::Vec3f tex_lod_bias;
     alignas(16) Common::Vec4f tex_border_color[3];
     alignas(16) Common::Vec4f blend_color;
+    /// Width and height of the host texture of each unit in x and y, for the level of detail.
+    /// Vulkan with generated SPIR-V only; the GLSL shaders ask the texture and do not declare it.
+    alignas(16) Common::Vec4f tex_size[3];
 };
 
-static_assert(sizeof(FSUniformData) == 0x530,
+static_assert(sizeof(FSUniformData) == 0x560,
               "The size of the UniformData does not match the structure in the shader");
 static_assert(sizeof(FSUniformData) < 16384,
               "UniformData structure must be less than 16kb as per the OpenGL spec");

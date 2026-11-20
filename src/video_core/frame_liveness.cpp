@@ -31,6 +31,8 @@ constexpr u32 FORGET_AFTER = 600;
 /// Times the last frames are gone through until what is needed no longer changes
 constexpr int MAX_ROUNDS = 8;
 constexpr std::size_t MAX_SHOWN_PLACES = 16;
+/// Times the same copy, transfer or fill is told apart between two images put up for display
+constexpr u32 MAX_OCCURRENCES = 255;
 
 /// The one tracker there is, for the reads that reach it from the surface cache
 FrameLiveness* instance = nullptr;
@@ -157,6 +159,8 @@ void FrameLiveness::Forget() {
     previous.clear();
     too_many_steps = false;
     anchor = 0;
+    stretch = 0;
+    stretch_began_in_frame = false;
     occurrences.clear();
     verdicts.clear();
     written.Clear();
@@ -184,13 +188,27 @@ void FrameLiveness::AddRead(Step& step, const MemoryRange& range) const {
 }
 
 u64 FrameLiveness::NextOccurrence(u64 base) {
+    const auto name = [this, base](u32 count) {
+        return counts_from_display ? Mix(Mix(base, count), stretch) : Mix(base, count);
+    };
     for (auto& [key, count] : occurrences) {
         if (key == base) {
-            return Mix(base, ++count);
+            // Past this many they are no longer told apart, and count as needed if one of them is
+            count = std::min(count + 1, MAX_OCCURRENCES);
+            return name(count);
         }
     }
     occurrences.emplace_back(base, 0);
-    return Mix(base, 0);
+    return name(0);
+}
+
+void FrameLiveness::BeginStretch(u64 base) {
+    if (!counts_from_display) {
+        return;
+    }
+    stretch = base;
+    stretch_began_in_frame = true;
+    occurrences.clear();
 }
 
 bool FrameLiveness::MayReplaceTarget(const Pica::RegsInternal& regs) const {
@@ -201,10 +219,9 @@ bool FrameLiveness::MayReplaceTarget(const Pica::RegsInternal& regs) const {
     const auto& framebuffer = regs.framebuffer.framebuffer;
     const auto& merger = regs.framebuffer.output_merger;
 
-    // Two triangles at the most, facing either way
-    using CullMode = Pica::RasterizerRegs::CullMode;
-    if (regs.pipeline.num_vertices > 6 || regs.rasterizer.cull_mode == CullMode::KeepClockWise ||
-        regs.rasterizer.cull_mode == CullMode::KeepCounterClockWise) {
+    // Two triangles at the most. Whether they face the way that is drawn is looked at with
+    // their vertices, by the caller.
+    if (regs.pipeline.num_vertices > 6) {
         return false;
     }
     // No pixel is kept from being written
@@ -406,7 +423,13 @@ bool FrameLiveness::ShouldAllowTransfer(const Pica::DisplayTransferConfig& confi
     // A copy with gaps leaves alone what is between the lines of an image, which is no part
     // of the image
     step.renews = true;
-    return Submit(step);
+    const bool carried_out = Submit(step);
+    if (step.shown) {
+        // An image, or a part of one, is where it gets displayed from: what follows is counted
+        // from here
+        BeginStretch(base);
+    }
+    return carried_out;
 }
 
 bool FrameLiveness::ShouldAllowFill(const Pica::MemoryFillConfig& config) {
@@ -707,8 +730,20 @@ void FrameLiveness::EndFrame() {
     previous_too_many_steps = too_many_steps;
     too_many_steps = false;
     last_carried_out = false;
-    anchor = 0;
-    occurrences.clear();
+    // Where a frame ends in what a game does is not fixed: a swap is taken up at the VBlank,
+    // and a game that is late for one, or that renders without waiting for them, is somewhere
+    // else in its frame each time. Counting from here would name the same work differently
+    // from one frame to the next (and the left eye as the right one was named the frame
+    // before). Only a game that puts nothing in a place for display is counted from here.
+    const bool counted_from_display = counts_from_display;
+    counts_from_display =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyWorkNaming) == 0;
+    if (!stretch_began_in_frame || counted_from_display != counts_from_display) {
+        anchor = 0;
+        stretch = 0;
+        occurrences.clear();
+    }
+    stretch_began_in_frame = false;
     seen.fill(0);
     left_out.fill(0);
 }

@@ -101,6 +101,11 @@ public:
 
     void ApplyPerProgramSettings(u64 program_ID);
 
+    /// Reports a transfer as done whose completion is being held for the VBlank (see
+    /// MemoryTransfer). The hold is no part of a save state, so this is called before one is
+    /// made: the game in it would wait for good otherwise.
+    void FinishHeldTransfer();
+
 #ifdef ENABLE_FREECAM
     /// Sets the free camera transform, a transform matrix applied to the position
     /// of every vertex.
@@ -130,6 +135,22 @@ private:
 
     std::unique_ptr<RightEyeDisabler> right_eye_disabler;
     std::unique_ptr<FrameLiveness> frame_liveness;
+
+    /// Pacing of a game whose render loop does not wait for the display, see MemoryTransfer.
+    /// Not part of a save state: it settles again within a few frames, and what is held is let
+    /// go before a state is made.
+    struct RenderPace {
+        /// Buffers the game has shown the top screen from lately (left eye)
+        std::array<PAddr, 4> shown{};
+        u32 shown_next{};
+        /// The one of them an image was copied into since the last VBlank, or 0
+        PAddr filled{};
+        /// The one whose copy is being held for the VBlank, or 0
+        PAddr held{};
+        u64 held_delay{};
+        bool reported{};
+    };
+    RenderPace render_pace;
 
 private:
     friend class FrameLiveness;

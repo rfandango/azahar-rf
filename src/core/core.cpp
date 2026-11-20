@@ -1056,6 +1056,10 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     // Flush on save, don't flush on load
     const bool should_flush = !Archive::is_loading::value;
     gpu->ClearAll(should_flush);
+    if (Archive::is_saving::value) {
+        // Before anything that would have to record it is written
+        gpu->FinishHeldTransfer();
+    }
     ar&* timing.get();
     for (u32 i = 0; i < num_cores; i++) {
         ar&* cpu_cores[i].get();

@@ -192,6 +192,12 @@ struct TextureConfig {
         /// A bit for each texture unit whose texture has one level only. Such a texture is
         /// sampled at that level, with no level of detail to work out for every fragment.
         BitField<17, 3, u32> single_level;
+        /// The GPU picks the level of detail of the other textures itself. Set when rendering
+        /// above the console's resolution: derivatives are then taken per host pixel, which
+        /// already puts the level log2(scale) below the console's, so that reproducing the
+        /// console's formula for it by hand buys nothing, and that takes a round of derivative
+        /// operations on the GPU's texture unit for every sample.
+        BitField<20, 1, u32> hardware_lod;
     };
     std::array<TextureBorder, 3> texture_border_color{};
     std::array<TevStageConfigRaw, 6> tev_stages{};
@@ -230,8 +236,9 @@ struct TextureConfig {
                                    FIELD_HASH(texture0_type), FIELD_HASH(texture2_use_coord1),
                                    FIELD_HASH(combiner_buffer_input), FIELD_HASH(fog_mode),
                                    FIELD_HASH(fog_flip), FIELD_HASH(shadow_texture_orthographic),
-                                   FIELD_HASH(single_level), FIELD_HASH(texture_border_color),
-                                   FIELD_HASH(tev_stages), FIELD_HASH(requested_wrap),
+                                   FIELD_HASH(single_level), FIELD_HASH(hardware_lod),
+                                   FIELD_HASH(texture_border_color), FIELD_HASH(tev_stages),
+                                   FIELD_HASH(requested_wrap),
 
                                    // nested layout
                                    TextureBorder::StructHash(), TevStageConfigRaw::StructHash(),
@@ -260,7 +267,7 @@ union Light {
     BitField<13, 1, u16> ambient_zero;
 
     static consteval u64 StructHash() {
-        constexpr u64 STRUCT_VERSION = 2;
+        constexpr u64 STRUCT_VERSION = 3;
 
         using T = Light;
         return Common::HashCombine(STRUCT_VERSION,

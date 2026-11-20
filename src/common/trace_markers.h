@@ -92,11 +92,26 @@ enum Experiment : std::uint32_t {
     LegacyColourlessShader = 2147483648,
 };
 
+/// More of the same, in a property of their own (`debug.azahar.experiment2`) now that the
+/// first has no bits left.
+enum Experiment2 : std::uint32_t {
+    /// A game that renders faster than the display shows is left to, as before
+    LegacyRenderPace = 1,
+    /// Work nobody sees: copies, transfers and fills that come up more than once are told
+    /// apart by counting from where the frame began, as before
+    LegacyWorkNaming = 2,
+};
+
 #ifdef CITRA_ENABLE_TRACE_MARKERS
 /// Currently active Experiment flags.
 std::uint32_t Experiments();
+/// Currently active Experiment2 flags.
+std::uint32_t Experiments2();
 #else
 constexpr std::uint32_t Experiments() {
+    return 0;
+}
+constexpr std::uint32_t Experiments2() {
     return 0;
 }
 #endif

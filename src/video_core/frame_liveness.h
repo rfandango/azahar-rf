@@ -114,7 +114,11 @@ private:
  *
  * Work that was not needed for a while is left out from then on. It is recognized by what it
  * reads and writes and by which copy, transfer or fill came before it, not by its position in
- * the frame, so that a scene with more or fewer objects in it remains the same frame. The
+ * the frame, so that a scene with more or fewer objects in it remains the same frame. Copies,
+ * transfers and fills that come up more than once are told apart by counting them from the
+ * last time an image was put in a place for display, not from where the frame began: a frame
+ * ends at the VBlank that takes up the swap, which is not always at the same point of what
+ * the game does. The
  * memory it would have written counts as stale, and so does what other work makes from it.
  * Should anything stale get on display or to the game, the guess was wrong: everything is
  * rendered again, for longer each time.
@@ -198,8 +202,11 @@ private:
     /// Finishes a step, decides whether it is carried out and notes it
     bool Submit(Step& step);
     void AddRead(Step& step, const MemoryRange& range) const;
-    /// The key of a copy, transfer or fill, which tells apart the times it comes up in a frame
+    /// The key of a copy, transfer or fill, which tells apart the times it comes up since an
+    /// image was last put in a place for display
     u64 NextOccurrence(u64 base);
+    /// A copy or transfer put an image in a place for display: counting starts over
+    void BeginStretch(u64 base);
     void GuestRead(const MemoryRange& range);
     void Mispredicted(const char* reader, const MemoryRange& range);
     void LookAtLastFrames();
@@ -223,9 +230,15 @@ private:
     bool last_carried_out = false;
     std::vector<bool> needed;
 
-    /// The last copy, transfer or fill of this frame, which the draws after it go with
+    /// The last copy, transfer or fill, which the draws after it go with
     u64 anchor = 0;
-    /// How often each copy, transfer and fill came up in this frame already
+    /// The copy or transfer that last put an image in a place for display
+    u64 stretch = 0;
+    bool stretch_began_in_frame = false;
+    /// Whether copies, transfers and fills are counted from there, not from where the frame
+    /// began
+    bool counts_from_display = true;
+    /// How often each copy, transfer and fill came up since then already
     boost::container::small_vector<std::pair<u64, u32>, 32> occurrences;
 
     std::unordered_map<u64, Verdict> verdicts;

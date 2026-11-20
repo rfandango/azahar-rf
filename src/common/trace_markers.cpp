@@ -19,9 +19,11 @@ namespace {
 constexpr const char* LEVEL_PROPERTY = "debug.azahar.trace";
 constexpr const char* EXPERIMENT_PROPERTY = "debug.azahar.experiment";
 
-std::uint32_t ReadExperiments() {
+constexpr const char* EXPERIMENT2_PROPERTY = "debug.azahar.experiment2";
+
+std::uint32_t ReadExperiments(const char* property = EXPERIMENT_PROPERTY) {
     char value[PROP_VALUE_MAX]{};
-    return __system_property_get(EXPERIMENT_PROPERTY, value) > 0
+    return __system_property_get(property, value) > 0
                ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0))
                : 0;
 }
@@ -29,6 +31,7 @@ std::uint32_t ReadExperiments() {
 // Read once when the library is loaded as well, for what is decided before the first VBlank
 // (pipelines built from the disk cache while a game starts).
 std::atomic<std::uint32_t> experiments{ReadExperiments()};
+std::atomic<std::uint32_t> experiments2{ReadExperiments(EXPERIMENT2_PROPERTY)};
 
 constexpr std::array<const char*, static_cast<std::size_t>(Counter::Count)> COUNTER_NAMES{
     "azahar.draws_hw",        "azahar.draws_sw",        "azahar.vertices_sw",
@@ -103,8 +106,13 @@ std::uint32_t Experiments() {
     return experiments.load(std::memory_order_relaxed);
 }
 
+std::uint32_t Experiments2() {
+    return experiments2.load(std::memory_order_relaxed);
+}
+
 void EndFrame() {
     experiments.store(ReadExperiments(), std::memory_order_relaxed);
+    experiments2.store(ReadExperiments(EXPERIMENT2_PROPERTY), std::memory_order_relaxed);
 
     if (!IsEnabled(Level::Frame)) {
         return;

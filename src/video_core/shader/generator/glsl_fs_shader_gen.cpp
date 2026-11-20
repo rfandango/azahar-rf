@@ -822,7 +822,10 @@ void FragmentModule::WriteLighting() {
                 term = diffuse_used ? fmt::format("({} + {}.ambient)", term, light_src)
                                     : fmt::format("{}.ambient", light_src);
             }
-            out += fmt::format("diffuse_sum.rgb += {} * {} * {};\n", term, dist_atten, spot_atten);
+            // The attenuations are scalars: multiplied with each other first, they scale the
+            // colour once
+            out +=
+                fmt::format("diffuse_sum.rgb += {} * ({} * {});\n", term, dist_atten, spot_atten);
         }
 
         // Compute secondary fragment color (specular lighting) function
@@ -830,7 +833,7 @@ void FragmentModule::WriteLighting() {
             const std::string term = spec0_used && spec1_used
                                          ? fmt::format("({} + {})", specular_0, specular_1)
                                          : (spec0_used ? specular_0 : specular_1);
-            out += fmt::format("specular_sum.rgb += {} * clamp_highlights * {} * {}{};\n", term,
+            out += fmt::format("specular_sum.rgb += {} * (clamp_highlights * {} * {}){};\n", term,
                                dist_atten, spot_atten, shadow_secondary);
         }
     }
@@ -1754,6 +1757,8 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
         case TexturingRegs::TextureConfig::Texture2D:
             if (config.texture.single_level & 1u) {
                 out += "return textureLod(tex0, texcoord0, 0.0);";
+            } else if (config.texture.hardware_lod) {
+                out += "return texture(tex0, texcoord0, tex_lod_bias[0]);";
             } else {
                 out += "return textureLod(tex0, texcoord0, getLod(texcoord0 * "
                        "vec2(textureSize(tex0, 0))) + tex_lod_bias[0]);";
@@ -1783,6 +1788,8 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
     case 1:
         if (config.texture.single_level & 2u) {
             out += "return textureLod(tex1, texcoord1, 0.0);";
+        } else if (config.texture.hardware_lod) {
+            out += "return texture(tex1, texcoord1, tex_lod_bias[1]);";
         } else {
             out += "return textureLod(tex1, texcoord1, getLod(texcoord1 * vec2(textureSize(tex1, "
                    "0))) + tex_lod_bias[1]);";
@@ -1792,6 +1799,8 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
         const char* texcoord = config.texture.texture2_use_coord1 ? "texcoord1" : "texcoord2";
         if (config.texture.single_level & 4u) {
             out += fmt::format("return textureLod(tex2, {}, 0.0);", texcoord);
+        } else if (config.texture.hardware_lod) {
+            out += fmt::format("return texture(tex2, {}, tex_lod_bias[2]);", texcoord);
         } else {
             out += fmt::format("return textureLod(tex2, {0}, getLod({0} * "
                                "vec2(textureSize(tex2, 0))) + tex_lod_bias[2]);",

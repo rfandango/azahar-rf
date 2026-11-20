@@ -3,6 +3,7 @@
 // Refer to the LICENSE.txt file included.
 
 #include <cstring>
+#include "common/settings.h"
 #include "common/trace_markers.h"
 #include "video_core/pica_types.h"
 #include "video_core/shader/generator/pica_fs_config.h"
@@ -104,10 +105,14 @@ TextureConfig::TextureConfig(const Pica::TexturingRegs& regs) {
             one_level |= 1u << tex_index;
         }
     }
+    // A resolution factor of 0 follows the window, which is above the console's as a rule
+    bool gpu_picks_level = Settings::values.resolution_factor.GetValue() != 1;
     if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyTextureLod) {
         one_level = 0;
+        gpu_picks_level = false;
     }
     single_level.Assign(one_level);
+    hardware_lod.Assign(gpu_picks_level);
 
     const auto& stages = regs.GetTevStages();
     for (std::size_t i = 0; i < tev_stages.size(); i++) {

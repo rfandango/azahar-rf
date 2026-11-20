@@ -2,7 +2,9 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <algorithm>
 #include <array>
+#include <utility>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/hitch_tracker.h"
@@ -337,6 +339,10 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     } else {
         framebuffer.address_left2 = *phys_address_left;
     }
+    if (screen_id == 0 &&
+        std::ranges::find(render_pace.shown, *phys_address_left) == render_pace.shown.end()) {
+        render_pace.shown[render_pace.shown_next++ % render_pace.shown.size()] = *phys_address_left;
+    }
 
     framebuffer.stride = info.stride;
     framebuffer.format = (framebuffer.format & 0xFFFF0000) | (info.format & 0xFFFF);
@@ -354,7 +360,8 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
         Common::Hitches::NoteGameFrame();
         // Steps once per guest frame (top screen buffer swap).
         CITRA_TRACE_SET_COUNTER("azahar.game_frame", impl->system.perf_stats->GetGameFrameCount());
-        CITRA_FRAME_DUMP("bufferswap top (guest frame end)");
+        CITRA_FRAME_DUMP("bufferswap top (guest frame end) to {:08X}, {} bytes a row, {} rows",
+                         *phys_address_left, info.stride, framebuffer.height.Value());
         right_eye_disabler->ReportEndFrame();
         frame_liveness->EndFrame();
     }
@@ -654,13 +661,74 @@ void GPU::MemoryTransfer() {
 
     // Complete transfer.
     config.trigger.Assign(0);
+
+    // Some games do not wait for the display: they render into one of several buffers as fast
+    // as the GPU finishes their work and show the newest at each VBlank. How fast that is here
+    // comes from a rough model of the console's GPU, made twice as fast as the console, and a
+    // game then finishes more images than there are VBlanks (Luigi's Mansion: Dark Moon, four
+    // for every three). The extra ones are rendered in full by the host and never shown, and
+    // what is shown advances unevenly. A real GPU would not have finished: so the copy that
+    // completes a second image for the top screen within one VBlank period is not reported as
+    // done until the VBlank. The game, which waits for that, renders one image a VBlank.
+    const auto& top_screen = impl->pica.regs.framebuffer_config[0];
+    const u32 buffer_size = top_screen.stride * top_screen.height;
+    // What the copy covers. A game may show a buffer from some rows in (Luigi's Mansion copies
+    // 416 rows and shows 400 of them), so the start of the copy need not be inside what is shown.
+    u32 output_extent = output_size;
+    if (config.is_texture_copy) {
+        const u32 row = config.texture_copy.output_width * 16;
+        const u32 gap = config.texture_copy.output_gap * 16;
+        if (row != 0 && gap != 0 && output_size > row) {
+            output_extent = (output_size / row - 1) * (row + gap) + row;
+        }
+    }
+    PAddr target = 0;
+    for (const PAddr buffer : render_pace.shown) {
+        if (buffer != 0 && output_start < buffer + buffer_size &&
+            buffer < output_start + output_extent) {
+            target = buffer;
+        }
+    }
+    const bool paced =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyRenderPace) == 0;
+    if (paced && target != 0 && render_pace.filled != 0 && render_pace.filled != target &&
+        render_pace.held == 0) {
+        CITRA_FRAME_DUMP("  the game is ahead of the display: this copy completes at the VBlank");
+        if (!render_pace.reported) {
+            render_pace.reported = true;
+            LOG_INFO(HW_GPU, "The game renders faster than the display shows: its images for "
+                             "the top screen are paced to the VBlank");
+        }
+        render_pace.held = target;
+        render_pace.held_delay = delay;
+        return;
+    }
+    if (target != 0) {
+        CITRA_FRAME_DUMP("  an image for the top screen, in the buffer at {:08X}", target);
+        render_pace.filled = target;
+    }
     impl->signal_interrupt(Service::GSP::InterruptId::PPF, delay);
+}
+
+void GPU::FinishHeldTransfer() {
+    if (render_pace.held == 0) {
+        return;
+    }
+    impl->signal_interrupt(Service::GSP::InterruptId::PPF, render_pace.held_delay);
+    render_pace.filled = std::exchange(render_pace.held, 0);
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     // Signal to GSP that GPU interrupt has occurred
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
+
+    // The image whose completion was held for this VBlank is the first of the new period
+    if (render_pace.held != 0) {
+        FinishHeldTransfer();
+    } else {
+        render_pace.filled = 0;
+    }
 
     // Present renderered frame.
     frame_liveness->NoteDisplay();

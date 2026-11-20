@@ -622,6 +622,10 @@ void FragmentModule::WriteLighting() {
             lighting.shadow_secondary && light_config.shadow_enable;
         const Id shadow_rgb{OpVectorShuffle(vec_ids.Get(3), shadow, shadow, 0, 1, 2)};
 
+        // Both attenuations scale every term of the light: they are multiplied with each other
+        // once, as scalars, instead of each with the three components of both sums
+        const Id atten{OpFMul(f32_id, dist_atten, spot_atten)};
+
         // Compute primary fragment color (diffuse lighting) function
         if (primary_used) {
             Id diffuse_sum_rgb{ConstF32(0.f, 0.f, 0.f)};
@@ -640,8 +644,7 @@ void FragmentModule::WriteLighting() {
                                       ? OpFAdd(vec_ids.Get(3), diffuse_sum_rgb, light_ambient)
                                       : light_ambient;
             }
-            diffuse_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), diffuse_sum_rgb, dist_atten);
-            diffuse_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), diffuse_sum_rgb, spot_atten);
+            diffuse_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), diffuse_sum_rgb, atten);
             const Id diffuse_sum_rgba{PadVectorF32(diffuse_sum_rgb, vec_ids.Get(4), 0.f)};
             diffuse_sum = OpFAdd(vec_ids.Get(4), diffuse_sum, diffuse_sum_rgba);
         }
@@ -651,9 +654,8 @@ void FragmentModule::WriteLighting() {
             const Id specular_01{spec0_used && spec1_used
                                      ? OpFAdd(vec_ids.Get(3), specular_0, specular_1)
                                      : (spec0_used ? specular_0 : specular_1)};
-            Id specular_sum_rgb{OpVectorTimesScalar(vec_ids.Get(3), specular_01, clamp_highlights)};
-            specular_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), specular_sum_rgb, dist_atten);
-            specular_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), specular_sum_rgb, spot_atten);
+            Id specular_sum_rgb{OpVectorTimesScalar(vec_ids.Get(3), specular_01,
+                                                    OpFMul(f32_id, clamp_highlights, atten))};
             if (shadow_secondary_enable) {
                 specular_sum_rgb = OpFMul(vec_ids.Get(3), specular_sum_rgb, shadow_rgb);
             }
@@ -1029,9 +1031,19 @@ void FragmentModule::DefineTexSampler(u32 texture_unit) {
             return OpImageSampleExplicitLod(vec_ids.Get(4), sampled_image, texcoord,
                                             spv::ImageOperandsMask::Lod, ConstF32(0.f));
         }
-        const Id tex_image{OpImage(image2d_id, sampled_image)};
-        const Id tex_size{OpImageQuerySizeLod(ivec_ids.Get(2), tex_image, ConstS32(0))};
-        const Id coord{OpFMul(vec_ids.Get(2), texcoord, OpConvertSToF(vec_ids.Get(2), tex_size))};
+        if (config.texture.hardware_lod) {
+            // Above the console's resolution the GPU's own choice of level, with the bias
+            const Id lod_bias{GetShaderDataMember(f32_id, ConstS32(27), ConstU32(texture_unit))};
+            return OpImageSampleImplicitLod(vec_ids.Get(4), sampled_image, texcoord,
+                                            spv::ImageOperandsMask::Bias, lod_bias);
+        }
+        // The size of the texture comes with the uniforms. Asked of the texture here, it is one
+        // more round trip to the GPU's texture unit for every fragment, before the derivatives
+        // below can even start.
+        const Id tex_size_vec{
+            GetShaderDataMember(vec_ids.Get(4), ConstS32(30), ConstU32(texture_unit))};
+        const Id tex_size{OpVectorShuffle(vec_ids.Get(2), tex_size_vec, tex_size_vec, 0, 1)};
+        const Id coord{OpFMul(vec_ids.Get(2), texcoord, tex_size)};
         const Id abs_dfdx_coord{OpFAbs(vec_ids.Get(2), OpDPdx(vec_ids.Get(2), coord))};
         const Id abs_dfdy_coord{OpFAbs(vec_ids.Get(2), OpDPdy(vec_ids.Get(2), coord))};
         const Id d{OpFMax(vec_ids.Get(2), abs_dfdx_coord, abs_dfdy_coord)};
@@ -1597,17 +1609,19 @@ void FragmentModule::DefineUniformStructs() {
     const Id const_color_array_id{TypeArray(vec_ids.Get(4), ConstU32(NUM_TEV_STAGES))};
     const Id border_color_array_id{TypeArray(vec_ids.Get(4), ConstU32(NUM_NON_PROC_TEX_UNITS))};
 
-    const Id shader_data_struct_id{
-        TypeStruct(i32_id, i32_id, f32_id, f32_id, f32_id, f32_id, i32_id, i32_id, i32_id, i32_id,
-                   i32_id, i32_id, i32_id, i32_id, i32_id, i32_id, f32_id, i32_id,
-                   lighting_lut_array_id, vec_ids.Get(3), vec_ids.Get(2), vec_ids.Get(2),
-                   vec_ids.Get(2), vec_ids.Get(3), light_src_array_id, const_color_array_id,
-                   vec_ids.Get(4), vec_ids.Get(3), border_color_array_id, vec_ids.Get(4))};
+    const Id shader_data_struct_id{TypeStruct(
+        i32_id, i32_id, f32_id, f32_id, f32_id, f32_id, i32_id, i32_id, i32_id, i32_id, i32_id,
+        i32_id, i32_id, i32_id, i32_id, i32_id, f32_id, i32_id, lighting_lut_array_id,
+        vec_ids.Get(3), vec_ids.Get(2), vec_ids.Get(2), vec_ids.Get(2), vec_ids.Get(3),
+        light_src_array_id, const_color_array_id, vec_ids.Get(4), vec_ids.Get(3),
+        border_color_array_id, vec_ids.Get(4), border_color_array_id)};
 
     constexpr std::array light_src_offsets{0u, 16u, 32u, 48u, 64u, 80u, 92u, 96u};
-    constexpr std::array shader_data_offsets{
-        0u,  4u,  8u,  12u, 16u,  20u,  24u,  28u,  32u,  36u,  40u,   44u,   48u,   52u,   56u,
-        60u, 64u, 68u, 80u, 176u, 192u, 200u, 208u, 224u, 240u, 1136u, 1232u, 1248u, 1264u, 1312u};
+    // The last member is tex_size, an array of the shape of the border colours
+    constexpr std::array shader_data_offsets{0u,   4u,    8u,    12u,   16u,   20u,   24u,  28u,
+                                             32u,  36u,   40u,   44u,   48u,   52u,   56u,  60u,
+                                             64u,  68u,   80u,   176u,  192u,  200u,  208u, 224u,
+                                             240u, 1136u, 1232u, 1248u, 1264u, 1312u, 1328u};
 
     Decorate(lighting_lut_array_id, spv::Decoration::ArrayStride, 16u);
     Decorate(light_src_array_id, spv::Decoration::ArrayStride, 112u);

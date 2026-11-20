@@ -850,6 +850,15 @@ bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
         // Bind the texture provided by the rasterizer cache
         Surface& surface = res_cache.GetTextureSurface(texture);
         Sampler& sampler = res_cache.GetSampler(texture.config);
+        // The fragment shader works the level of detail out from the size of the host texture,
+        // which it is told instead of asking the texture for it at every fragment
+        const auto extent = surface.RealExtent();
+        const Common::Vec4f tex_size{static_cast<f32>(extent.width),
+                                     static_cast<f32>(extent.height), 0.f, 0.f};
+        if (fs_data.tex_size[texture_index] != tex_size) {
+            fs_data.tex_size[texture_index] = tex_size;
+            fs_data_dirty = true;
+        }
         const vk::ImageView surface_view = surface.FramebufferView();
         vk::ImageView texture_view;
         if (swapped_color_view && surface_view == swapped_color_view) {

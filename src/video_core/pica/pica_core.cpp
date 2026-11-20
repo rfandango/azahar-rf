@@ -1072,10 +1072,9 @@ Overwrites MayOverwriteArea(const RegsInternal& regs) {
     const auto& merger = regs.framebuffer.output_merger;
     const auto& rasterizer = regs.rasterizer;
 
-    // Two triangles at the most, facing either way, and no fragment of them is dropped
+    // Two triangles at the most, and no fragment of them is dropped. Whether they face the way
+    // that is drawn is looked at with their vertices, in CoversViewport.
     if (regs.pipeline.num_vertices > 6 || merger.alpha_test.enable || rasterizer.clip_enable ||
-        rasterizer.cull_mode == RasterizerRegs::CullMode::KeepClockWise ||
-        rasterizer.cull_mode == RasterizerRegs::CullMode::KeepCounterClockWise ||
         merger.fragment_operation_mode != FramebufferRegs::FragmentOperationMode::Default) {
         return {};
     }
@@ -1290,6 +1289,7 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
     // Where each vertex ends up, in pixels from the corner it is at (positive to the outside),
     // and that corner: bit 0 for the right, bit 1 for the top
     std::array<Common::Vec2<f32>, 6> offsets{};
+    std::array<Common::Vec2<f32>, 6> positions{};
     std::array<u32, 6> corners{};
     for (u32 index = 0; index < count; ++index) {
         const u32 vertex = is_indexed
@@ -1324,6 +1324,7 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
             return false;
         }
         offsets[index] = offset;
+        positions[index] = {x, y};
         corners[index] = (x > 0.f ? 1u : 0u) | (y > 0.f ? 2u : 0u);
         at_corners =
             at_corners && offset.x >= -MAX_INSIDE_EXACTLY && offset.y >= -MAX_INSIDE_EXACTLY;
@@ -1351,6 +1352,27 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
             if (corners[a] == corners[b] && offsets[a] != offsets[b]) {
                 return false;
             }
+        }
+    }
+    // A triangle that faces away from what is kept is not drawn at all. Which way it faces is
+    // what the software rasterizer goes by: the sign of its area on the screen, with the
+    // vertices in the order the triangle is put together in (a strip takes those of every
+    // other triangle the other way round).
+    using CullMode = RasterizerRegs::CullMode;
+    const CullMode cull_mode = regs.internal.rasterizer.cull_mode;
+    if (cull_mode == CullMode::KeepClockWise || cull_mode == CullMode::KeepCounterClockWise) {
+        const std::array<u32, 3> second_as_drawn =
+            topology == Topology::Strip ? std::array<u32, 3>{2, 1, 3} : second;
+        const auto area = [&positions](const std::array<u32, 3>& triangle) {
+            const auto ab = positions[triangle[1]] - positions[triangle[0]];
+            const auto ac = positions[triangle[2]] - positions[triangle[0]];
+            return ab.x * ac.y - ab.y * ac.x;
+        };
+        const f32 kept = cull_mode == CullMode::KeepCounterClockWise ? 1.f : -1.f;
+        if (!(area(first) * kept > 0.f && area(second_as_drawn) * kept > 0.f)) {
+            CITRA_FRAME_DUMP("  draw: covers the viewport but faces away, cull mode {}",
+                             static_cast<u32>(cull_mode));
+            return false;
         }
     }
     if (exactly != nullptr) {
