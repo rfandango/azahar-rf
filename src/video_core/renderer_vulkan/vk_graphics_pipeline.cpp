@@ -213,8 +213,20 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
         alpha_op = vk::BlendOp::eAdd;
     }
 
+    // The PICA blends whenever logic operations are off, and games draw opaque geometry with
+    // "source times one plus destination times zero". Passed on as blending it makes the GPU
+    // fetch the destination of every fragment for nothing, and a driver gives up on what it
+    // does for opaque geometry: Turnip stops updating its coarse depth buffer for the rest of
+    // the render pass at the first draw that blends and writes depth, which is the first draw
+    // of every scene. Copying the source is no blending, so it is not asked for.
+    const bool blend_copies_source =
+        color_op == vk::BlendOp::eAdd && alpha_op == vk::BlendOp::eAdd &&
+        src_color_factor == vk::BlendFactor::eOne && dst_color_factor == vk::BlendFactor::eZero &&
+        src_alpha_factor == vk::BlendFactor::eOne && dst_alpha_factor == vk::BlendFactor::eZero &&
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyOpaqueBlend) == 0;
+
     const vk::PipelineColorBlendAttachmentState colorblend_attachment = {
-        .blendEnable = blending.blend_enable,
+        .blendEnable = blending.blend_enable && !blend_copies_source,
         .srcColorBlendFactor = src_color_factor,
         .dstColorBlendFactor = dst_color_factor,
         .colorBlendOp = color_op,

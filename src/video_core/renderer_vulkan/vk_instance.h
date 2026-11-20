@@ -295,7 +295,7 @@ public:
 
     /// Returns true if commands should be flushed at the end of each major renderpass
     bool ShouldFlush() const {
-        return driver_id == vk::DriverIdKHR::eArmProprietary ||
+        return (vk_without & 16) != 0 || driver_id == vk::DriverIdKHR::eArmProprietary ||
                driver_id == vk::DriverIdKHR::eQualcommProprietary;
     }
 
@@ -360,6 +360,8 @@ protected:
     bool fragment_shader_barycentric{};
     bool shader_stencil_export{};
     bool external_memory_host{};
+    /// Profiling builds: the value of debug.azahar.vk_without, see CreateDevice
+    u32 vk_without{};
     u64 min_imported_host_pointer_alignment{};
     bool layered_rendering_supported{true};
     bool tooling_info{};

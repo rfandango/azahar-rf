@@ -3,7 +3,8 @@
 // Refer to the license.txt file included.
 
 // Fills part of an RGBA8 surface from another surface that holds the same guest bytes with a
-// different layout: another width, tiled or linear, or (with DEPTH_SOURCE) depth and stencil.
+// different layout: another width, tiled or linear, another scale along an axis, or (with
+// DEPTH_SOURCE) depth and stencil, or (with RGB8_SOURCE) three bytes to a pixel.
 
 #version 450 core
 #extension GL_EXT_samplerless_texture_functions : require
@@ -20,19 +21,35 @@ layout(set = 0, binding = 2, rgba8) uniform highp writeonly image2D dest;
 layout(push_constant, std140) uniform RelayoutInfo {
     highp ivec2 dst_offset;  // Host texel of the first invocation
     highp ivec2 dst_extent;  // Host texels to go through
-    highp int dst_scale;     // Host texels per guest pixel
-    highp int src_scale;
+    highp int dst_scale;     // Host texels per guest pixel of the destination
+    highp int src_scale_x2;  // Twice the host texels per guest pixel of the source, along x
+    highp int src_scale_y2;  // and along y: a surface may have half its scale along an axis
     highp int dst_width;     // Guest size and layout of the destination
     highp int dst_height;
     highp int dst_tiled;
     highp int src_width;     // Guest size and layout of the source
     highp int src_height;
     highp int src_tiled;
-    highp int pixel_delta;   // Index of a guest pixel in the source minus its index in the
-                             // destination
+    highp int delta;         // Index of a guest pixel in the source minus its index in the
+                             // destination. With RGB8_SOURCE: address of the destination minus
+                             // address of the source, in bytes
     highp int first_pixel;   // Destination pixel indices to fill
     highp int end_pixel;
 };
+
+// Whole-number division of values that are not negative, done in floating point. The pass runs
+// for every host texel of the range, and a mobile GPU takes dozens of instructions over an
+// integer division by a value that is not a constant. Exact for dividends below two million
+// (the half added keeps the quotient clear of a whole number by more than the rounding error);
+// a surface has at most 1024 x 1024 pixels of four bytes, and the byte offsets used below stay
+// within that.
+highp int Div(highp int a, highp int b) {
+    return int((float(a) + 0.5) / float(b));
+}
+
+highp ivec2 Div(highp ivec2 a, highp int b) {
+    return ivec2((vec2(a) + 0.5) / float(b));
+}
 
 // Tiled surfaces are stored as rows of 8x8 tiles from the top of the image down, with the
 // pixels of a tile in Z-order. Linear surfaces are stored row by row from the bottom up.
@@ -52,15 +69,28 @@ highp int PixelIndex(highp ivec2 pos, highp int width, highp int height, highp i
 
 highp ivec2 PixelPosition(highp int index, highp int width, highp int height, highp int tiled) {
     if (tiled == 0) {
-        return ivec2(index % width, index / width);
+        highp int row = Div(index, width);
+        return ivec2(index - row * width, row);
     }
     highp int tile = index >> 6;
     highp int in_tile = index & 63;
     highp int x = (in_tile & 1) | ((in_tile >> 1) & 2) | ((in_tile >> 2) & 4);
     highp int y = ((in_tile >> 1) & 1) | ((in_tile >> 2) & 2) | ((in_tile >> 3) & 4);
     highp int tiles_per_row = width >> 3;
-    highp int row = (tile / tiles_per_row) * 8 + y;
-    return ivec2((tile % tiles_per_row) * 8 + x, height - 1 - row);
+    highp int tile_row = Div(tile, tiles_per_row);
+    highp int row = tile_row * 8 + y;
+    return ivec2((tile - tile_row * tiles_per_row) * 8 + x, height - 1 - row);
+}
+
+// The host texel of the source for a guest pixel of it and a place inside that pixel, given as
+// the place the destination texel has inside its own guest pixel. Host coordinates of a guest
+// pixel round down, as in SurfaceScale.
+highp ivec2 SourceTexel(highp int index, highp ivec2 in_pixel) {
+    highp ivec2 pos = PixelPosition(index, src_width, src_height, src_tiled);
+    highp ivec2 scale2 = ivec2(src_scale_x2, src_scale_y2);
+    highp ivec2 low = (pos * scale2) >> 1;
+    highp ivec2 high = ((pos + 1) * scale2) >> 1;
+    return low + Div(in_pixel * (high - low), dst_scale);
 }
 
 void main() {
@@ -69,19 +99,37 @@ void main() {
         return;
     }
     highp ivec2 dst_coord = dst_offset + local;
-    highp ivec2 dst_pixel = dst_coord / dst_scale;
+    highp ivec2 dst_pixel = Div(dst_coord, dst_scale);
     highp ivec2 in_pixel = dst_coord - dst_pixel * dst_scale;
 
     highp int dst_index = PixelIndex(dst_pixel, dst_width, dst_height, dst_tiled);
     if (dst_index < first_pixel || dst_index >= end_pixel) {
         return;
     }
-    highp int src_index = dst_index + pixel_delta;
+
+#ifdef RGB8_SOURCE
+    // The destination pixel is four bytes of guest memory (alpha, blue, green, red). In the
+    // source they lie in two neighbouring pixels of three bytes (blue, green, red): each byte
+    // is taken from where it is.
+    highp int first_byte = dst_index * 4 + delta;
+    highp int first = first_byte / 3;
+    if (first_byte < 0 || first + 1 >= src_width * src_height) {
+        return;
+    }
+    highp vec3 one = texelFetch(source, SourceTexel(first, in_pixel), 0).bgr;
+    highp vec3 two = texelFetch(source, SourceTexel(first + 1, in_pixel), 0).bgr;
+    // The six bytes of the two pixels in guest order, of which four from the first one's
+    // offset on are the destination's
+    highp int skip = first_byte - first * 3;
+    highp vec4 bytes = skip == 0 ? vec4(one, two.x)
+                                 : (skip == 1 ? vec4(one.yz, two.xy) : vec4(one.z, two));
+    imageStore(dest, dst_coord, bytes.wzyx);
+#else
+    highp int src_index = dst_index + delta;
     if (src_index < 0 || src_index >= src_width * src_height) {
         return;
     }
-    highp ivec2 src_coord = PixelPosition(src_index, src_width, src_height, src_tiled) * src_scale +
-                            in_pixel * src_scale / dst_scale;
+    highp ivec2 src_coord = SourceTexel(src_index, in_pixel);
 
 #ifdef DEPTH_SOURCE
     highp uint depth_val = uint(texelFetch(depth, src_coord, 0).x * (exp2(32.0) - 1.0));
@@ -91,5 +139,6 @@ void main() {
     imageStore(dest, dst_coord, vec4(components) / (exp2(8.0) - 1.0));
 #else
     imageStore(dest, dst_coord, texelFetch(source, src_coord, 0));
+#endif
 #endif
 }

@@ -174,6 +174,13 @@ LightConfig::LightConfig(const Pica::LightingRegs& regs) {
         lights[light_index].dist_atten_enable.Assign(!regs.IsDistAttenDisabled(num));
         lights[light_index].spot_atten_enable.Assign(!regs.IsSpotAttenDisabled(num));
         lights[light_index].shadow_enable.Assign(!regs.IsShadowDisabled(num));
+        const auto is_black = [](const Pica::LightingRegs::LightColor& color) {
+            return color.r == 0 && color.g == 0 && color.b == 0;
+        };
+        lights[light_index].specular_0_zero.Assign(is_black(light.specular_0));
+        lights[light_index].specular_1_zero.Assign(is_black(light.specular_1));
+        lights[light_index].diffuse_zero.Assign(is_black(light.diffuse));
+        lights[light_index].ambient_zero.Assign(is_black(light.ambient));
     }
 
     lut_d0.enable.Assign(regs.config1.disable_lut_d0 == 0);

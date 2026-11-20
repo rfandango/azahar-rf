@@ -675,9 +675,18 @@ void FragmentModule::WriteLighting() {
             out += "clamp_highlights = sign(dot_product);\n";
         }
 
+        // A term whose colour is black adds nothing: it is left out, with what only feeds it
+        const bool spec0_used = !light_config.specular_0_zero;
+        const bool spec1_used = !light_config.specular_1_zero;
+        const bool diffuse_used = !light_config.diffuse_zero;
+        const bool ambient_used = !light_config.ambient_zero;
+        const bool primary_used = diffuse_used || ambient_used;
+        const bool secondary_used = spec0_used || spec1_used;
+        const bool light_used = primary_used || secondary_used;
+
         // If enabled, compute spot light attenuation value
         std::string spot_atten = "1.0";
-        if (light_config.spot_atten_enable &&
+        if (light_used && light_config.spot_atten_enable &&
             LightingRegs::IsLightingSamplerSupported(
                 lighting.config, LightingRegs::LightingSampler::SpotlightAttenuation)) {
             const std::string value =
@@ -688,7 +697,7 @@ void FragmentModule::WriteLighting() {
 
         // If enabled, compute distance attenuation value
         std::string dist_atten = "1.0";
-        if (light_config.dist_atten_enable) {
+        if (light_used && light_config.dist_atten_enable) {
             const std::string index = fmt::format("clamp({}.dist_atten_scale * light_distance "
                                                   "+ {}.dist_atten_bias, 0.0, 1.0)",
                                                   light_src, light_src, light_src);
@@ -696,7 +705,8 @@ void FragmentModule::WriteLighting() {
             dist_atten = fmt::format("LookupLightingLUTUnsigned({}, {})", sampler, index);
         }
 
-        if (light_config.geometric_factor_0 || light_config.geometric_factor_1) {
+        if ((light_config.geometric_factor_0 && spec0_used) ||
+            (light_config.geometric_factor_1 && spec1_used)) {
             out += "geo_factor = dot(half_vector, half_vector);\n"
                    "geo_factor = geo_factor == 0.0 ? 0.0 : min("
                    "dot_product / geo_factor, 1.0);\n";
@@ -704,7 +714,7 @@ void FragmentModule::WriteLighting() {
 
         // Specular 0 component
         std::string d0_lut_value = "1.0";
-        if (lighting.lut_d0.enable &&
+        if (spec0_used && lighting.lut_d0.enable &&
             LightingRegs::IsLightingSamplerSupported(
                 lighting.config, LightingRegs::LightingSampler::Distribution0)) {
             // Lookup specular "distribution 0" LUT value
@@ -719,7 +729,7 @@ void FragmentModule::WriteLighting() {
         }
 
         // If enabled, lookup ReflectRed value, otherwise, 1.0 is used
-        if (lighting.lut_rr.enable &&
+        if (spec1_used && lighting.lut_rr.enable &&
             LightingRegs::IsLightingSamplerSupported(lighting.config,
                                                      LightingRegs::LightingSampler::ReflectRed)) {
             std::string value =
@@ -732,7 +742,7 @@ void FragmentModule::WriteLighting() {
         }
 
         // If enabled, lookup ReflectGreen value, otherwise, ReflectRed value is used
-        if (lighting.lut_rg.enable &&
+        if (spec1_used && lighting.lut_rg.enable &&
             LightingRegs::IsLightingSamplerSupported(lighting.config,
                                                      LightingRegs::LightingSampler::ReflectGreen)) {
             std::string value =
@@ -745,7 +755,7 @@ void FragmentModule::WriteLighting() {
         }
 
         // If enabled, lookup ReflectBlue value, otherwise, ReflectRed value is used
-        if (lighting.lut_rb.enable &&
+        if (spec1_used && lighting.lut_rb.enable &&
             LightingRegs::IsLightingSamplerSupported(lighting.config,
                                                      LightingRegs::LightingSampler::ReflectBlue)) {
             std::string value =
@@ -759,7 +769,7 @@ void FragmentModule::WriteLighting() {
 
         // Specular 1 component
         std::string d1_lut_value = "1.0";
-        if (lighting.lut_d1.enable &&
+        if (spec1_used && lighting.lut_d1.enable &&
             LightingRegs::IsLightingSamplerSupported(
                 lighting.config, LightingRegs::LightingSampler::Distribution1)) {
             // Lookup specular "distribution 1" LUT value
@@ -803,13 +813,26 @@ void FragmentModule::WriteLighting() {
         const auto shadow_secondary = shadow_secondary_enable ? " * shadow.rgb" : "";
 
         // Compute primary fragment color (diffuse lighting) function
-        out += fmt::format(
-            "diffuse_sum.rgb += (({}.diffuse * dot_product{}) + {}.ambient) * {} * {};\n",
-            light_src, shadow_primary, light_src, dist_atten, spot_atten);
+        if (primary_used) {
+            std::string term;
+            if (diffuse_used) {
+                term = fmt::format("({}.diffuse * dot_product{})", light_src, shadow_primary);
+            }
+            if (ambient_used) {
+                term = diffuse_used ? fmt::format("({} + {}.ambient)", term, light_src)
+                                    : fmt::format("{}.ambient", light_src);
+            }
+            out += fmt::format("diffuse_sum.rgb += {} * {} * {};\n", term, dist_atten, spot_atten);
+        }
 
         // Compute secondary fragment color (specular lighting) function
-        out += fmt::format("specular_sum.rgb += ({} + {}) * clamp_highlights * {} * {}{};\n",
-                           specular_0, specular_1, dist_atten, spot_atten, shadow_secondary);
+        if (secondary_used) {
+            const std::string term = spec0_used && spec1_used
+                                         ? fmt::format("({} + {})", specular_0, specular_1)
+                                         : (spec0_used ? specular_0 : specular_1);
+            out += fmt::format("specular_sum.rgb += {} * clamp_highlights * {} * {}{};\n", term,
+                               dist_atten, spot_atten, shadow_secondary);
+        }
     }
 
     // Apply shadow attenuation to alpha components if enabled

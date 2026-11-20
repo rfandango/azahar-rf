@@ -4,6 +4,7 @@
 
 #include "video_core/renderer_vulkan/vk_texture_runtime.h"
 
+#include <algorithm>
 #include <limits>
 #include <span>
 #include <string>
@@ -348,6 +349,24 @@ void TextureRuntime::FreeRetired() {
     std::erase_if(retired, [](const auto& entry) { return !entry.first; });
 }
 
+void TextureRuntime::NoteStorageUse(PAddr addr, u32 width, u32 height) {
+    // A game has a handful of these at a time. What is noted and no longer true costs one
+    // surface its framebuffer compression until it leaves the list.
+    static constexpr std::size_t MAX_STORAGE_USES = 64;
+    const StorageUse use{addr, width, height};
+    if (std::ranges::find(storage_uses, use) != storage_uses.end()) {
+        return;
+    }
+    if (storage_uses.size() == MAX_STORAGE_USES) {
+        storage_uses.erase(storage_uses.begin());
+    }
+    storage_uses.push_back(use);
+}
+
+bool TextureRuntime::HadStorageUse(PAddr addr, u32 width, u32 height) const {
+    return std::ranges::find(storage_uses, StorageUse{addr, width, height}) != storage_uses.end();
+}
+
 bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
                                  const VideoCore::TextureCopy& copy) {
     const PixelFormat src_format = source.pixel_format;
@@ -639,7 +658,7 @@ bool TextureRuntime::CanRelayoutTextures(const Surface& source,
     // The conversion writes the destination as a storage image.
     return dest.pixel_format == PixelFormat::RGBA8 &&
            instance.GetTraits(PixelFormat::RGBA8).storage_support &&
-           (source.pixel_format == PixelFormat::RGBA8 ||
+           (source.pixel_format == PixelFormat::RGBA8 || source.pixel_format == PixelFormat::RGB8 ||
             source.pixel_format == PixelFormat::D24S8) &&
            source.sample_count == 1 && dest.sample_count == 1 && !source.IsCustom() &&
            !dest.IsCustom();
@@ -826,11 +845,13 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
     // created for that gets no framebuffer compression on some GPUs (an Adreno 6xx leaves it
     // off for an image with storage usage, and for one with a view format of another kind),
     // and compression is worth a third of the frame where memory traffic is the limit. So only
-    // a surface known to be a shadow source starts out that way; any other gets such images
-    // when it turns out to need them, see MakeStorageCapable.
+    // a surface known to be a shadow source starts out that way, and one of guest pixels that
+    // needed it before; any other gets such images when it turns out to need them, see
+    // MakeStorageCapable.
     const bool is_mutable =
         traits.native == vk::Format::eR8G8B8A8Unorm &&
         (True(flags & VideoCore::SurfaceFlagBits::ShadowSource) ||
+         runtime.HadStorageUse(addr, width, height) ||
          (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyStorageUsage) != 0);
 
     const vk::Format format = traits.native;
@@ -1421,6 +1442,7 @@ bool Surface::MakeStorageCapable() {
         handle = std::move(fresh);
     }
     image_generation++;
+    runtime.NoteStorageUse(addr, width, height);
     LOG_INFO(Render_Vulkan, "Surface {}x{} @{:08X} was given images a shadow map can use",
              GetScaledWidth(), GetScaledHeight(), addr);
     return true;

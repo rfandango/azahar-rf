@@ -1258,8 +1258,10 @@ bool RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
 
         // Games reuse memory for surfaces of another shape, so the newest contents of this
         // region can sit in surfaces that lay the same bytes out differently. Convert those on
-        // the host GPU.
-        if (ValidateByRelayout(surface_id, params.GetInterval())) {
+        // the host GPU. Not for a caller that can do without the old contents (allow_download
+        // unset, a texture copy with gaps): the conversion goes through the whole range, most
+        // of which that caller is about to write.
+        if (allow_download && ValidateByRelayout(surface_id, params.GetInterval())) {
             notify_validated(params.GetInterval());
             continue;
         }
@@ -1579,11 +1581,12 @@ bool RasterizerCache<T>::ValidateByRelayout(SurfaceId surface_id, const SurfaceI
             continue;
         }
         const Surface& owner = slot_surfaces[owner_id];
+        // A source with pixels of another size is gone through by the byte, wherever it starts
+        const bool same_pixel_size = owner.BytesInPixels(1) == pixel_size;
         if (owner.type == SurfaceType::Fill || owner.levels != 1 || owner.stride != owner.width ||
-            owner.texture_type != TextureType::Texture2D || owner.BytesInPixels(1) != pixel_size ||
-            owner.half_scale_x || owner.half_scale_y || !pixel_aligned(owner.addr) ||
-            !pixel_aligned(part.lower()) || !pixel_aligned(part.upper()) ||
-            !runtime.CanRelayoutTextures(owner, surface)) {
+            owner.texture_type != TextureType::Texture2D ||
+            (same_pixel_size && !pixel_aligned(owner.addr)) || !pixel_aligned(part.lower()) ||
+            !pixel_aligned(part.upper()) || !runtime.CanRelayoutTextures(owner, surface)) {
             return false;
         }
         missing -= part;
@@ -1601,10 +1604,12 @@ bool RasterizerCache<T>::ValidateByRelayout(SurfaceId surface_id, const SurfaceI
                          static_cast<u32>(owner.type), owner.addr,
                          PixelFormatAsString(surface.pixel_format), surface.width, surface.height,
                          static_cast<u32>(surface.type), surface.addr, part.lower(), part.upper());
+        const s32 byte_delta = static_cast<s32>(surface.addr) - static_cast<s32>(owner.addr);
         const TextureRelayout relayout = {
             .dst_rect = surface.GetScaledSubRect(surface.FromInterval(part)),
-            .pixel_delta = (static_cast<s32>(surface.addr) - static_cast<s32>(owner.addr)) /
-                           static_cast<s32>(pixel_size),
+            .pixel_delta = owner.BytesInPixels(1) == pixel_size
+                               ? byte_delta / static_cast<s32>(pixel_size)
+                               : byte_delta,
             .first_pixel = (part.lower() - surface.addr) / pixel_size,
             .end_pixel = (part.upper() - surface.addr) / pixel_size,
         };

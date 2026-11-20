@@ -150,6 +150,16 @@ public:
     /// Destroys the retired images the GPU is done with. Called once a frame.
     void FreeRetired();
 
+    /// Notes that the surface of these guest pixels had to be given storage usage
+    /// (Surface::MakeStorageCapable). Games overwrite such a surface every frame (a shadow map
+    /// is cleared with a memory fill, a depth buffer that is sampled as colour is rendered
+    /// again), which makes the cache drop it and create it anew: a surface of pixels noted
+    /// here is created with storage usage, so that it is not given new images every frame.
+    void NoteStorageUse(PAddr addr, u32 width, u32 height);
+
+    /// Whether a surface of these guest pixels had to be given storage usage before
+    bool HadStorageUse(PAddr addr, u32 width, u32 height) const;
+
     /// Maps an internal staging buffer of the provided size for pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
 
@@ -202,6 +212,14 @@ private:
     u32 num_swapchain_images;
     /// Replaced images and the tick they were last used in, see Retire
     std::vector<std::pair<Handle, u64>> retired;
+    /// Guest surfaces that needed storage usage, oldest first, see NoteStorageUse
+    struct StorageUse {
+        PAddr addr;
+        u32 width;
+        u32 height;
+        bool operator==(const StorageUse&) const = default;
+    };
+    std::vector<StorageUse> storage_uses;
 };
 
 class Surface : public VideoCore::SurfaceBase {

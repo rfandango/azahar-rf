@@ -675,8 +675,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     const auto& alpha_test = regs.framebuffer.output_merger.alpha_test;
     const bool color_unused =
         !write_color_fb && !shadow_rendering &&
-        (alpha_test.enable == 0 ||
-         alpha_test.func == Pica::FramebufferRegs::CompareFunc::Always) &&
+        (alpha_test.enable == 0 || alpha_test.func == Pica::FramebufferRegs::CompareFunc::Always) &&
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyColourlessShader) == 0;
     pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value(), host_scissor,
                                      color_unused);
@@ -691,6 +690,33 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     // Begin rendering
     CITRA_FRAME_DUMP("  vk draw rect {},{} {}x{}", draw_rect.left, draw_rect.bottom,
                      draw_rect.GetWidth(), draw_rect.GetHeight());
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    if (VideoCore::FrameStateDump::IsActive() && !regs.lighting.disable) {
+        // What the lighting tables of this draw hold: the range of their values, and whether
+        // they are flat (one value, no slope), in which case a lookup tells nothing
+        const auto describe = [&](std::string_view name, u32 index) {
+            const auto& lut = pica.lighting.luts[index];
+            f32 low = 1.f, high = 0.f;
+            bool flat = true;
+            for (const auto& entry : lut) {
+                low = std::min(low, entry.ToFloat());
+                high = std::max(high, entry.ToFloat());
+                flat = flat && entry.DiffToFloat() == 0.f;
+            }
+            flat = flat && low == high;
+            return fmt::format(" {}={:.3f}..{:.3f}{}", name, low, high, flat ? " flat" : "");
+        };
+        std::string text = "  luts:";
+        text += describe("D0", 0) + describe("D1", 1) + describe("FR", 3) + describe("RB", 4) +
+                describe("RG", 5) + describe("RR", 6);
+        for (u32 i = 0; i <= regs.lighting.max_light_index; i++) {
+            const u32 num = regs.lighting.light_enable.GetNum(i);
+            text += describe(fmt::format("SP{}", num), 8 + num);
+            text += describe(fmt::format("DA{}", num), 16 + num);
+        }
+        CITRA_FRAME_DUMP("{}", text);
+    }
+#endif
     // The draw is confined to that rectangle. If it overwrites all of it and a render pass
     // begins with it, there is nothing in the rectangle for the pass to load.
     renderpass_cache.BeginRendering(framebuffer, draw_rect, overwrites_color, overwrites_depth);

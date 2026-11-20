@@ -475,20 +475,18 @@ void FragmentModule::WriteLighting() {
             clamp_highlights = OpFSign(f32_id, dot_product);
         }
 
-        // If enabled, compute spot light attenuation value
-        Id spot_atten{ConstF32(1.f)};
-        if (light_config.spot_atten_enable &&
-            LightingRegs::IsLightingSamplerSupported(
-                lighting.config, LightingRegs::LightingSampler::SpotlightAttenuation)) {
-            const Id value{
-                get_lut_value(LightingRegs::SpotlightAttenuationSampler(light_config.num),
-                              light_config.num, lighting.lut_sp.type, lighting.lut_sp.abs_input)};
-            spot_atten = OpFMul(f32_id, ConstF32(lighting.lut_sp.GetScale()), value);
-        }
+        // A term whose colour is black adds nothing: it is left out, with what only feeds it
+        const bool spec0_used = !light_config.specular_0_zero;
+        const bool spec1_used = !light_config.specular_1_zero;
+        const bool diffuse_used = !light_config.diffuse_zero;
+        const bool ambient_used = !light_config.ambient_zero;
+        const bool primary_used = diffuse_used || ambient_used;
+        const bool secondary_used = spec0_used || spec1_used;
+        const bool light_used = primary_used || secondary_used;
 
         // If enabled, compute distance attenuation value
         Id dist_atten{ConstF32(1.f)};
-        if (light_config.dist_atten_enable) {
+        if (light_used && light_config.dist_atten_enable) {
             const Id dist_atten_scale{GetLightMember(7)};
             const Id dist_atten_bias{GetLightMember(6)};
             const Id index{OpFma(f32_id, dist_atten_scale, light_distance, dist_atten_bias)};
@@ -496,88 +494,6 @@ void FragmentModule::WriteLighting() {
             const Id sampler{ConstS32(
                 static_cast<s32>(LightingRegs::DistanceAttenuationSampler(light_config.num)))};
             dist_atten = lookup_lighting_lut_unsigned(sampler, clamped_index);
-        }
-
-        if (light_config.geometric_factor_0 || light_config.geometric_factor_1) {
-            geo_factor = OpDot(f32_id, half_vector, half_vector);
-            const Id dot_div_geo{
-                OpFMin(f32_id, OpFDiv(f32_id, dot_product, geo_factor), ConstF32(1.f))};
-            const Id is_geo_factor_zero{OpFOrdEqual(bool_id, geo_factor, ConstF32(0.f))};
-            geo_factor = OpSelect(f32_id, is_geo_factor_zero, ConstF32(0.f), dot_div_geo);
-        }
-
-        // Specular 0 component
-        Id d0_lut_value{ConstF32(1.f)};
-        if (lighting.lut_d0.enable &&
-            LightingRegs::IsLightingSamplerSupported(
-                lighting.config, LightingRegs::LightingSampler::Distribution0)) {
-            // Lookup specular "distribution 0" LUT value
-            const Id value{get_lut_value(LightingRegs::LightingSampler::Distribution0,
-                                         light_config.num, lighting.lut_d0.type,
-                                         lighting.lut_d0.abs_input)};
-            d0_lut_value = OpFMul(f32_id, ConstF32(lighting.lut_d0.GetScale()), value);
-        }
-
-        Id specular_0{OpVectorTimesScalar(vec_ids.Get(3), GetLightMember(0), d0_lut_value)};
-        if (light_config.geometric_factor_0) {
-            specular_0 = OpVectorTimesScalar(vec_ids.Get(3), specular_0, geo_factor);
-        }
-
-        // If enabled, lookup ReflectRed value, otherwise, 1.0 is used
-        Id refl_value_r{ConstF32(1.f)};
-        if (lighting.lut_rr.enable &&
-            LightingRegs::IsLightingSamplerSupported(lighting.config,
-                                                     LightingRegs::LightingSampler::ReflectRed)) {
-            const Id value{get_lut_value(LightingRegs::LightingSampler::ReflectRed,
-                                         light_config.num, lighting.lut_rr.type,
-                                         lighting.lut_rr.abs_input)};
-
-            refl_value_r = OpFMul(f32_id, ConstF32(lighting.lut_rr.GetScale()), value);
-        }
-
-        // If enabled, lookup ReflectGreen value, otherwise, ReflectRed value is used
-        Id refl_value_g{refl_value_r};
-        if (lighting.lut_rg.enable &&
-            LightingRegs::IsLightingSamplerSupported(lighting.config,
-                                                     LightingRegs::LightingSampler::ReflectGreen)) {
-            const Id value{get_lut_value(LightingRegs::LightingSampler::ReflectGreen,
-                                         light_config.num, lighting.lut_rg.type,
-                                         lighting.lut_rg.abs_input)};
-
-            refl_value_g = OpFMul(f32_id, ConstF32(lighting.lut_rg.GetScale()), value);
-        }
-
-        // If enabled, lookup ReflectBlue value, otherwise, ReflectRed value is used
-        Id refl_value_b{refl_value_r};
-        if (lighting.lut_rb.enable &&
-            LightingRegs::IsLightingSamplerSupported(lighting.config,
-                                                     LightingRegs::LightingSampler::ReflectBlue)) {
-            const Id value{get_lut_value(LightingRegs::LightingSampler::ReflectBlue,
-                                         light_config.num, lighting.lut_rb.type,
-                                         lighting.lut_rb.abs_input)};
-            refl_value_b = OpFMul(f32_id, ConstF32(lighting.lut_rb.GetScale()), value);
-        }
-
-        // Specular 1 component
-        Id d1_lut_value{ConstF32(1.f)};
-        if (lighting.lut_d1.enable &&
-            LightingRegs::IsLightingSamplerSupported(
-                lighting.config, LightingRegs::LightingSampler::Distribution1)) {
-            // Lookup specular "distribution 1" LUT value
-            const Id value{get_lut_value(LightingRegs::LightingSampler::Distribution1,
-                                         light_config.num, lighting.lut_d1.type,
-                                         lighting.lut_d1.abs_input)};
-            d1_lut_value = OpFMul(f32_id, ConstF32(lighting.lut_d1.GetScale()), value);
-        }
-
-        const Id refl_value{
-            OpCompositeConstruct(vec_ids.Get(3), refl_value_r, refl_value_g, refl_value_b)};
-        const Id light_specular_1{GetLightMember(1)};
-        Id specular_1{OpFMul(vec_ids.Get(3),
-                             OpVectorTimesScalar(vec_ids.Get(3), refl_value, d1_lut_value),
-                             light_specular_1)};
-        if (light_config.geometric_factor_1) {
-            specular_1 = OpVectorTimesScalar(vec_ids.Get(3), specular_1, geo_factor);
         }
 
         // Fresnel
@@ -601,39 +517,149 @@ void FragmentModule::WriteLighting() {
             }
         }
 
+        // If enabled, compute spot light attenuation value
+        Id spot_atten{ConstF32(1.f)};
+        if (light_used && light_config.spot_atten_enable &&
+            LightingRegs::IsLightingSamplerSupported(
+                lighting.config, LightingRegs::LightingSampler::SpotlightAttenuation)) {
+            const Id value{
+                get_lut_value(LightingRegs::SpotlightAttenuationSampler(light_config.num),
+                              light_config.num, lighting.lut_sp.type, lighting.lut_sp.abs_input)};
+            spot_atten = OpFMul(f32_id, ConstF32(lighting.lut_sp.GetScale()), value);
+        }
+
+        if ((light_config.geometric_factor_0 && spec0_used) ||
+            (light_config.geometric_factor_1 && spec1_used)) {
+            geo_factor = OpDot(f32_id, half_vector, half_vector);
+            const Id dot_div_geo{
+                OpFMin(f32_id, OpFDiv(f32_id, dot_product, geo_factor), ConstF32(1.f))};
+            const Id is_geo_factor_zero{OpFOrdEqual(bool_id, geo_factor, ConstF32(0.f))};
+            geo_factor = OpSelect(f32_id, is_geo_factor_zero, ConstF32(0.f), dot_div_geo);
+        }
+
+        // Specular 0 component
+        Id specular_0{ConstF32(0.f, 0.f, 0.f)};
+        if (spec0_used) {
+            Id d0_lut_value{ConstF32(1.f)};
+            if (lighting.lut_d0.enable &&
+                LightingRegs::IsLightingSamplerSupported(
+                    lighting.config, LightingRegs::LightingSampler::Distribution0)) {
+                // Lookup specular "distribution 0" LUT value
+                const Id value{get_lut_value(LightingRegs::LightingSampler::Distribution0,
+                                             light_config.num, lighting.lut_d0.type,
+                                             lighting.lut_d0.abs_input)};
+                d0_lut_value = OpFMul(f32_id, ConstF32(lighting.lut_d0.GetScale()), value);
+            }
+
+            specular_0 = OpVectorTimesScalar(vec_ids.Get(3), GetLightMember(0), d0_lut_value);
+            if (light_config.geometric_factor_0) {
+                specular_0 = OpVectorTimesScalar(vec_ids.Get(3), specular_0, geo_factor);
+            }
+        }
+
+        // If enabled, lookup ReflectRed value, otherwise, 1.0 is used
+        Id refl_value_r{ConstF32(1.f)};
+        if (spec1_used && lighting.lut_rr.enable &&
+            LightingRegs::IsLightingSamplerSupported(lighting.config,
+                                                     LightingRegs::LightingSampler::ReflectRed)) {
+            const Id value{get_lut_value(LightingRegs::LightingSampler::ReflectRed,
+                                         light_config.num, lighting.lut_rr.type,
+                                         lighting.lut_rr.abs_input)};
+
+            refl_value_r = OpFMul(f32_id, ConstF32(lighting.lut_rr.GetScale()), value);
+        }
+
+        // If enabled, lookup ReflectGreen value, otherwise, ReflectRed value is used
+        Id refl_value_g{refl_value_r};
+        if (spec1_used && lighting.lut_rg.enable &&
+            LightingRegs::IsLightingSamplerSupported(lighting.config,
+                                                     LightingRegs::LightingSampler::ReflectGreen)) {
+            const Id value{get_lut_value(LightingRegs::LightingSampler::ReflectGreen,
+                                         light_config.num, lighting.lut_rg.type,
+                                         lighting.lut_rg.abs_input)};
+
+            refl_value_g = OpFMul(f32_id, ConstF32(lighting.lut_rg.GetScale()), value);
+        }
+
+        // If enabled, lookup ReflectBlue value, otherwise, ReflectRed value is used
+        Id refl_value_b{refl_value_r};
+        if (spec1_used && lighting.lut_rb.enable &&
+            LightingRegs::IsLightingSamplerSupported(lighting.config,
+                                                     LightingRegs::LightingSampler::ReflectBlue)) {
+            const Id value{get_lut_value(LightingRegs::LightingSampler::ReflectBlue,
+                                         light_config.num, lighting.lut_rb.type,
+                                         lighting.lut_rb.abs_input)};
+            refl_value_b = OpFMul(f32_id, ConstF32(lighting.lut_rb.GetScale()), value);
+        }
+
+        // Specular 1 component
+        Id specular_1{ConstF32(0.f, 0.f, 0.f)};
+        if (spec1_used) {
+            Id d1_lut_value{ConstF32(1.f)};
+            if (lighting.lut_d1.enable &&
+                LightingRegs::IsLightingSamplerSupported(
+                    lighting.config, LightingRegs::LightingSampler::Distribution1)) {
+                // Lookup specular "distribution 1" LUT value
+                const Id value{get_lut_value(LightingRegs::LightingSampler::Distribution1,
+                                             light_config.num, lighting.lut_d1.type,
+                                             lighting.lut_d1.abs_input)};
+                d1_lut_value = OpFMul(f32_id, ConstF32(lighting.lut_d1.GetScale()), value);
+            }
+
+            const Id refl_value{
+                OpCompositeConstruct(vec_ids.Get(3), refl_value_r, refl_value_g, refl_value_b)};
+            const Id light_specular_1{GetLightMember(1)};
+            specular_1 = OpFMul(vec_ids.Get(3),
+                                OpVectorTimesScalar(vec_ids.Get(3), refl_value, d1_lut_value),
+                                light_specular_1);
+            if (light_config.geometric_factor_1) {
+                specular_1 = OpVectorTimesScalar(vec_ids.Get(3), specular_1, geo_factor);
+            }
+        }
+
         const bool shadow_primary_enable = lighting.shadow_primary && light_config.shadow_enable;
         const bool shadow_secondary_enable =
             lighting.shadow_secondary && light_config.shadow_enable;
         const Id shadow_rgb{OpVectorShuffle(vec_ids.Get(3), shadow, shadow, 0, 1, 2)};
 
-        const Id light_diffuse{GetLightMember(2)};
-        const Id light_ambient{GetLightMember(3)};
-        Id diffuse_mul_dot{OpVectorTimesScalar(vec_ids.Get(3), light_diffuse, dot_product)};
-
-        // Shadow only attenuates diffuse, not the light's ambient
-        if (shadow_primary_enable) {
-            diffuse_mul_dot = OpFMul(vec_ids.Get(3), diffuse_mul_dot, shadow_rgb);
-        }
-
         // Compute primary fragment color (diffuse lighting) function
-        Id diffuse_sum_rgb{OpFAdd(vec_ids.Get(3), diffuse_mul_dot, light_ambient)};
-        diffuse_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), diffuse_sum_rgb, dist_atten);
-        diffuse_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), diffuse_sum_rgb, spot_atten);
+        if (primary_used) {
+            Id diffuse_sum_rgb{ConstF32(0.f, 0.f, 0.f)};
+            if (diffuse_used) {
+                const Id light_diffuse{GetLightMember(2)};
+                diffuse_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), light_diffuse, dot_product);
+
+                // Shadow only attenuates diffuse, not the light's ambient
+                if (shadow_primary_enable) {
+                    diffuse_sum_rgb = OpFMul(vec_ids.Get(3), diffuse_sum_rgb, shadow_rgb);
+                }
+            }
+            if (ambient_used) {
+                const Id light_ambient{GetLightMember(3)};
+                diffuse_sum_rgb = diffuse_used
+                                      ? OpFAdd(vec_ids.Get(3), diffuse_sum_rgb, light_ambient)
+                                      : light_ambient;
+            }
+            diffuse_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), diffuse_sum_rgb, dist_atten);
+            diffuse_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), diffuse_sum_rgb, spot_atten);
+            const Id diffuse_sum_rgba{PadVectorF32(diffuse_sum_rgb, vec_ids.Get(4), 0.f)};
+            diffuse_sum = OpFAdd(vec_ids.Get(4), diffuse_sum, diffuse_sum_rgba);
+        }
 
         // Compute secondary fragment color (specular lighting) function
-        const Id specular_01{OpFAdd(vec_ids.Get(3), specular_0, specular_1)};
-        Id specular_sum_rgb{OpVectorTimesScalar(vec_ids.Get(3), specular_01, clamp_highlights)};
-        specular_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), specular_sum_rgb, dist_atten);
-        specular_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), specular_sum_rgb, spot_atten);
-        if (shadow_secondary_enable) {
-            specular_sum_rgb = OpFMul(vec_ids.Get(3), specular_sum_rgb, shadow_rgb);
+        if (secondary_used) {
+            const Id specular_01{spec0_used && spec1_used
+                                     ? OpFAdd(vec_ids.Get(3), specular_0, specular_1)
+                                     : (spec0_used ? specular_0 : specular_1)};
+            Id specular_sum_rgb{OpVectorTimesScalar(vec_ids.Get(3), specular_01, clamp_highlights)};
+            specular_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), specular_sum_rgb, dist_atten);
+            specular_sum_rgb = OpVectorTimesScalar(vec_ids.Get(3), specular_sum_rgb, spot_atten);
+            if (shadow_secondary_enable) {
+                specular_sum_rgb = OpFMul(vec_ids.Get(3), specular_sum_rgb, shadow_rgb);
+            }
+            const Id specular_sum_rgba{PadVectorF32(specular_sum_rgb, vec_ids.Get(4), 0.f)};
+            specular_sum = OpFAdd(vec_ids.Get(4), specular_sum, specular_sum_rgba);
         }
-
-        // Accumulate the fragment colors
-        const Id diffuse_sum_rgba{PadVectorF32(diffuse_sum_rgb, vec_ids.Get(4), 0.f)};
-        const Id specular_sum_rgba{PadVectorF32(specular_sum_rgb, vec_ids.Get(4), 0.f)};
-        diffuse_sum = OpFAdd(vec_ids.Get(4), diffuse_sum, diffuse_sum_rgba);
-        specular_sum = OpFAdd(vec_ids.Get(4), specular_sum, specular_sum_rgba);
     }
 
     // Apply shadow attenuation to alpha components if enabled

@@ -67,6 +67,9 @@ enum Experiment : std::uint32_t {
     LegacyFrameHandoff = 8388608,  ///< Vulkan: the emulation waits for the render thread at every
                                    ///< VBlank, and images are handed to the display on the queue
                                    ///< rendering is submitted to, as before
+    LegacyOpaqueBlend = 16777216,  ///< Vulkan: a blend function that only copies the source is
+                                   ///< passed to the driver as blending, as before. Read when a
+                                   ///< pipeline is built, so set it before the game starts.
     LegacyScissor = 33554432,      ///< Vulkan: fragment shaders test the scissor that keeps what is
                                    ///< inside a rectangle and drop what is outside, as before
     /// Shadow maps are rendered at the resolution scale, as before

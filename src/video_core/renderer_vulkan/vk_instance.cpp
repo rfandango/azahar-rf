@@ -15,6 +15,11 @@
 
 #include <vk_mem_alloc.h>
 
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+#include <cstdlib>
+#include <sys/system_properties.h>
+#endif
+
 namespace Vulkan {
 
 namespace {
@@ -446,13 +451,36 @@ bool Instance::CreateDevice() {
     const bool is_qualcomm = driver_id == vk::DriverIdKHR::eQualcommProprietary;
     const bool is_turnip = driver_id == vk::DriverIdKHR::eMesaTurnip;
 
+    // Profiling builds: the property debug.azahar.vk_without names what the driver offers and
+    // is to be left unused, to find which of the paths that differ between two drivers a
+    // rendering fault follows. Sum of: 1 extended dynamic state, 2 custom border colours,
+    // 4 shader stencil export, 8 host memory import, 16 commands are flushed after each larger
+    // render pass (as with the Qualcomm and ARM drivers). Read when the device is created.
+    // With 31 a Turnip driver is used like Qualcomm's own.
+    u32 without = 0;
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    {
+        char value[PROP_VALUE_MAX]{};
+        if (__system_property_get("debug.azahar.vk_without", value) > 0) {
+            without = static_cast<u32>(std::strtoul(value, nullptr, 0));
+        }
+        if (without != 0) {
+            LOG_WARNING(Render_Vulkan, "debug.azahar.vk_without = {}", without);
+        }
+    }
+#endif
+    const std::string_view left_out = "debug.azahar.vk_without says so";
+    vk_without = without;
+
     add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     image_format_list = add_extension(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
     display_timing = add_extension(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
     create_renderpass2 = add_extension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
     depth_stencil_resolve = add_extension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
-    shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
-    external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    shader_stencil_export =
+        add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME, (without & 4) != 0, left_out);
+    external_memory_host =
+        add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, (without & 8) != 0, left_out);
     tooling_info = add_extension(VK_EXT_TOOLING_INFO_EXTENSION_NAME, is_moltenvk,
                                  "function pointer is not exposed by MoltenVK");
     const bool has_timeline_semaphores =
@@ -460,11 +488,15 @@ bool Instance::CreateDevice() {
                       "it is broken on Qualcomm drivers");
     const bool has_portability_subset = add_extension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
     const bool has_extended_dynamic_state =
-        add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, is_arm || is_qualcomm,
-                      "it is broken on Qualcomm and ARM drivers");
+        (without & 1) != 0
+            ? add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, true, left_out)
+            : add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, is_arm || is_qualcomm,
+                            "it is broken on Qualcomm and ARM drivers");
     const bool has_custom_border_color =
-        add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, is_qualcomm,
-                      "it is broken on most Qualcomm driver versions");
+        (without & 2) != 0
+            ? add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, true, left_out)
+            : add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, is_qualcomm,
+                            "it is broken on most Qualcomm driver versions");
     const bool has_index_type_uint8 =
         add_extension(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, is_moltenvk,
                       "uint8 index conversion causes memory leaks in MoltenVK");

@@ -58,7 +58,10 @@ struct TextureBlit {
 /// (width, tiled or linear, or format). Pixel indices count guest pixels in memory order.
 struct TextureRelayout {
     Common::Rectangle<u32> dst_rect; ///< Host rectangle of the destination to go through
-    s32 pixel_delta; ///< Index of a pixel in the source minus its index in the destination
+    /// Index of a pixel in the source minus its index in the destination. For a source whose
+    /// pixels are of another size than the destination's: the address of the destination minus
+    /// the address of the source, in bytes.
+    s32 pixel_delta;
     u32 first_pixel; ///< Range of destination pixel indices to fill
     u32 end_pixel;
 };

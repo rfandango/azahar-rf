@@ -115,8 +115,8 @@ struct FramebufferConfig {
             FIELD_HASH(alpha_test_func), FIELD_HASH(scissor_test_mode), FIELD_HASH(depthmap_enable),
             FIELD_HASH(logic_op), FIELD_HASH(shadow_rendering), FIELD_HASH(alphablend_enable),
             FIELD_HASH(depth_from_viewport), FIELD_HASH(color_unused),
-            FIELD_HASH(requested_rgb_blend),
-            FIELD_HASH(requested_alpha_blend), FIELD_HASH(requested_logic_op),
+            FIELD_HASH(requested_rgb_blend), FIELD_HASH(requested_alpha_blend),
+            FIELD_HASH(requested_logic_op),
 
             // nested layout
             BlendConfig::StructHash());
@@ -250,9 +250,17 @@ union Light {
     BitField<7, 1, u16> geometric_factor_0;
     BitField<8, 1, u16> geometric_factor_1;
     BitField<9, 1, u16> shadow_enable;
+    // Which of the light's colours are zero. A term that is multiplied by such a colour is
+    // left out of the shader, with the table lookups that only feed it: games give every
+    // material the lights of the scene and leave the terms it does not have black (the
+    // registers hold material times light), and a lookup is the costly part of a light.
+    BitField<10, 1, u16> specular_0_zero;
+    BitField<11, 1, u16> specular_1_zero;
+    BitField<12, 1, u16> diffuse_zero;
+    BitField<13, 1, u16> ambient_zero;
 
     static consteval u64 StructHash() {
-        constexpr u64 STRUCT_VERSION = 0;
+        constexpr u64 STRUCT_VERSION = 2;
 
         using T = Light;
         return Common::HashCombine(STRUCT_VERSION,
@@ -264,7 +272,9 @@ union Light {
                                    FIELD_HASH(num), FIELD_HASH(directional),
                                    FIELD_HASH(two_sided_diffuse), FIELD_HASH(dist_atten_enable),
                                    FIELD_HASH(spot_atten_enable), FIELD_HASH(geometric_factor_0),
-                                   FIELD_HASH(geometric_factor_1), FIELD_HASH(shadow_enable));
+                                   FIELD_HASH(geometric_factor_1), FIELD_HASH(shadow_enable),
+                                   FIELD_HASH(specular_0_zero), FIELD_HASH(specular_1_zero),
+                                   FIELD_HASH(diffuse_zero), FIELD_HASH(ambient_zero));
     }
 };
 static_assert(std::has_unique_object_representations_v<Light>);

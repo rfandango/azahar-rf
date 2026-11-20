@@ -58,7 +58,8 @@ struct RelayoutInfo {
     Common::Vec2i dst_offset;
     Common::Vec2i dst_extent;
     s32 dst_scale;
-    s32 src_scale;
+    s32 src_scale_x2;
+    s32 src_scale_y2;
     s32 dst_width;
     s32 dst_height;
     s32 dst_tiled;
@@ -290,6 +291,9 @@ BlitHelper::BlitHelper(const Instance& instance_, Scheduler& scheduler_,
       relayout_depth_comp{Compile(HostShaders::VULKAN_RELAYOUT_COMP,
                                   vk::ShaderStageFlagBits::eCompute, device,
                                   "#define DEPTH_SOURCE\n")},
+      relayout_rgb_comp{Compile(HostShaders::VULKAN_RELAYOUT_COMP,
+                                vk::ShaderStageFlagBits::eCompute, device,
+                                "#define RGB8_SOURCE\n")},
       blit_depth_stencil_frag{VK_NULL_HANDLE},
       // Texture filtering shader modules
       bicubic_frag{Compile(HostShaders::BICUBIC_FRAG, vk::ShaderStageFlagBits::eFragment, device)},
@@ -308,6 +312,7 @@ BlitHelper::BlitHelper(const Instance& instance_, Scheduler& scheduler_,
           MakeComputePipeline(depth_to_buffer_comp, compute_buffer_pipeline_layout)},
       relayout_color_pipeline{MakeComputePipeline(relayout_color_comp, relayout_pipeline_layout)},
       relayout_depth_pipeline{MakeComputePipeline(relayout_depth_comp, relayout_pipeline_layout)},
+      relayout_rgb_pipeline{MakeComputePipeline(relayout_rgb_comp, relayout_pipeline_layout)},
       depth_blit_pipeline{VK_NULL_HANDLE},
       linear_sampler{device.createSampler(SAMPLER_CREATE_INFO<vk::Filter::eLinear>)},
       nearest_sampler{device.createSampler(SAMPLER_CREATE_INFO<vk::Filter::eNearest>)} {
@@ -370,6 +375,7 @@ BlitHelper::~BlitHelper() {
     device.destroyShaderModule(depth_to_buffer_comp);
     device.destroyShaderModule(relayout_color_comp);
     device.destroyShaderModule(relayout_depth_comp);
+    device.destroyShaderModule(relayout_rgb_comp);
     if (blit_depth_stencil_frag) {
         device.destroyShaderModule(blit_depth_stencil_frag);
     }
@@ -382,6 +388,7 @@ BlitHelper::~BlitHelper() {
     device.destroyPipeline(depth_to_buffer_pipeline);
     device.destroyPipeline(relayout_color_pipeline);
     device.destroyPipeline(relayout_depth_pipeline);
+    device.destroyPipeline(relayout_rgb_pipeline);
     device.destroyPipeline(d24s8_to_rgba8_pipeline);
     if (d24s8_to_rgba8_ms_pipeline) {
         device.destroyPipeline(d24s8_to_rgba8_ms_pipeline);
@@ -595,7 +602,10 @@ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
 bool BlitHelper::Relayout(Surface& source, Surface& dest,
                           const VideoCore::TextureRelayout& relayout) {
     const bool depth_source = source.type == VideoCore::SurfaceType::DepthStencil;
-    const auto pipeline = depth_source ? relayout_depth_pipeline : relayout_color_pipeline;
+    const auto pipeline = depth_source ? relayout_depth_pipeline
+                          : source.pixel_format == VideoCore::PixelFormat::RGB8
+                              ? relayout_rgb_pipeline
+                              : relayout_color_pipeline;
     const auto src_layout =
         depth_source ? vk::ImageLayout::eDepthStencilReadOnlyOptimal : vk::ImageLayout::eGeneral;
 
@@ -620,7 +630,8 @@ bool BlitHelper::Relayout(Surface& source, Surface& dest,
         .dst_extent = Common::Vec2i{static_cast<int>(relayout.dst_rect.GetWidth()),
                                     static_cast<int>(relayout.dst_rect.GetHeight())},
         .dst_scale = static_cast<s32>(dest.res_scale),
-        .src_scale = static_cast<s32>(source.res_scale),
+        .src_scale_x2 = static_cast<s32>(source.res_scale * (source.half_scale_x ? 1 : 2)),
+        .src_scale_y2 = static_cast<s32>(source.res_scale * (source.half_scale_y ? 1 : 2)),
         .dst_width = static_cast<s32>(dest.width),
         .dst_height = static_cast<s32>(dest.height),
         .dst_tiled = dest.is_tiled,

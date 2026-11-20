@@ -94,6 +94,7 @@ private:
     vk::ShaderModule depth_to_buffer_comp;
     vk::ShaderModule relayout_color_comp;
     vk::ShaderModule relayout_depth_comp;
+    vk::ShaderModule relayout_rgb_comp;
     vk::ShaderModule blit_depth_stencil_frag;
     vk::ShaderModule bicubic_frag;
     vk::ShaderModule scale_force_frag;
@@ -106,6 +107,7 @@ private:
     vk::Pipeline depth_to_buffer_pipeline;
     vk::Pipeline relayout_color_pipeline;
     vk::Pipeline relayout_depth_pipeline;
+    vk::Pipeline relayout_rgb_pipeline;
     vk::Pipeline depth_blit_pipeline;
     vk::Sampler linear_sampler;
     vk::Sampler nearest_sampler;
