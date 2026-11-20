@@ -27,7 +27,12 @@ if [ "$build" = 1 ]; then
     if command -v ccache > /dev/null 2>&1; then
         export NDK_CCACHE="${NDK_CCACHE:-$(command -v ccache)}"
     fi
-    (cd "$ANDROID_DIR" && ./gradlew --console=plain "$task" -Pandroid.injected.build.abi=arm64-v8a)
+    # The Android Gradle plugin marks a build restricted to one ABI as test-only, and the
+    # installer of a device refuses such an APK ("package appears to be invalid"): it would
+    # only go on over adb with -t. The APK is copied to other devices as a file as well, so
+    # it is told not to.
+    (cd "$ANDROID_DIR" && ./gradlew --console=plain "$task" \
+        -Pandroid.injected.build.abi=arm64-v8a -Pandroid.injected.testOnly=false)
 fi
 
 # Builds restricted to one ABI (android.injected.build.abi) leave the APK under intermediates/.
@@ -50,7 +55,7 @@ fi
 if [ "$install" = 1 ]; then
     require_device
     info "Installing $PACKAGE"
-    # -t: single-ABI builds are marked testOnly by the Android Gradle plugin.
+    # -t: an APK built before this script asked for otherwise is marked test-only
     "$ADB" install -r -t "$apk"
     cat >&2 << EOF
 
