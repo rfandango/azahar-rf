@@ -61,14 +61,15 @@ void Timing::SetProcessorClockMultiplier(u32 multiplier) {
 }
 
 void Timing::GovernProcessorClock(std::chrono::microseconds emulated,
-                                  std::chrono::microseconds host_work, double speed_limit) {
+                                  std::chrono::microseconds host_work, double speed_limit,
+                                  bool reproducible) {
     if (processor_clock_multiplier <= 1) {
         return;
     }
     const double asked = processor_clock_multiplier;
     double granted = processor_clock_granted;
-    if (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::FixedProcessorClock)
-        [[unlikely]] {
+    if (reproducible || (Common::TraceMarkers::Experiments2() &
+                         Common::TraceMarkers::FixedProcessorClock)) [[unlikely]] {
         granted = asked;
         clock_governor = {};
     } else {

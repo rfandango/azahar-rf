@@ -303,9 +303,14 @@ public:
      * does not have that, everything ran slow: video at half speed, sound stretched. Such a
      * title is given what the host manages in real time instead, never less than the Old
      * 3DS's clock, and all of it again as soon as there is room.
+     *
+     * With `reproducible` the title is given all it asked for whatever the host does: what
+     * the emulation does must then not depend on the machine it runs on (an input movie
+     * being recorded or played back).
      */
     void GovernProcessorClock(std::chrono::microseconds emulated,
-                              std::chrono::microseconds host_work, double speed_limit);
+                              std::chrono::microseconds host_work, double speed_limit,
+                              bool reproducible);
 
     std::chrono::microseconds GetGlobalTimeUs() const;
 

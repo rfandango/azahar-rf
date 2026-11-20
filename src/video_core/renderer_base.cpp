@@ -8,6 +8,7 @@
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "core/hle/service/hid/hid.h"
+#include "core/movie.h"
 #include "core/tracer/recorder.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/frame_state_dump.h"
@@ -124,9 +125,11 @@ void RendererBase::EndFrame() {
         CITRA_HITCH_SCOPE_ABSORB(Limiter);
         system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
     }
-    system.CoreTiming().GovernProcessorClock(system.frame_limiter.LastIntervalEmulated(),
-                                             system.frame_limiter.LastIntervalWork(),
-                                             Settings::GetFrameLimit() / 100.0);
+    const Core::Movie::PlayMode movie = system.Movie().GetPlayMode();
+    system.CoreTiming().GovernProcessorClock(
+        system.frame_limiter.LastIntervalEmulated(), system.frame_limiter.LastIntervalWork(),
+        Settings::GetFrameLimit() / 100.0,
+        movie == Core::Movie::PlayMode::Recording || movie == Core::Movie::PlayMode::Playing);
 
     // On fast enough devices, the time limiter sleep spans most of the 16ms period
     // between VBlank events. If an input event lands in that period, then the change
