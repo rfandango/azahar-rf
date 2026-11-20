@@ -121,6 +121,11 @@ public:
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
+    /// The share of the viewport that the box around the vertices of the draw about to be
+    /// carried out takes up, for a draw of two triangles at the most, whose vertices are
+    /// shaded here to find out. One, all of it, where that cannot be told.
+    float SmallDrawViewportShare(bool is_indexed);
+
 private:
     void InitializeRegs();
 
@@ -143,6 +148,11 @@ private:
     void DrawArrays(bool is_indexed);
 
     void LoadVertices(bool is_indexed);
+
+    /// Sets up and returns the engine to shade a few vertices of the vertex shader in use
+    /// with, without holding the emulation up: the configured one if it has the shader
+    /// ready, the interpreter until then
+    ShaderEngine& EngineForFewVertices();
 
     /// Whether the triangles of the draw about to be carried out cover all of the viewport.
     /// Only looks at draws of two triangles, whose vertices are shaded here to find out.
@@ -430,6 +440,8 @@ private:
     CommandList cmd_list;
     VideoCore::FrameLiveness* draw_filter{};
     std::unique_ptr<ShaderEngine> shader_engine;
+    /// Shades a few vertices while `shader_engine` does not have their shader ready
+    std::unique_ptr<ShaderEngine> few_vertices_engine;
 };
 
 #define GPU_REG_INDEX(field_name) (offsetof(Pica::PicaCore::Regs, field_name) / sizeof(u32))

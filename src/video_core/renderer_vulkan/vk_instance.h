@@ -176,6 +176,17 @@ public:
         return display_timing;
     }
 
+    /// Returns true when pipelines can be put together from separately built parts without
+    /// compiling anything again (VK_EXT_graphics_pipeline_library with fast linking)
+    bool IsGraphicsPipelineLibrarySupported() const {
+        return graphics_pipeline_library;
+    }
+
+    /// Returns true when VK_EXT_pipeline_creation_feedback is in use (profiling builds)
+    bool IsPipelineCreationFeedbackSupported() const {
+        return pipeline_creation_feedback;
+    }
+
     /// Returns true when VK_EXT_pipeline_creation_cache_control is supported
     bool IsPipelineCreationCacheControlSupported() const {
         return pipeline_creation_cache_control;
@@ -357,6 +368,8 @@ protected:
     bool create_renderpass2{};
     bool depth_stencil_resolve{};
     bool pipeline_creation_cache_control{};
+    bool pipeline_creation_feedback{};
+    bool graphics_pipeline_library{};
     bool fragment_shader_barycentric{};
     bool shader_stencil_export{};
     bool external_memory_host{};

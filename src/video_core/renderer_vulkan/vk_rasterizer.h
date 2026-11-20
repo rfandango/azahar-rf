@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <unordered_map>
 #include "video_core/rasterizer_accelerated.h"
 #include "video_core/renderer_vulkan/vk_descriptor_update_queue.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -162,6 +163,23 @@ private:
         bool valid{};
     };
     BoundTarget bound_target{};
+
+    /// Which targets the game draws anew all the time: one of those can go a frame without
+    /// a small draw whose pipeline is still being built, one that is drawn to once cannot.
+    /// The frames are counted by TickFrame; kept for each colour buffer are the last two it
+    /// was drawn to in.
+    struct TargetUse {
+        u64 last{};
+        u64 before{};
+    };
+    std::unordered_map<PAddr, TargetUse> target_use;
+    u64 frame_count{1};
+    u64 target_use_frame{};
+    bool target_redrawn{};
+
+    /// Whether a draw of two triangles at the most has to wait for its pipeline: leaving
+    /// it out until the pipeline is built would show, or last
+    bool SmallDrawMustShow(bool is_indexed);
     /// What the draw that comes next overwrites of the area it is confined to
     bool next_draw_overwrites_color{};
     bool next_draw_overwrites_depth{};

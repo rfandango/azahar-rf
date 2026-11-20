@@ -74,7 +74,8 @@ public:
     bool LoadCacheCrashed(u64 title_id) const;
 
     /// Binds a pipeline using the provided information
-    bool BindPipeline(PipelineInfo& info, bool wait_built = false);
+    /// `vertices` is for the log only: what a draw that had to wait was
+    bool BindPipeline(PipelineInfo& info, bool wait_built = false, u32 vertices = 0);
 
     Pica::Shader::Generator::ExtraVSConfig CalcExtraConfig(
         const Pica::Shader::Generator::PicaVSConfig& config);
@@ -190,6 +191,8 @@ private:
     std::size_t num_worker_threads;
     Common::ThreadWorker pipeline_workers;
     Common::ThreadWorker shader_workers;
+    /// Builds in one piece, at its leisure, the pipelines that were put together from parts
+    Common::ThreadWorker pipeline_optimizer;
     PipelineInfo current_info{};
     GraphicsPipeline* current_pipeline{};
     std::array<DescriptorHeap, NumDescriptorHeaps> descriptor_heaps;

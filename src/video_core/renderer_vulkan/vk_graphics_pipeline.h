@@ -5,6 +5,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include "common/hash.h"
 #include "common/thread_worker.h"
 #include "video_core/pica/regs_pipeline.h"
@@ -318,33 +322,80 @@ struct Shader : public Common::AsyncHandle {
     std::string program;
 };
 
+/// A part of a pipeline that the driver builds and keeps on its own where it can
+/// (VK_EXT_graphics_pipeline_library): the vertex layout, the vertex stage, the fragment
+/// stage or the blending. A part is shared by all the pipelines that are made with it, so a
+/// vertex shader is compiled once and not again with every fragment shader it meets.
+struct PipelinePart {
+    /// Held by the thread that builds the part; whoever else needs it waits here
+    std::mutex build_mutex;
+    std::atomic_bool is_built{false};
+    vk::UniquePipeline pipeline;
+};
+
+/// The parts built so far, by a hash of what each is made from
+class PipelineParts {
+public:
+    /// Returns the part for the key; nobody has built it yet if it was not asked for before
+    PipelinePart& Get(u64 key) {
+        std::scoped_lock lock{mutex};
+        auto& part = parts[key];
+        if (!part) {
+            part = std::make_unique<PipelinePart>();
+        }
+        return *part;
+    }
+
+    /// A pipeline put together from parts is drawn with at once, and built in one piece
+    /// here right after, with its stages fitted to each other, to take its place
+    Common::ThreadWorker* optimizer{};
+    /// How many were built that way since the driver's cache was last stored, and when the
+    /// last of them was done (milliseconds of the steady clock)
+    std::atomic<u32> optimized_unsaved{};
+    std::atomic<s64> last_optimized_ms{};
+
+private:
+    std::mutex mutex;
+    std::unordered_map<u64, std::unique_ptr<PipelinePart>> parts;
+};
+
 class GraphicsPipeline : public Common::AsyncHandle {
 public:
+    /// With `parts` the pipeline is put together from parts shared with other pipelines
     explicit GraphicsPipeline(const Instance& instance, RenderManager& renderpass_cache,
                               const PipelineInfo& info, vk::PipelineCache pipeline_cache,
                               vk::PipelineLayout layout, std::array<Shader*, 3> stages,
-                              Common::ThreadWorker* worker);
+                              Common::ThreadWorker* worker, PipelineParts* parts = nullptr);
     ~GraphicsPipeline();
 
-    bool TryBuild(bool wait_built);
+    /// `for_draw` is false when the pipeline is built ahead of any draw, from the disk cache
+    bool TryBuild(bool wait_built, bool for_draw = true);
 
-    bool Build(bool fail_on_compile_required = false);
+    /// With `optimize` the pipeline, already put together from parts, is built in one piece
+    bool Build(bool fail_on_compile_required = false, bool for_waiting_draw = false,
+               bool optimize = false);
 
     /// Returns once the pipeline is built, for a draw that cannot go on without it. A build
     /// that is still waiting for a worker is done on the calling thread right away: the workers
-    /// can have many other pipelines to get through first.
-    void BuildNowOrWait();
+    /// can have many other pipelines to get through first. True if the calling thread built it.
+    bool BuildNowOrWait();
 
     [[nodiscard]] vk::Pipeline Handle() const noexcept {
-        return *pipeline;
+        return vk::Pipeline{current.load(std::memory_order_acquire)};
     }
 
 private:
     const Instance& instance;
     RenderManager& renderpass_cache;
     Common::ThreadWorker* worker;
+    PipelineParts* parts;
 
     vk::UniquePipeline pipeline;
+    /// Built in one piece after `pipeline` was put together from parts. That one stays, as
+    /// commands recorded with it may still be on their way.
+    vk::UniquePipeline optimized;
+    /// The one to draw with
+    std::atomic<VkPipeline> current{};
     vk::PipelineLayout pipeline_layout;
     vk::PipelineCache pipeline_cache;
 
@@ -353,6 +404,12 @@ private:
     bool is_pending{};
     /// Set by whoever builds the pipeline after it was queued: a worker, or a thread waiting
     std::atomic_flag build_claimed;
+
+    /// For the log of what it took to get the pipeline, in profiling builds: when the first
+    /// draw asked for it, when its build was queued, and the draws left out in between
+    std::chrono::steady_clock::time_point first_asked{};
+    std::chrono::steady_clock::time_point queued{};
+    std::atomic<u32> draws_left_out{};
 };
 
 } // namespace Vulkan

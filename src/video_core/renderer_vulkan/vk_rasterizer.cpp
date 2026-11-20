@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_timing.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 #include "video_core/texture/texture_decode.h"
 
@@ -159,6 +160,7 @@ void RasterizerVulkan::TickFrame() {
 #endif
     res_cache.TickFrame();
     runtime.FreeRetired();
+    ++frame_count;
 }
 
 void RasterizerVulkan::LoadDefaultDiskResources(
@@ -501,9 +503,29 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
         SetupIndexArray();
     }
 
-    const bool wait_built = !async_shaders || regs.pipeline.num_vertices <= 6;
-    if (!pipeline_cache.BindPipeline(pipeline_info, wait_built)) {
-        return true;
+    // With shaders compiled in the background a draw whose pipeline is not built yet is left
+    // out, to turn up a frame or two later. Small draws used to wait instead, all of them,
+    // since among them are the passes over the whole screen; now only those wait that would
+    // be missed.
+    const u32 vertices = regs.pipeline.num_vertices;
+    if (!pipeline_cache.BindPipeline(pipeline_info, !async_shaders, vertices)) {
+        if (vertices > 6 || !SmallDrawMustShow(is_indexed)) {
+            return true;
+        }
+        if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacySmallDrawWait) ==
+            0) {
+            // It has to be drawn now, but not with this pipeline: its vertex shader can take
+            // the driver tens of milliseconds, and the render thread would stand still for
+            // them. The caller shades the few vertices on the CPU when this fails and draws
+            // them with the pass-through vertex shader, which is always there. What is left to
+            // wait for is the fragment shader, a few milliseconds, if that is new as well. The
+            // pipeline asked for here is built in the background for the frames to come.
+            LOG_SHADER_TIMING("Small draw shown with its vertices shaded on the CPU");
+            return false;
+        }
+        if (!pipeline_cache.BindPipeline(pipeline_info, true, vertices)) {
+            return true;
+        }
     }
 
     const DrawParams params = {
@@ -527,6 +549,24 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
     });
 
     return true;
+}
+
+bool RasterizerVulkan::SmallDrawMustShow(bool is_indexed) {
+    if (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacySmallDrawWait) {
+        return true;
+    }
+    // What is drawn once has to be drawn: nothing would bring it back
+    if (!target_redrawn) {
+        LOG_SHADER_TIMING("Small draw waits for its pipeline: its target is not drawn anew");
+        return true;
+    }
+    // A quarter of the viewport and more is a pass over the screen, which what is drawn
+    // after it builds on; less is a sprite, a glyph or a particle
+    constexpr float PASS_SHARE = 0.25f;
+    const float share = pica.SmallDrawViewportShare(is_indexed);
+    LOG_SHADER_TIMING("Small draw {} its pipeline: {:.0f}% of the viewport",
+                      share >= PASS_SHARE ? "waits for" : "left out without", share * 100.f);
+    return share >= PASS_SHARE;
 }
 
 void RasterizerVulkan::SetupIndexArray() {
@@ -615,6 +655,16 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         !(Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyAttachments);
     const bool using_color_fb = needs_color_fb || (same_target && bound_target.color);
     const bool using_depth_fb = needs_depth_fb || (same_target && bound_target.depth);
+    if (!same_target || target_use_frame != frame_count) {
+        TargetUse& use = target_use[target.color_addr != 0 ? target.color_addr : target.depth_addr];
+        if (use.last != frame_count) {
+            use.before = use.last;
+            use.last = frame_count;
+        }
+        // Drawn to a few frames ago too: a game at 20 frames a second draws every third
+        target_redrawn = use.before != 0 && frame_count - use.before <= 4;
+        target_use_frame = frame_count;
+    }
     bound_target = target;
     bound_target.color = using_color_fb;
     bound_target.depth = using_depth_fb;

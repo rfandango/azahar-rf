@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
+#include "video_core/renderer_vulkan/vk_shader_timing.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
@@ -77,32 +78,59 @@ Shader::~Shader() {
 GraphicsPipeline::GraphicsPipeline(const Instance& instance_, RenderManager& renderpass_cache_,
                                    const PipelineInfo& info_, vk::PipelineCache pipeline_cache_,
                                    vk::PipelineLayout layout_, std::array<Shader*, 3> stages_,
-                                   Common::ThreadWorker* worker_)
-    : instance{instance_}, renderpass_cache{renderpass_cache_}, worker{worker_},
+                                   Common::ThreadWorker* worker_, PipelineParts* parts_)
+    : instance{instance_}, renderpass_cache{renderpass_cache_}, worker{worker_}, parts{parts_},
       pipeline_layout{layout_}, pipeline_cache{pipeline_cache_}, info{info_}, stages{stages_} {}
 
 GraphicsPipeline::~GraphicsPipeline() = default;
 
-bool GraphicsPipeline::TryBuild(bool wait_built) {
+bool GraphicsPipeline::TryBuild(bool wait_built, bool for_draw) {
+    if (for_draw) {
+        if (first_asked == ShaderTiming::Clock::time_point{}) {
+            first_asked = ShaderTiming::Clock::now();
+        }
+        if (!wait_built) {
+            draws_left_out.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     // The pipeline is currently being compiled. We can either wait for it
     // or skip the draw.
     if (is_pending) {
         return wait_built;
     }
 
-    // If the shaders haven't been compiled yet, we cannot proceed.
+    // The shaders may still be on their way through the shader workers. The build is queued
+    // all the same and waits for them there, which is a matter of milliseconds. It used to be
+    // left for the next draw with this pipeline to queue: a frame later at the best, and at a
+    // change of scene, when frames are long and everything is new, several hundred
+    // milliseconds later (Monster Hunter 4 Ultimate after a save state: 474 ms median).
     const bool shaders_pending = std::any_of(
         stages.begin(), stages.end(), [](Shader* shader) { return shader && !shader->IsDone(); });
-    if (!wait_built && shaders_pending) {
+    if (!wait_built && shaders_pending &&
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyPipelineQueueing)) {
         return false;
     }
 
     // Ask the driver if it can give us the pipeline quickly.
-    if (!shaders_pending && instance.IsPipelineCreationCacheControlSupported() && Build(true)) {
-        return true;
+    if (!shaders_pending && instance.IsPipelineCreationCacheControlSupported()) {
+        [[maybe_unused]] const auto probe_start = ShaderTiming::Clock::now();
+        const bool found = Build(true);
+        if (for_draw) {
+            LOG_SHADER_TIMING("Pipeline probe: {} in {:.2f} ms on the emulation thread, {:.1f} ms "
+                              "after the first draw, {} draws left out before",
+                              found ? "found" : "not found", ShaderTiming::MsSince(probe_start),
+                              ShaderTiming::MsBetween(first_asked, probe_start),
+                              draws_left_out.load(std::memory_order_relaxed) -
+                                  (wait_built ? 0 : 1));
+        }
+        if (found) {
+            return true;
+        }
     }
 
     // Fallback to (a)synchronous compilation
+    queued = ShaderTiming::Clock::now();
     worker->QueueWork([this] {
         if (!build_claimed.test_and_set()) {
             Build();
@@ -112,18 +140,19 @@ bool GraphicsPipeline::TryBuild(bool wait_built) {
     return wait_built;
 }
 
-void GraphicsPipeline::BuildNowOrWait() {
+bool GraphicsPipeline::BuildNowOrWait() {
     if (IsDone()) {
-        return;
+        return false;
     }
     if (!build_claimed.test_and_set()) {
-        Build();
-        return;
+        Build(false, true);
+        return true;
     }
     WaitDone();
+    return false;
 }
 
-bool GraphicsPipeline::Build(bool fail_on_compile_required) {
+bool GraphicsPipeline::Build(bool fail_on_compile_required, bool for_waiting_draw, bool optimize) {
     MICROPROFILE_SCOPE(Vulkan_Pipeline);
     CITRA_HITCH_SCOPE(ShaderCompile);
     // The fail_on_compile_required variant only asks the driver for an already-cached pipeline.
@@ -132,6 +161,8 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
     if (!fail_on_compile_required) {
         CITRA_TRACE_COUNT(PipelineBuilds);
     }
+    [[maybe_unused]] const auto build_start = ShaderTiming::Clock::now();
+    [[maybe_unused]] double shader_wait_ms = 0.0;
 
     const u32 stride_alignment = instance.GetMinVertexStrideAlignment();
     std::array<vk::VertexInputBindingDescription, MAX_VERTEX_BINDINGS> bindings;
@@ -314,7 +345,9 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
 
         if (!shader->IsDone()) {
             CITRA_TRACE_SCOPE("Vulkan::WaitShader");
+            const auto wait_start = ShaderTiming::Clock::now();
             shader->WaitDone();
+            shader_wait_ms += ShaderTiming::MsSince(wait_start);
         }
         shader_stages[shader_count++] = vk::PipelineShaderStageCreateInfo{
             .stage = MakeShaderStage(i),
@@ -344,16 +377,254 @@ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
         pipeline_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequiredEXT;
     }
 
-    auto result = instance.GetDevice().createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
-    if (result.result == vk::Result::eSuccess) {
+    // What the driver itself says it spent, in all and on each stage
+    vk::PipelineCreationFeedbackEXT whole_feedback{};
+    std::array<vk::PipelineCreationFeedbackEXT, MAX_SHADER_STAGES> stage_feedbacks{};
+    const vk::PipelineCreationFeedbackCreateInfoEXT feedback_info = {
+        .pPipelineCreationFeedback = &whole_feedback,
+        .pipelineStageCreationFeedbackCount = shader_count,
+        .pPipelineStageCreationFeedbacks = stage_feedbacks.data(),
+    };
+    if (instance.IsPipelineCreationFeedbackSupported() && !fail_on_compile_required &&
+        (!parts || optimize)) {
+        pipeline_info.pNext = &feedback_info;
+    }
+
+    [[maybe_unused]] const auto create_start = ShaderTiming::Clock::now();
+    // Where the driver builds the stages of a pipeline one by one and keeps each, a pipeline
+    // that is new to it is put together from such parts: of a vertex and a fragment shader
+    // usually only the latter has to be compiled then, a few milliseconds against twenty
+    // and more for both. Its stages are not fitted to each other, though (the vertex
+    // shader works out everything any fragment shader might read), so right after it is
+    // built in one piece in the background, and that one is drawn with from then on. One
+    // the driver has in its cache in one piece is taken from there.
+    bool from_parts = false;
+    bool found_whole = false;
+    if (parts && !optimize && instance.IsPipelineCreationCacheControlSupported()) {
+        vk::GraphicsPipelineCreateInfo whole_info = pipeline_info;
+        whole_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequiredEXT;
+        auto whole = instance.GetDevice().createGraphicsPipelineUnique(pipeline_cache, whole_info);
+        if (whole.result == vk::Result::eSuccess) {
+            pipeline = std::move(whole.value);
+            found_whole = true;
+        }
+    }
+    if (found_whole) {
+        // Nothing left to do
+    } else if (parts && !optimize) {
+        from_parts = true;
+        // The four parts, each with the state that is its own and nothing else. What the
+        // parts are told apart by: the shader modules themselves (several shader ids can
+        // stand for one module), and of the rest only what is not set while drawing.
+        const bool dynamic = instance.IsExtendedDynamicStateSupported();
+        const u64 attachments_hash = Common::ComputeStructHash64(info.state.attachments);
+        const u64 raster_hash = dynamic ? 0 : Common::ComputeStructHash64(info.state.rasterization);
+        const u64 depth_hash = dynamic ? 0 : Common::ComputeStructHash64(info.state.depth_stencil);
+        const auto module_id = [](const Shader* shader) {
+            return static_cast<u64>(reinterpret_cast<std::uintptr_t>(shader));
+        };
+        using Subset = vk::GraphicsPipelineLibraryFlagBitsEXT;
+        using States = boost::container::static_vector<vk::DynamicState, 8>;
+
+        // Returns the part, built here unless it is there already; nothing if it would have
+        // to be compiled, or is being compiled by another thread, and that is not wanted
+        const auto get_part = [&](u64 key, Subset subset, vk::GraphicsPipelineCreateInfo part_info,
+                                  const States& states, double& spent_ms) -> vk::Pipeline {
+            PipelinePart& part = parts->Get(key);
+            if (part.is_built.load(std::memory_order_acquire)) {
+                return *part.pipeline;
+            }
+            const auto part_start = ShaderTiming::Clock::now();
+            std::unique_lock lock{part.build_mutex, std::defer_lock};
+            if (!fail_on_compile_required) {
+                lock.lock();
+            } else if (!lock.try_lock()) {
+                return nullptr;
+            }
+            if (!part.is_built.load(std::memory_order_acquire)) {
+                const vk::PipelineDynamicStateCreateInfo part_dynamic = {
+                    .dynamicStateCount = static_cast<u32>(states.size()),
+                    .pDynamicStates = states.data(),
+                };
+                const vk::GraphicsPipelineLibraryCreateInfoEXT library_info = {
+                    .flags = subset,
+                };
+                part_info.pNext = &library_info;
+                part_info.pDynamicState = &part_dynamic;
+                part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR;
+                if (fail_on_compile_required) {
+                    part_info.flags |=
+                        vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequiredEXT;
+                }
+                auto part_result =
+                    instance.GetDevice().createGraphicsPipelineUnique(pipeline_cache, part_info);
+                if (part_result.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
+                    return nullptr;
+                }
+                ASSERT_MSG(part_result.result == vk::Result::eSuccess,
+                           "Pipeline part creation failed!");
+                part.pipeline = std::move(part_result.value);
+                part.is_built.store(true, std::memory_order_release);
+            }
+            spent_ms += ShaderTiming::MsSince(part_start);
+            return *part.pipeline;
+        };
+
+        double layout_ms = 0.0;
+        double vertex_ms = 0.0;
+        double fragment_ms = 0.0;
+        std::array<vk::Pipeline, 4> libraries;
+
+        States layout_states;
+        States vertex_states = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+        States fragment_states = {vk::DynamicState::eStencilCompareMask,
+                                  vk::DynamicState::eStencilWriteMask,
+                                  vk::DynamicState::eStencilReference};
+        const States blend_states = {vk::DynamicState::eBlendConstants};
+        if (dynamic) {
+            layout_states.push_back(vk::DynamicState::ePrimitiveTopologyEXT);
+            vertex_states.push_back(vk::DynamicState::eCullModeEXT);
+            vertex_states.push_back(vk::DynamicState::eFrontFaceEXT);
+            fragment_states.push_back(vk::DynamicState::eDepthCompareOpEXT);
+            fragment_states.push_back(vk::DynamicState::eDepthTestEnableEXT);
+            fragment_states.push_back(vk::DynamicState::eDepthWriteEnableEXT);
+            fragment_states.push_back(vk::DynamicState::eStencilOpEXT);
+            fragment_states.push_back(vk::DynamicState::eStencilTestEnableEXT);
+        }
+
+        // The stages of the two parts that have shaders
+        std::array<vk::PipelineShaderStageCreateInfo, 2> vertex_part_stages;
+        u32 vertex_part_stage_count = 0;
+        const vk::PipelineShaderStageCreateInfo* fragment_part_stage = nullptr;
+        for (u32 i = 0; i < shader_count; i++) {
+            if (shader_stages[i].stage == vk::ShaderStageFlagBits::eFragment) {
+                fragment_part_stage = &shader_stages[i];
+            } else {
+                vertex_part_stages[vertex_part_stage_count++] = shader_stages[i];
+            }
+        }
+
+        libraries[0] =
+            get_part(Common::HashCombine(u64{1}, raster_hash,
+                                         Common::ComputeStructHash64(info.state.vertex_layout)),
+                     Subset::eVertexInputInterface,
+                     vk::GraphicsPipelineCreateInfo{
+                         .pVertexInputState = &vertex_input_info,
+                         .pInputAssemblyState = &input_assembly,
+                     },
+                     layout_states, layout_ms);
+        libraries[1] = get_part(Common::HashCombine(u64{2}, raster_hash, attachments_hash,
+                                                    module_id(stages[0]), module_id(stages[2])),
+                                Subset::ePreRasterizationShaders,
+                                vk::GraphicsPipelineCreateInfo{
+                                    .stageCount = vertex_part_stage_count,
+                                    .pStages = vertex_part_stages.data(),
+                                    .pViewportState = &viewport_info,
+                                    .pRasterizationState = &raster_state,
+                                    .layout = pipeline_layout,
+                                    .renderPass = pipeline_info.renderPass,
+                                },
+                                vertex_states, vertex_ms);
+        libraries[2] = get_part(
+            Common::HashCombine(u64{3}, depth_hash, attachments_hash, module_id(stages[1])),
+            Subset::eFragmentShader,
+            vk::GraphicsPipelineCreateInfo{
+                .stageCount = fragment_part_stage ? 1u : 0u,
+                .pStages = fragment_part_stage,
+                .pMultisampleState = &multisampling,
+                .pDepthStencilState = &depth_info,
+                .layout = pipeline_layout,
+                .renderPass = pipeline_info.renderPass,
+            },
+            fragment_states, fragment_ms);
+        libraries[3] =
+            get_part(Common::HashCombine(
+                         u64{4}, attachments_hash, Common::ComputeStructHash64(info.state.blending),
+                         u64{colorblend_attachment.blendEnable},
+                         u64{static_cast<u32>(colorblend_attachment.colorWriteMask)}),
+                     Subset::eFragmentOutputInterface,
+                     vk::GraphicsPipelineCreateInfo{
+                         .pMultisampleState = &multisampling,
+                         .pColorBlendState = &color_blending,
+                         .renderPass = pipeline_info.renderPass,
+                     },
+                     blend_states, layout_ms);
+        if (std::ranges::any_of(libraries, [](vk::Pipeline part) { return !part; })) {
+            return false;
+        }
+
+        // Putting them together compiles nothing
+        const vk::PipelineLibraryCreateInfoKHR library_list = {
+            .libraryCount = static_cast<u32>(libraries.size()),
+            .pLibraries = libraries.data(),
+        };
+        vk::GraphicsPipelineCreateInfo linked_info = {
+            .pNext = &library_list,
+            .layout = pipeline_layout,
+            .renderPass = pipeline_info.renderPass,
+        };
+        if (fail_on_compile_required) {
+            linked_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequiredEXT;
+        }
+        auto result =
+            instance.GetDevice().createGraphicsPipelineUnique(pipeline_cache, linked_info);
+        if (result.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
+            return false;
+        }
+        ASSERT_MSG(result.result == vk::Result::eSuccess, "Putting a pipeline together failed!");
         pipeline = std::move(result.value);
-    } else if (result.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
-        return false;
+        // In the places the log has for what the driver says of a pipeline built in one piece
+        whole_feedback.duration = static_cast<u64>(ShaderTiming::MsSince(create_start) * 1e6);
+        stage_feedbacks[0].duration = static_cast<u64>(vertex_ms * 1e6);
+        stage_feedbacks[1].duration = static_cast<u64>(fragment_ms * 1e6);
     } else {
-        UNREACHABLE_MSG("Graphics pipeline creation failed!");
+        auto result =
+            instance.GetDevice().createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+        if (result.result == vk::Result::eSuccess) {
+            (optimize ? optimized : pipeline) = std::move(result.value);
+        } else if (result.result == vk::Result::eErrorPipelineCompileRequiredEXT) {
+            return false;
+        } else {
+            UNREACHABLE_MSG("Graphics pipeline creation failed!");
+        }
+    }
+    current.store(optimize ? *optimized : *pipeline, std::memory_order_release);
+
+    if (optimize) {
+        LOG_SHADER_TIMING("Pipeline built in one piece after its parts: {:.1f} ms on core {}",
+                          ShaderTiming::MsSince(create_start), ShaderTiming::CurrentCore());
+        parts->last_optimized_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           ShaderTiming::Clock::now().time_since_epoch())
+                                           .count(),
+                                       std::memory_order_relaxed);
+        parts->optimized_unsaved.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    if (!fail_on_compile_required) {
+        // Pipelines of the disk cache are built before any draw asks for them
+        [[maybe_unused]] const bool asked = first_asked != ShaderTiming::Clock::time_point{};
+        LOG_SHADER_TIMING(
+            "Pipeline built: driver {:.1f} ms, shaders awaited {:.1f} ms, {} on core {}, queued "
+            "{:.1f} ms before, first draw {:.1f} ms before, {} draws left out, stages {}, driver "
+            "says {:.1f} ms: {:.1f} {:.1f} {:.1f}{}",
+            ShaderTiming::MsSince(create_start), shader_wait_ms,
+            for_waiting_draw ? "by the waiting draw" : "by a worker", ShaderTiming::CurrentCore(),
+            ShaderTiming::MsBetween(queued, build_start),
+            asked ? ShaderTiming::MsBetween(first_asked, build_start) : -1.0,
+            draws_left_out.load(std::memory_order_relaxed), shader_count,
+            whole_feedback.duration / 1e6, stage_feedbacks[0].duration / 1e6,
+            stage_feedbacks[1].duration / 1e6, stage_feedbacks[2].duration / 1e6,
+            from_parts    ? " (from parts)"
+            : found_whole ? " (found whole)"
+                          : "");
     }
 
     MarkDone();
+    if (from_parts && parts->optimizer &&
+        !(Common::TraceMarkers::Experiments2() & Common::TraceMarkers::KeepPipelinesFromParts)) {
+        parts->optimizer->QueueWork([this] { Build(false, false, true); });
+    }
     return true;
 }
 

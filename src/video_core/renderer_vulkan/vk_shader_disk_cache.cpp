@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_disk_cache.h"
+#include "video_core/renderer_vulkan/vk_shader_timing.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/shader/generator/glsl_fs_shader_gen.h"
 #include "video_core/shader/generator/glsl_shader_gen.h"
@@ -115,8 +116,11 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
 
         ExtraVSConfig extra_config = parent.CalcExtraConfig(config);
 
+        [[maybe_unused]] const auto generate_start = ShaderTiming::Clock::now();
         auto program =
             Common::HashableString(GLSL::GenerateVertexShader(setup, config, extra_config));
+        LOG_SHADER_TIMING("VS generated: {:.2f} ms on the emulation thread, {} characters",
+                          ShaderTiming::MsSince(generate_start), std::string_view{program}.size());
 
         if (program.empty()) {
             LOG_ERROR(Render_Vulkan, "Failed to retrieve programmable vertex shader");
@@ -138,11 +142,14 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
 
             shader.program = std::move(program);
             const vk::Device device = parent.instance.GetDevice();
-            parent.shader_workers.QueueWork([device, &shader, this, spirv_id, variant] {
+            parent.shader_workers.QueueWork([device, &shader, this, spirv_id, variant,
+                                             queued = ShaderTiming::Clock::now()] {
                 CITRA_TRACE_SCOPE("Vulkan::CompileVS");
                 CITRA_HITCH_SCOPE(ShaderCompile);
                 CITRA_TRACE_COUNT(ShaderCompiles);
+                [[maybe_unused]] const auto compile_start = ShaderTiming::Clock::now();
                 auto spirv = CompileGLSL(shader.program, vk::ShaderStageFlagBits::eVertex);
+                [[maybe_unused]] const auto module_start = ShaderTiming::Clock::now();
 #ifdef CITRA_ENABLE_TRACE_MARKERS
                 if (variant & Common::TraceMarkers::DumpShaders) {
                     const std::string_view source{shader.program};
@@ -157,6 +164,11 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVer
                 }
                 shader.program.clear();
                 shader.module = CompileSPV(spirv, device);
+                LOG_SHADER_TIMING("VS compiled: glslang {:.1f} ms, module {:.2f} ms, on core {}, "
+                                  "queued {:.1f} ms before",
+                                  ShaderTiming::MsBetween(compile_start, module_start),
+                                  ShaderTiming::MsSince(module_start), ShaderTiming::CurrentCore(),
+                                  ShaderTiming::MsBetween(queued, compile_start));
                 shader.MarkDone();
             });
         }
@@ -282,11 +294,12 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
     if (new_shader) {
         LOG_NEW_OBJECT(Render_Vulkan, "New FS config {:016X}", fs_config_hash);
 
-        parent.shader_workers.QueueWork([fs_config, user, this, &shader, fs_config_hash,
-                                         variant]() {
+        parent.shader_workers.QueueWork([fs_config, user, this, &shader, fs_config_hash, variant,
+                                         queued = ShaderTiming::Clock::now()]() {
             CITRA_TRACE_SCOPE("Vulkan::CompileFS");
             CITRA_HITCH_SCOPE(ShaderCompile);
             CITRA_TRACE_COUNT(ShaderCompiles);
+            [[maybe_unused]] const auto compile_start = ShaderTiming::Clock::now();
             std::vector<u32> spirv;
             const bool use_spirv = parent.profile.vk_use_spirv_generator;
             if (use_spirv && !fs_config.UsesSpirvIncompatibleConfig()) {
@@ -303,6 +316,14 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
                 spirv = CompileGLSL(code, vk::ShaderStageFlagBits::eFragment);
                 shader.module = CompileSPV(spirv, parent.instance.GetDevice());
             }
+            LOG_SHADER_TIMING("FS compiled: {:.1f} ms ({}), {} words, on core {}, queued {:.1f} "
+                              "ms before",
+                              ShaderTiming::MsSince(compile_start),
+                              use_spirv && !fs_config.UsesSpirvIncompatibleConfig()
+                                  ? "generated as SPIR-V"
+                                  : "through GLSL",
+                              spirv.size(), ShaderTiming::CurrentCore(),
+                              ShaderTiming::MsBetween(queued, compile_start));
             shader.MarkDone();
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS
@@ -396,7 +417,7 @@ GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
         }
         it.value() = std::make_unique<GraphicsPipeline>(
             parent.instance, parent.renderpass_cache, info, *parent.driver_pipeline_cache,
-            *parent.pipeline_layout, parent.current_shaders, &parent.pipeline_workers);
+            *parent.pipeline_layout, parent.current_shaders, &parent.pipeline_workers, Parts());
     }
 
     if (known_graphic_pipelines.emplace(hash).second) {
@@ -412,6 +433,27 @@ GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
     }
 
     return it.value().get();
+}
+
+PipelineParts* ShaderDiskCache::Parts() {
+    const bool in_one_piece =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MonolithicPipelines) != 0;
+    pipeline_parts.optimizer = &parent.pipeline_optimizer;
+    return parent.instance.IsGraphicsPipelineLibrarySupported() && !in_one_piece ? &pipeline_parts
+                                                                                 : nullptr;
+}
+
+u32 ShaderDiskCache::TakeOptimizedPipelines(s64 quiet_ms) {
+    if (pipeline_parts.optimized_unsaved.load(std::memory_order_relaxed) == 0) [[likely]] {
+        return 0;
+    }
+    const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    if (now_ms - pipeline_parts.last_optimized_ms.load(std::memory_order_relaxed) < quiet_ms) {
+        return 0;
+    }
+    return pipeline_parts.optimized_unsaved.exchange(0, std::memory_order_relaxed);
 }
 
 void ShaderDiskCache::WaitLoadCachedPipelines() {
@@ -1517,6 +1559,12 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
     size_t current_callback_index = 0;
     size_t tot_callback_index = tot_entries - 1;
 
+    // For the log of profiling builds: how many of the pipelines are there only because of
+    // state that a driver could be given while drawing
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    std::unordered_set<u64> vertex_ids, fragment_ids, by_shaders, by_targets, by_layout, by_blend;
+#endif
+
     // There is only one entry type in the pipeline info cache,
     // no need to keep track of anything.
     for (int i = 1; i < tot_entries; i++) {
@@ -1549,6 +1597,23 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
 
             known_graphic_pipelines.emplace(curr.Id());
             auto pl_hash_opt = entry->pl_info.OptimizedHash(parent.instance);
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+            {
+                const StaticPipelineInfo& state = entry->pl_info;
+                const u64 shaders = Common::HashCombine(state.shader_ids[0], state.shader_ids[1],
+                                                        state.shader_ids[2]);
+                const u64 targets =
+                    Common::HashCombine(shaders, Common::ComputeStructHash64(state.attachments));
+                vertex_ids.insert(state.shader_ids[0]);
+                fragment_ids.insert(state.shader_ids[1]);
+                by_shaders.insert(shaders);
+                by_targets.insert(targets);
+                by_layout.insert(
+                    Common::HashCombine(targets, Common::ComputeStructHash64(state.vertex_layout)));
+                by_blend.insert(
+                    Common::HashCombine(targets, Common::ComputeStructHash64(state.blending)));
+            }
+#endif
 
             if (graphics_pipelines.find(pl_hash_opt) != graphics_pipelines.end()) {
                 // Multiple entries can have the same optimized hash. Skip if that's the case.
@@ -1609,10 +1674,10 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
             auto [it_pl, _] = graphics_pipelines.try_emplace(pl_hash_opt);
             it_pl.value() = std::make_unique<GraphicsPipeline>(
                 parent.instance, parent.renderpass_cache, info, *parent.driver_pipeline_cache,
-                *parent.pipeline_layout, shaders, &parent.pipeline_workers);
+                *parent.pipeline_layout, shaders, &parent.pipeline_workers, Parts());
 
             // The cached shaders are compiled above, so a pipeline that is not built yet was queued
-            if (!it_pl.value()->TryBuild(false)) {
+            if (!it_pl.value()->TryBuild(false, false)) {
                 loaded_cached_pipelines.push_back(it_pl.value().get());
             }
 
@@ -1622,6 +1687,13 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
             MALFORMED_DISK_CACHE;
         }
     }
+
+    LOG_SHADER_TIMING("Cached pipelines: {} entries, {} pipelines, from {} vertex and {} "
+                      "fragment shaders in {} combinations; {} with their render targets, {} "
+                      "with the vertex layout as well, {} with the blending instead",
+                      known_graphic_pipelines.size(), graphics_pipelines.size(), vertex_ids.size(),
+                      fragment_ids.size(), by_shaders.size(), by_targets.size(), by_layout.size(),
+                      by_blend.size());
 
     // Switch to append mode to receive new entries.
     return pl_cache.SwitchMode(CacheFile::CacheOpMode::APPEND);

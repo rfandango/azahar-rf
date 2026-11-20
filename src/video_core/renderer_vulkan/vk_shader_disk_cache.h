@@ -359,9 +359,22 @@ private:
     std::unordered_map<size_t, Shader> fixed_geometry_shaders;
     std::unordered_set<u64> known_geometry_shaders;
 
+    /// The parts the pipelines below are put together from, where the driver can do that. They
+    /// are told apart by the addresses of the shaders above, among other things, and have to
+    /// outlive the pipelines.
+    PipelineParts pipeline_parts;
     tsl::robin_map<u64, std::unique_ptr<GraphicsPipeline>, Common::IdentityHash<u64>>
         graphics_pipelines;
     std::unordered_set<u64> known_graphic_pipelines;
+    /// Returns the parts to build pipelines from, or nothing if they are built in one piece
+    PipelineParts* Parts();
+
+public:
+    /// Pipelines built in one piece in the background since the driver's cache was stored,
+    /// if the last of them is `quiet_ms` back or more; none otherwise. Counted anew after.
+    u32 TakeOptimizedPipelines(s64 quiet_ms);
+
+private:
     std::vector<GraphicsPipeline*> loaded_cached_pipelines;
 };
 

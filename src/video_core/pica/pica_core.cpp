@@ -77,7 +77,8 @@ static_assert(sizeof(CommandHeader) == sizeof(u32), "CommandHeader has incorrect
 PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> debug_context_)
     : memory{memory_}, debug_context{std::move(debug_context_)},
       geometry_pipeline{regs.internal, gs_unit, gs_setup},
-      shader_engine{CreateEngine(Settings::values.use_shader_jit.GetValue())} {
+      shader_engine{CreateEngine(Settings::values.use_shader_jit.GetValue())},
+      few_vertices_engine{CreateEngine(false)} {
     InitializeRegs();
     dirty_regs.SetAllDirty();
 
@@ -1244,6 +1245,70 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }
 }
 
+ShaderEngine& PicaCore::EngineForFewVertices() {
+    if (shader_engine->SetupBatchIfReady(vs_setup, regs.internal.vs.main_offset)) {
+        return *shader_engine;
+    }
+    few_vertices_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+    return *few_vertices_engine;
+}
+
+float PicaCore::SmallDrawViewportShare(bool is_indexed) {
+    const auto& pipeline = regs.internal.pipeline;
+    const u32 count = pipeline.num_vertices;
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || !primitive_assembler.IsEmpty() ||
+        count == 0 || count > 6) {
+        return 1.f;
+    }
+
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const u8* index_address_8 = memory.GetPhysicalPointer(base_address + index_info.offset);
+    if (is_indexed && index_address_8 == nullptr) {
+        return 1.f;
+    }
+    const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+    const bool index_u16 = index_info.format != 0;
+
+    const VertexLoader loader(memory, pipeline);
+    ShaderUnit shader_unit;
+    ShaderEngine& engine = EngineForFewVertices();
+
+    // The box around the vertices, cut to the viewport, which goes from -1 to 1 both ways
+    f32 left = 1.f;
+    f32 right = -1.f;
+    f32 bottom = 1.f;
+    f32 top = -1.f;
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        shader_unit.LoadInput(regs.internal.vs, input);
+        engine.Run(vs_setup, shader_unit);
+        AttributeBuffer output;
+        shader_unit.WriteOutput(regs.internal.vs, output);
+        const OutputVertex shaded{regs.internal.rasterizer, output};
+
+        // A triangle with a vertex behind the eye can reach anywhere
+        const f32 w = shaded.pos.w.ToFloat32();
+        const f32 x = shaded.pos.x.ToFloat32() / w;
+        const f32 y = shaded.pos.y.ToFloat32() / w;
+        if (!(w > 0.f) || !std::isfinite(x) || !std::isfinite(y)) {
+            return 1.f;
+        }
+        left = std::min(left, std::clamp(x, -1.f, 1.f));
+        right = std::max(right, std::clamp(x, -1.f, 1.f));
+        bottom = std::min(bottom, std::clamp(y, -1.f, 1.f));
+        top = std::max(top, std::clamp(y, -1.f, 1.f));
+    }
+    if (!(right > left && top > bottom)) {
+        return 0.f;
+    }
+    return (right - left) * (top - bottom) / 4.f;
+}
+
 bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
     using Topology = PipelineRegs::TriangleTopology;
     const auto& pipeline = regs.internal.pipeline;
@@ -1268,7 +1333,7 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
 
     const VertexLoader loader(memory, pipeline);
     ShaderUnit shader_unit;
-    shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+    ShaderEngine& engine = EngineForFewVertices();
 
     // A full-screen pass is often drawn a fraction of a pixel off the viewport. It replaces
     // what the target holds as long as its triangles cover the centre of every pixel, which
@@ -1298,7 +1363,7 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
         AttributeBuffer input;
         loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
         shader_unit.LoadInput(regs.internal.vs, input);
-        shader_engine->Run(vs_setup, shader_unit);
+        engine.Run(vs_setup, shader_unit);
         AttributeBuffer output;
         shader_unit.WriteOutput(regs.internal.vs, output);
         const OutputVertex shaded{regs.internal.rasterizer, output};
@@ -1462,7 +1527,15 @@ void PicaCore::LoadVertices(bool is_indexed) {
     // Compile the vertex shader for this batch.
     ShaderUnit shader_unit;
     AttributeBuffer vs_output;
-    shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+    // A batch of a few hundred vertices is interpreted in less time than the recompiler
+    // takes for a shader it has not seen, so it does not wait for it
+    constexpr u32 FEW_VERTICES = 512;
+    ShaderEngine* engine = shader_engine.get();
+    if (pipeline.num_vertices <= FEW_VERTICES && pipeline.use_gs == PipelineRegs::UseGS::No) {
+        engine = &EngineForFewVertices();
+    } else {
+        shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+    }
 
     // Setup geometry pipeline in case we are using a geometry shader.
     geometry_pipeline.Reconfigure();
@@ -1504,7 +1577,7 @@ void PicaCore::LoadVertices(bool is_indexed) {
 
             // Invoke the vertex shader for this vertex.
             shader_unit.LoadInput(regs.internal.vs, input);
-            shader_engine->Run(vs_setup, shader_unit);
+            engine->Run(vs_setup, shader_unit);
             shader_unit.WriteOutput(regs.internal.vs, vs_output);
 
             // Cache the vertex when doing indexed rendering.

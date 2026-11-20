@@ -23,6 +23,16 @@ public:
     virtual void SetupBatch(ShaderSetup& setup, u32 entry_point) = 0;
 
     /**
+     * As SetupBatch, for a batch too small to be worth holding the caller up for. Returns false
+     * if the engine does not have the shader ready: it then gets it ready in the background,
+     * and the caller runs this batch with another engine.
+     */
+    virtual bool SetupBatchIfReady(ShaderSetup& setup, u32 entry_point) {
+        SetupBatch(setup, entry_point);
+        return true;
+    }
+
+    /**
      * Runs the currently setup shader.
      *
      * @param setup Shader engine state, must be setup with SetupBatch on each shader change.

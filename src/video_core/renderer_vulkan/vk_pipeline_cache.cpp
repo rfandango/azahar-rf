@@ -4,6 +4,11 @@
 
 #include <boost/container/static_vector.hpp>
 
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
 #include "common/common_paths.h"
 #include "common/file_util.h"
 #include "common/hitch_tracker.h"
@@ -91,6 +96,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       num_worker_threads{std::max(std::thread::hardware_concurrency(), 2U) / 2},
       pipeline_workers{num_worker_threads, "Pipeline workers"},
       shader_workers{num_worker_threads, "Shader workers"},
+      pipeline_optimizer{1, "Pipeline optimizer"},
       descriptor_heaps{
           DescriptorHeap{instance, scheduler.GetMasterSemaphore(), BUFFER_BINDINGS, 32},
           DescriptorHeap{instance, scheduler.GetMasterSemaphore(), TEXTURE_BINDINGS<1>},
@@ -99,6 +105,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
           instance, vk::ShaderStageFlagBits::eVertex,
           GLSL::GenerateTrivialVertexShader(instance.IsShaderClipDistanceSupported(), true)} {
     scheduler.RegisterOnDispatch([this] { update_queue.Flush(); });
+    // Nothing waits for what the optimizer builds, so it gives way to everything else. It is
+    // one thread, which this therefore runs on.
+    pipeline_optimizer.QueueWork([] {
+#ifdef __ANDROID__
+        setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 10);
+#endif
+    });
     profile = Pica::Shader::Profile{
         .enable_accurate_mul = false,
         .has_separable_shaders = true,
@@ -150,6 +163,7 @@ void PipelineCache::BuildLayout() {
 
 PipelineCache::~PipelineCache() {
     pipeline_workers.WaitForRequests();
+    pipeline_optimizer.WaitForRequests();
     shader_workers.WaitForRequests();
     SaveDriverPipelineDiskCache();
 }
@@ -360,6 +374,13 @@ void PipelineCache::NoteNewPipeline() {
 
 void PipelineCache::SaveDriverPipelineDiskCacheWhenDue() {
     if (unsaved_pipelines == 0) [[likely]] {
+        // What the optimizer built since, once it has been done for a while
+        if (const u32 optimized = curr_disk_cache->TakeOptimizedPipelines(10000)) [[unlikely]] {
+            LOG_INFO(Render_Vulkan,
+                     "Storing the driver's pipeline cache with {} pipelines built in one piece",
+                     optimized);
+            pipeline_workers.QueueWork([this] { SaveDriverPipelineDiskCache(); });
+        }
         return;
     }
     // New pipelines come in groups, with a new scene or effect. Some time after the first, the
@@ -415,6 +436,12 @@ void PipelineCache::SwitchDiskCache(u64 title_id, const std::atomic_bool& stop_l
         return static_cast<u32>(tid >> 32) == APPLET_TID_HIGH;
     };
 
+    // Caches are dropped below, and with them their pipelines, which the workers may still
+    // have on their lists: built in one piece after their parts, a pipeline is on the
+    // optimizer's for seconds
+    pipeline_workers.WaitForRequests();
+    pipeline_optimizer.WaitForRequests();
+
     bool prev_applet = curr_disk_cache ? is_applet(curr_disk_cache->GetProgramID()) : false;
     bool new_applet = is_applet(disk_caches[new_pos]->GetProgramID());
     curr_disk_cache = disk_caches[new_pos];
@@ -442,7 +469,7 @@ void PipelineCache::SwitchDiskCache(u64 title_id, const std::atomic_bool& stop_l
     }
 }
 
-bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
+bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, u32 vertices) {
     MICROPROFILE_SCOPE(Vulkan_Bind);
 
     for (u32 i = 0; i < MAX_SHADER_STAGES; i++) {
@@ -457,7 +484,7 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
 
     const bool is_dirty = scheduler.IsStateDirty(StateFlags::Pipeline);
     const bool pipeline_dirty = (current_pipeline != pipeline) || is_dirty;
-    scheduler.Record([this, is_dirty, pipeline_dirty, pipeline,
+    scheduler.Record([this, is_dirty, pipeline_dirty, pipeline, vertices,
                       current_dynamic = current_info.dynamic_info, dynamic = info.dynamic_info,
                       descriptor_sets = bound_descriptor_sets, offsets = offsets,
                       current_rasterization = current_info.state.rasterization,
@@ -565,12 +592,14 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
                 CITRA_TRACE_SCOPE("Vulkan::WaitPipeline");
                 CITRA_HITCH_SCOPE_ANY_THREAD(ShaderCompile);
                 const auto start = std::chrono::steady_clock::now();
-                pipeline->BuildNowOrWait();
+                const bool built_here = pipeline->BuildNowOrWait();
                 const std::chrono::duration<double, std::milli> waited =
                     std::chrono::steady_clock::now() - start;
                 if (waited.count() >= 4.0) {
-                    LOG_INFO(Render_Vulkan, "A draw waited {:.1f} ms for its pipeline",
-                             waited.count());
+                    LOG_INFO(Render_Vulkan,
+                             "A draw of {} vertices waited {:.1f} ms for its pipeline ({})",
+                             vertices, waited.count(),
+                             built_here ? "built on the render thread" : "a worker had it");
                 }
             }
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());

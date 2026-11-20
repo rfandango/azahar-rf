@@ -109,6 +109,21 @@ enum Experiment2 : std::uint32_t {
     /// The audio device is closed and opened again each time settings are applied anew, as
     /// before
     LegacySinkReload = 16,
+    /// Vulkan: a pipeline is built in one piece, its shader stages compiled together, as
+    /// before, also where the driver can build the stages one by one and keep each. Read
+    /// when a pipeline is first asked for.
+    MonolithicPipelines = 32,
+    /// Vulkan, with shaders compiled in the background: every draw of two triangles at the
+    /// most holds the render thread up until its pipeline is built, as before
+    LegacySmallDrawWait = 64,
+    /// Vulkan: a pipeline put together from separately built stages is drawn with for
+    /// good; it is not built in one piece afterwards. On an Adreno 650 with Turnip the GPU
+    /// hung in two of eight runs of ninety seconds that way, so this is for looking into
+    /// that hang. Read when a pipeline is built.
+    KeepPipelinesFromParts = 128,
+    /// Vulkan: a pipeline whose shaders are still being compiled is not queued for building
+    /// until a later draw asks for it again, as before
+    LegacyPipelineQueueing = 256,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as

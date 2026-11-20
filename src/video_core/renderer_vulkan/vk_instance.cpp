@@ -406,12 +406,14 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceRobustness2FeaturesEXT,
         vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT,
         vk::PhysicalDevicePipelineCreationCacheControlFeaturesEXT,
-        vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
+        vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
     const vk::StructureChain properties_chain =
         physical_device
             .getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDriverProperties,
                             vk::PhysicalDevicePortabilitySubsetPropertiesKHR,
-                            vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
+                            vk::PhysicalDeviceExternalMemoryHostPropertiesEXT,
+                            vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>();
     const vk::PhysicalDeviceDriverProperties driver =
         properties_chain.get<vk::PhysicalDeviceDriverProperties>();
 
@@ -424,7 +426,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 16> enabled_extensions;
+    boost::container::static_vector<const char*, 24> enabled_extensions;
     const auto add_extension = [&](std::string_view extension, bool blacklist = false,
                                    std::string_view reason = "") -> bool {
         const auto result =
@@ -510,6 +512,22 @@ bool Instance::CreateDevice() {
     const bool has_fragment_shader_barycentric =
         add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, is_moltenvk,
                       "the PerVertexKHR attribute is not supported by MoltenVK");
+    // Pipelines put together from parts the driver builds and keeps one by one: a vertex
+    // shader is then compiled once, not again for every fragment shader it is drawn with.
+    // Only where putting the parts together takes no compiling, and so far only tried with
+    // Turnip.
+    const bool has_graphics_pipeline_library =
+        is_turnip &&
+        feature_chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
+            .graphicsPipelineLibrary &&
+        properties_chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>()
+            .graphicsPipelineLibraryFastLinking &&
+        add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+        add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    // For the timing log of pipeline builds: what the driver spent on each shader stage
+    pipeline_creation_feedback = add_extension(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+#endif
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -576,6 +594,7 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT{},
         vk::PhysicalDevicePipelineCreationCacheControlFeaturesEXT{},
         vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR{},
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{},
     };
 
 #define PROP_GET(structName, prop, property) property = properties_chain.get<structName>().prop;
@@ -659,6 +678,13 @@ bool Instance::CreateDevice() {
                  fragment_shader_barycentric)
     } else {
         device_chain.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
+    }
+
+    if (has_graphics_pipeline_library) {
+        FEAT_SET(vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT, graphicsPipelineLibrary,
+                 graphics_pipeline_library)
+    } else {
+        device_chain.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
     }
 
 #undef PROP_GET
