@@ -3,11 +3,13 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cmath>
 #include <random>
 #include <tuple>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
+#include "common/trace_markers.h"
 #include "core/core_timing.h"
 
 namespace Core {
@@ -46,13 +48,100 @@ s64 Timing::GenerateBaseTicks() {
 void Timing::UpdateClockSpeed(u32 cpu_clock_percentage) {
     clock_percentage = cpu_clock_percentage;
     for (auto& timer : timers) {
-        timer->cpu_clock_scale = 100.0 / (clock_percentage * processor_clock_multiplier);
+        timer->cpu_clock_scale = 100.0 / (clock_percentage * processor_clock_granted);
     }
 }
 
 void Timing::SetProcessorClockMultiplier(u32 multiplier) {
     processor_clock_multiplier = std::max<u32>(multiplier, 1);
+    processor_clock_granted = processor_clock_multiplier;
+    processor_clock_logged = processor_clock_granted;
+    clock_governor = {};
     UpdateClockSpeed(clock_percentage);
+}
+
+void Timing::GovernProcessorClock(std::chrono::microseconds emulated,
+                                  std::chrono::microseconds host_work, double speed_limit) {
+    if (processor_clock_multiplier <= 1) {
+        return;
+    }
+    const double asked = processor_clock_multiplier;
+    double granted = processor_clock_granted;
+    if (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::FixedProcessorClock)
+        [[unlikely]] {
+        granted = asked;
+        clock_governor = {};
+    } else {
+        // A pause or a state being loaded says nothing about what the host can do
+        constexpr std::chrono::milliseconds NOT_A_MEASURE{250};
+        if (emulated <= std::chrono::microseconds::zero() || host_work > NOT_A_MEASURE ||
+            speed_limit <= 0.0) {
+            clock_governor = {};
+            return;
+        }
+        // Decided anew every sixth of an emulated second
+        constexpr u32 STRETCH_VBLANKS = 10;
+        clock_governor.emulated_us += emulated.count();
+        clock_governor.work_us += host_work.count();
+        if (++clock_governor.vblanks < STRETCH_VBLANKS) {
+            return;
+        }
+
+        // The share of the stretch in which the busiest emulated core ran the title's code
+        double busiest = 0.0;
+        const std::size_t cores = std::min(timers.size(), clock_governor.ticks.size());
+        for (std::size_t core = 0; core < cores; core++) {
+            const u64 ticks = timers[core]->GetTicks();
+            const u64 idle_ticks = timers[core]->GetIdleTicks();
+            const u64 passed = ticks - clock_governor.ticks[core];
+            const u64 idled = idle_ticks - clock_governor.idle_ticks[core];
+            if (clock_governor.has_baseline && passed > 0) {
+                busiest = std::max(busiest, 1.0 - static_cast<double>(idled) / passed);
+            }
+            clock_governor.ticks[core] = ticks;
+            clock_governor.idle_ticks[core] = idle_ticks;
+        }
+        // The host's work for the stretch against the real time the stretch may take
+        const double load = static_cast<double>(clock_governor.work_us) * speed_limit /
+                            static_cast<double>(clock_governor.emulated_us);
+        const bool measured = clock_governor.has_baseline;
+        clock_governor.vblanks = 0;
+        clock_governor.emulated_us = 0;
+        clock_governor.work_us = 0;
+        clock_governor.has_baseline = true;
+        if (!measured) {
+            return;
+        }
+
+        // Less is given only to a title that uses all it gets, where the host's work goes with
+        // what is given, and then as much less as the work is too much, with a margin. More
+        // is given again while the host has room, a step at a time and no further than the
+        // same margin. Not all of the host's work goes with what is given, so either way it
+        // ends up between the two marks, where nothing is changed.
+        constexpr double TOO_MUCH = 0.93;
+        constexpr double AIM = 0.85;
+        constexpr double ROOM = 0.80;
+        constexpr double ALL_OF_IT = 0.9;
+        constexpr double STEP_UP = 1.1;
+        if (load > TOO_MUCH && busiest > ALL_OF_IT) {
+            granted = std::clamp(granted * AIM / load, 1.0, asked);
+        } else if (load < ROOM && granted < asked) {
+            granted = std::min(asked, granted * std::min(STEP_UP, AIM / std::max(load, 0.01)));
+        }
+    }
+    if (granted == processor_clock_granted) {
+        return;
+    }
+    processor_clock_granted = granted;
+    UpdateClockSpeed(clock_percentage);
+    // Said when it has moved by a good part, and when it is back to all that was asked for
+    if (std::abs(granted - processor_clock_logged) >= 0.25 ||
+        (granted == asked && processor_clock_logged != asked)) {
+        processor_clock_logged = granted;
+        LOG_INFO(Core_Timing,
+                 "Processor clock: {:.0f} MHz of the {:.0f} MHz asked for is what the host manages",
+                 268.0 * granted, 268.0 * asked);
+    }
 }
 
 TimingEventType* Timing::RegisterEvent(const std::string& name, TimedCallback callback) {

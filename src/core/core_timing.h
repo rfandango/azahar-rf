@@ -17,6 +17,7 @@
  *   ScheduleEvent(periodInCycles - cyclesLate, callback, "whatever")
  */
 
+#include <array>
 #include <chrono>
 #include <functional>
 #include <limits>
@@ -290,6 +291,22 @@ public:
      */
     void SetProcessorClockMultiplier(u32 multiplier);
 
+    /**
+     * Fits the processor clock of a title that asked for more than the Old 3DS's to what the
+     * host can deliver. Called once per VBlank with the emulated time that passed since the
+     * call before, how long the host worked for it, and the speed the emulation is held to
+     * (1 for real time).
+     *
+     * A title gets three times the instructions per VBlank at 804 MHz. One that uses them all
+     * whatever it is given (a thread that never sleeps, as while Monster Hunter 4 Ultimate
+     * plays its opening video) costs the host three times the work too, and where the host
+     * does not have that, everything ran slow: video at half speed, sound stretched. Such a
+     * title is given what the host manages in real time instead, never less than the Old
+     * 3DS's clock, and all of it again as soon as there is room.
+     */
+    void GovernProcessorClock(std::chrono::microseconds emulated,
+                              std::chrono::microseconds host_work, double speed_limit);
+
     std::chrono::microseconds GetGlobalTimeUs() const;
 
     std::shared_ptr<Timer> GetTimer(std::size_t cpu_id);
@@ -314,6 +331,22 @@ private:
     // a setting and the second follows from the state of the kernel.
     u32 clock_percentage = 100;
     u32 processor_clock_multiplier = 1;
+
+    /// What of processor_clock_multiplier the title is given at the moment, and what
+    /// GovernProcessorClock has gathered to decide on it: the VBlanks of the stretch it is
+    /// looking at, the emulated time and the host's work in them, and where the ticks and
+    /// the idle ticks of each core stood when the stretch began
+    double processor_clock_granted = 1.0;
+    double processor_clock_logged = 1.0;
+    struct ClockGovernor {
+        u32 vblanks = 0;
+        s64 emulated_us = 0;
+        s64 work_us = 0;
+        bool has_baseline = false;
+        std::array<u64, 4> ticks{};
+        std::array<u64, 4> idle_ticks{};
+    };
+    ClockGovernor clock_governor;
 
     // When true, the event queue can't be modified. Used while deserializing to workaround
     // destructor side effects.

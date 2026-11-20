@@ -194,6 +194,15 @@ public:
 
     void DoFrameLimiting(std::chrono::microseconds current_system_time_us);
 
+    /// The emulated time between the last two calls of DoFrameLimiting, and how long the
+    /// host worked for it (the limiter's own waiting left out)
+    std::chrono::microseconds LastIntervalEmulated() const {
+        return last_interval_emulated;
+    }
+    std::chrono::microseconds LastIntervalWork() const {
+        return last_interval_work;
+    }
+
     bool IsFrameAdvancing() const;
     /**
      * Sets whether frame advancing is enabled or not.
@@ -249,6 +258,8 @@ private:
 
     /// Accumulated difference between walltime and emulated time
     std::chrono::microseconds frame_limiting_delta_err{0};
+    std::chrono::microseconds last_interval_emulated{0};
+    std::chrono::microseconds last_interval_work{0};
 
     /// Whether to use frame advancing (i.e. frame by frame)
     std::atomic_bool frame_advancing_enabled;

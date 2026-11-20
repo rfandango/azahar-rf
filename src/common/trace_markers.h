@@ -124,6 +124,9 @@ enum Experiment2 : std::uint32_t {
     /// Vulkan: a pipeline whose shaders are still being compiled is not queued for building
     /// until a later draw asks for it again, as before
     LegacyPipelineQueueing = 256,
+    /// A title that asks for the New 3DS's 804 MHz processor clock gets all of that emulated
+    /// CPU time whether the host can deliver it in real time or not, as before
+    FixedProcessorClock = 512,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as

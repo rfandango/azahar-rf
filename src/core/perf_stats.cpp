@@ -267,6 +267,8 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
     }
 
     auto now = Clock::now();
+    last_interval_emulated = current_system_time_us - previous_system_time_us;
+    last_interval_work = duration_cast<microseconds>(now - previous_walltime);
     double sleep_scale =
         Settings::GetFrameLimit() / 100.0 * pacing_scale.load(std::memory_order_relaxed);
 

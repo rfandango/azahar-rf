@@ -124,6 +124,9 @@ void RendererBase::EndFrame() {
         CITRA_HITCH_SCOPE_ABSORB(Limiter);
         system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
     }
+    system.CoreTiming().GovernProcessorClock(system.frame_limiter.LastIntervalEmulated(),
+                                             system.frame_limiter.LastIntervalWork(),
+                                             Settings::GetFrameLimit() / 100.0);
 
     // On fast enough devices, the time limiter sleep spans most of the 16ms period
     // between VBlank events. If an input event lands in that period, then the change
