@@ -2,11 +2,14 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <mutex>
 #include <string>
 #include <utility>
 #include "common/hitch_tracker.h"
+#include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/thread.h"
 #include "common/trace_markers.h"
@@ -38,6 +41,105 @@ std::unique_ptr<MasterSemaphore> MakeMasterSemaphore(const Instance& instance) {
 
 } // Anonymous namespace
 
+GpuTimeMeter::GpuTimeMeter(const Instance& instance_) : instance{instance_} {
+    const vk::PhysicalDevice physical_device = instance.GetPhysicalDevice();
+    const auto families = physical_device.getQueueFamilyProperties();
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const u32 valid_bits = family < families.size() ? families[family].timestampValidBits : 0;
+    if (valid_bits == 0) {
+        return;
+    }
+    valid_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
+    tick_ns = physical_device.getProperties().limits.timestampPeriod;
+    const vk::QueryPoolCreateInfo pool_info = {
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = SLOTS * 2,
+    };
+    try {
+        pool = instance.GetDevice().createQueryPoolUnique(pool_info);
+    } catch (const vk::SystemError& err) {
+        LOG_WARNING(Render_Vulkan, "No timestamp queries, GPU time is not measured: {}",
+                    err.what());
+    }
+}
+
+GpuTimeMeter::~GpuTimeMeter() = default;
+
+void GpuTimeMeter::Begin(vk::CommandBuffer cmdbuf) {
+    slot_open = false;
+    if (!pool || !enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    {
+        // Slots are handed out and collected in the same order, so with one to spare the
+        // next one is not among those still waiting
+        std::scoped_lock lock{mutex};
+        if (pending.size() >= SLOTS - 1) {
+            return;
+        }
+    }
+    open_slot = next_slot;
+    next_slot = (next_slot + 1) % SLOTS;
+    slot_open = true;
+    cmdbuf.resetQueryPool(*pool, open_slot * 2, 2);
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *pool, open_slot * 2);
+}
+
+void GpuTimeMeter::End(vk::CommandBuffer cmdbuf, u64 tick) {
+    if (!slot_open) {
+        return;
+    }
+    slot_open = false;
+    // At the bottom of the pipe: when what was recorded before it is done, not when the GPU
+    // has read as far as this
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *pool, open_slot * 2 + 1);
+    std::scoped_lock lock{mutex};
+    pending.push_back(Pending{.slot = open_slot, .tick = tick});
+}
+
+std::chrono::nanoseconds GpuTimeMeter::Collect(u64 finished_tick) {
+    u64 busy = 0;
+    while (true) {
+        Pending entry;
+        {
+            std::scoped_lock lock{mutex};
+            if (pending.empty() || pending.front().tick > finished_tick) {
+                break;
+            }
+            entry = pending.front();
+        }
+        // The entry stays in the queue while its slot is read, which keeps the slot from
+        // being handed out again
+        std::array<u64, 2> stamps{};
+        const vk::Result result = instance.GetDevice().getQueryPoolResults(
+            *pool, entry.slot * 2, 2, sizeof(stamps), stamps.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        {
+            std::scoped_lock lock{mutex};
+            pending.pop_front();
+        }
+        if (result != vk::Result::eSuccess) {
+            continue;
+        }
+        const u64 begin = stamps[0] & valid_mask;
+        const u64 end = stamps[1] & valid_mask;
+        if (end < last_end) {
+            // Submissions end in the order they were made, so the GPU's counter started
+            // again: some devices stop it when the GPU is powered down between frames that
+            // come far apart
+            last_end = 0;
+        }
+        // The GPU may have read the start of a submission while it still worked on the one
+        // before
+        const u64 start = std::max(begin, last_end);
+        if (end > start) {
+            busy += end - start;
+        }
+        last_end = std::max(last_end, end);
+    }
+    return std::chrono::nanoseconds{static_cast<s64>(static_cast<double>(busy) * tick_ns)};
+}
+
 void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf) {
     auto command = first;
     while (command != nullptr) {
@@ -54,7 +156,7 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf) {
 
 Scheduler::Scheduler(const Instance& instance)
     : master_semaphore{MakeMasterSemaphore(instance)},
-      command_pool{instance, master_semaphore.get()}, use_worker_thread{true} {
+      command_pool{instance, master_semaphore.get()}, gpu_time{instance}, use_worker_thread{true} {
     AllocateWorkerCommandBuffers();
     if (use_worker_thread) {
         AcquireNewChunk();
@@ -119,6 +221,17 @@ void Scheduler::TimeGpuWork(const std::string& what) {
     CITRA_FRAME_DUMP("  gpu {:6.2f} ms  {}", elapsed.count(), what);
 }
 #endif
+
+std::optional<std::chrono::nanoseconds> Scheduler::TakeGpuTime(bool wanted) {
+    gpu_time.SetEnabled(wanted);
+    if (!gpu_time.IsAvailable()) {
+        return std::nullopt;
+    }
+    // Also when nobody wants it any more: what is still under way has to leave the queue
+    master_semaphore->Refresh();
+    const std::chrono::nanoseconds busy = gpu_time.Collect(master_semaphore->KnownGpuTick());
+    return wanted ? std::optional{busy} : std::nullopt;
+}
 
 void Scheduler::DispatchWork() {
     if (!use_worker_thread || chunk->Empty()) {
@@ -199,6 +312,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     current_cmdbuf = command_pool.Commit();
     current_cmdbuf.begin(begin_info);
+    gpu_time.Begin(current_cmdbuf);
 }
 
 void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wait_semaphore) {
@@ -215,6 +329,7 @@ void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wa
         MICROPROFILE_SCOPE(Vulkan_Submit);
         CITRA_TRACE_SCOPE("vkQueueSubmit");
         std::scoped_lock lock{submit_mutex};
+        gpu_time.End(cmdbuf, signal_value);
         master_semaphore->SubmitWork(cmdbuf, wait_semaphore, signal_semaphore, signal_value);
     });
 

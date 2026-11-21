@@ -284,9 +284,19 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
         Common::TraceMarkers::Experiments() &
         (Common::TraceMarkers::DumpShaders | Common::TraceMarkers::RelaxedShaderPrecision |
          Common::TraceMarkers::SkipLightingMath);
-    if (variant != 0) {
-        fs_config_hash = Common::HashCombine(fs_config_hash, u64{variant});
-    }
+    // One of the second set of switches changes the shaders too
+    const bool legacy_rounding =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyStageRounding) != 0;
+    const auto named = [legacy_rounding](u64 hash, u32 with) {
+        if (with != 0) {
+            hash = Common::HashCombine(hash, u64{with});
+        }
+        return legacy_rounding ? Common::HashCombine(hash, u64{1} << 40) : hash;
+    };
+    // Frame dumps name the fragment shader of a draw as a dump of the shaders names its file
+    CITRA_FRAME_DUMP("  vk fs {:016X}",
+                     named(fs_config_hash, variant | Common::TraceMarkers::DumpShaders));
+    fs_config_hash = named(fs_config_hash, variant);
 
     const auto [it, new_shader] = fragment_shaders.try_emplace(fs_config_hash, parent.instance);
     auto& shader = it->second;
@@ -295,7 +305,7 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
         LOG_NEW_OBJECT(Render_Vulkan, "New FS config {:016X}", fs_config_hash);
 
         parent.shader_workers.QueueWork([fs_config, user, this, &shader, fs_config_hash, variant,
-                                         queued = ShaderTiming::Clock::now()]() {
+                                         legacy_rounding, queued = ShaderTiming::Clock::now()]() {
             CITRA_TRACE_SCOPE("Vulkan::CompileFS");
             CITRA_HITCH_SCOPE(ShaderCompile);
             CITRA_TRACE_COUNT(ShaderCompiles);
@@ -333,7 +343,7 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
             }
 #endif
 
-            if (user.IsCacheable() && variant == 0) {
+            if (user.IsCacheable() && variant == 0 && !legacy_rounding) {
                 // Only cache to disk if the user config is cacheable
                 AppendFSSPIRV(fs_cache, spirv, fs_config_hash);
                 FSConfigEntry entry{.version = FSConfigEntry::EXPECTED_VERSION,
@@ -1623,6 +1633,14 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
     std::unordered_set<u64> vertex_ids, fragment_ids, by_shaders, by_targets, by_layout, by_blend;
 #endif
 
+    // Pipelines of the list whose shaders are not stored (any more): left out. Counted, not
+    // logged one by one: there are thousands in a list that has seen the shaders change, the
+    // logger writes every error line out to storage at once, and with storage slow that held
+    // the load of a save state up for half a minute.
+    u32 without_vertex_shader = 0;
+    u32 without_fragment_shader = 0;
+    u32 without_geometry_shader = 0;
+
     // There is only one entry type in the pipeline info cache,
     // no need to keep track of anything.
     for (int i = 1; i < tot_entries; i++) {
@@ -1692,8 +1710,9 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
                 auto it_vs =
                     programmable_vertex_map.find(entry->pl_info.shader_ids[ProgramType::VS]);
                 if (it_vs == programmable_vertex_map.end()) {
-                    LOG_ERROR(Render_Vulkan, "Missing vertex shader {:016X} for pipeline {:016X}",
+                    LOG_DEBUG(Render_Vulkan, "Missing vertex shader {:016X} for pipeline {:016X}",
                               entry->pl_info.shader_ids[ProgramType::VS], curr.Id());
+                    without_vertex_shader++;
                     continue;
                 }
                 shaders[ProgramType::VS] = it_vs->second;
@@ -1703,8 +1722,9 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
 
             auto it_fs = fragment_shaders.find(entry->pl_info.shader_ids[ProgramType::FS]);
             if (it_fs == fragment_shaders.end()) {
-                LOG_ERROR(Render_Vulkan, "Missing fragment shader {:016X} for pipeline {:016X}",
+                LOG_DEBUG(Render_Vulkan, "Missing fragment shader {:016X} for pipeline {:016X}",
                           entry->pl_info.shader_ids[ProgramType::FS], curr.Id());
+                without_fragment_shader++;
                 continue;
             }
             shaders[ProgramType::FS] = &it_fs->second;
@@ -1715,8 +1735,9 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
                 auto it_gs =
                     fixed_geometry_shaders.find(entry->pl_info.shader_ids[ProgramType::GS]);
                 if (it_gs == fixed_geometry_shaders.end()) {
-                    LOG_ERROR(Render_Vulkan, "Missing geometry shader {:016X} for pipeline {:016X}",
+                    LOG_DEBUG(Render_Vulkan, "Missing geometry shader {:016X} for pipeline {:016X}",
                               entry->pl_info.shader_ids[ProgramType::GS], curr.Id());
+                    without_geometry_shader++;
                     continue;
                 }
                 shaders[ProgramType::GS] = &it_gs->second;
@@ -1745,6 +1766,15 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
         } else {
             MALFORMED_DISK_CACHE;
         }
+    }
+
+    if (without_vertex_shader + without_fragment_shader + without_geometry_shader != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Stored pipelines left out because a shader of theirs is not stored: {} for the "
+                 "vertex shader, {} for the fragment shader, {} for the geometry shader; {} "
+                 "taken",
+                 without_vertex_shader, without_fragment_shader, without_geometry_shader,
+                 graphics_pipelines.size());
     }
 
     LOG_SHADER_TIMING("Cached pipelines: {} entries, {} pipelines, from {} vertex and {} "

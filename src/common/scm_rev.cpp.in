@@ -13,6 +13,7 @@
 #define BUILD_FULLNAME "@BUILD_FULLNAME@"
 #define BUILD_VARIANT "@BUILD_VARIANT@"
 #define SHADER_CACHE_VERSION "@SHADER_CACHE_VERSION@"
+#define RECOMPILER_CACHE_VERSION "@RECOMPILER_CACHE_VERSION@"
 
 namespace Common {
 
@@ -25,6 +26,7 @@ const char g_build_fullname[] = BUILD_FULLNAME;
 const char g_build_version[]  = BUILD_VERSION;
 const char g_build_variant[]  = BUILD_VARIANT;
 const char g_shader_cache_version[] = SHADER_CACHE_VERSION;
+const char g_recompiler_cache_version[] = RECOMPILER_CACHE_VERSION;
 
 } // namespace
 

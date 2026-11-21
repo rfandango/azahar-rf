@@ -19,7 +19,11 @@ struct LightSrc {
     alignas(16) Common::Vec3f specular_1;
     alignas(16) Common::Vec3f diffuse;
     alignas(16) Common::Vec3f ambient;
+    /// Where the light is. For a directional light: the direction to it, of length one, with
+    /// the length it had in position_length (the same for every fragment, so it is worked
+    /// out when the light is set, not by the shader).
     alignas(16) Common::Vec3f position;
+    f32 position_length;
     alignas(16) Common::Vec3f spot_direction; // negated
     f32 dist_atten_bias;
     f32 dist_atten_scale;
@@ -62,7 +66,8 @@ struct FSUniformData {
     alignas(16) Common::Vec3f tex_lod_bias;
     alignas(16) Common::Vec4f tex_border_color[3];
     alignas(16) Common::Vec4f blend_color;
-    /// Width and height of the host texture of each unit in x and y, for the level of detail.
+    /// Width and height of the host texture of each unit in x and y, for the level of detail
+    /// and for looking up a shadow map, and one divided by them in z and w.
     /// Vulkan with generated SPIR-V only; the GLSL shaders ask the texture and do not declare it.
     alignas(16) Common::Vec4f tex_size[3];
 };

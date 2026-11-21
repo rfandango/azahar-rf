@@ -126,6 +126,7 @@ enum class BooleanSetting(
         false
     ),
     USE_FRAME_LIMIT(SettingKeys.use_frame_limit(), CitraSettings.SECTION_RENDERER, true),
+    DYNAMIC_RESOLUTION(SettingKeys.dynamic_resolution(), CitraSettings.SECTION_RENDERER, false),
     DEBUG_RENDERER(SettingKeys.renderer_debug(), CitraSettings.SECTION_DEBUG, false),
     DISABLE_RIGHT_EYE_RENDER(
         SettingKeys.disable_right_eye_render(),

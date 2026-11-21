@@ -97,6 +97,13 @@ public:
         return extent;
     }
 
+    /// By how many degrees what is drawn into the images has to be turned (clockwise as seen
+    /// on the image, 0, 90, 180 or 270) for it to be upright on the display: the images are
+    /// in the orientation of the display's panel, so that the compositor need not turn them.
+    u32 GetPreRotation() const {
+        return pre_rotation;
+    }
+
     [[nodiscard]] vk::Semaphore GetImageAcquiredSemaphore() const {
         return image_acquired[frame_index];
     }
@@ -134,6 +141,7 @@ private:
     std::array<vk::PastPresentationTimingGOOGLE, 16> past_timings;
     vk::Extent2D extent;
     vk::SurfaceTransformFlagBitsKHR transform;
+    u32 pre_rotation{};
     vk::CompositeAlphaFlagBitsKHR composite_alpha;
     std::vector<vk::Image> images;
     std::vector<vk::Semaphore> image_acquired;

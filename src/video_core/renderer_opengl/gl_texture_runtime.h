@@ -51,6 +51,12 @@ public:
         return GetResourceTick();
     }
 
+    /// What the cache tells the Vulkan runtime for its blits that wait: none wait here
+    void NoteSurfaceRemoved(Surface&) {}
+    bool StillNeeded(Surface&) {
+        return false;
+    }
+
     /// Submits and waits for current GPU work.
     void Finish();
 
@@ -155,7 +161,7 @@ public:
 
     /// Downloads pixel data to staging from a rectangle region of the surface texture
     void Download(const VideoCore::BufferTextureCopy& download,
-                  const VideoCore::StagingData& staging);
+                  const VideoCore::StagingData& staging, bool wait = true);
 
     /// Attaches a handle of surface to the specified framebuffer target
     void Attach(GLenum target, u32 level, u32 layer, u32 handle = 1);

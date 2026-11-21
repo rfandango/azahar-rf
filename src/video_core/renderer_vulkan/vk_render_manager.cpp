@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
 #include "common/trace_markers.h"
@@ -46,8 +47,7 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer, Common::Recta
     // has the GPU store everything and load it again. When it does have to be ended for a
     // wider area, the new one takes the old area along, for the draws that go back to it.
     const vk::Rect2D drawn_to = render_area;
-    if (pass.render_pass && !pass.do_clear && pass.framebuffer == framebuffer->Handle() &&
-        !legacy) {
+    if (pass.render_pass && pass.framebuffer == framebuffer->Handle() && !legacy) {
         const vk::Rect2D& open = pass.render_area;
         const s32 left = std::min(open.offset.x, render_area.offset.x);
         const s32 bottom = std::min(open.offset.y, render_area.offset.y);
@@ -69,29 +69,98 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer, Common::Recta
         }
     }
 
-    // A pass first loads what its area holds, from memory into the GPU's tile buffer: a copy
-    // of every pixel, which is for nothing if the first draw overwrites them all. That is how
-    // games clear a buffer and how they run a full-screen effect.
-    vk::RenderPass render_pass = framebuffer->RenderPass();
-    if (!legacy && render_area == drawn_to && framebuffer->Samples() == 1) {
-        const VideoCore::PixelFormat color = framebuffer->Format(SurfaceType::Color);
-        const VideoCore::PixelFormat depth = framebuffer->Format(SurfaceType::Depth);
-        const bool discard_color = overwrites_color && color != PixelFormat::Invalid;
-        const bool discard_depth = overwrites_depth && depth != PixelFormat::Invalid;
-        if (discard_color || discard_depth) {
-            CITRA_FRAME_DUMP("  vk renderpass does not load:{}{}", discard_color ? " colour" : "",
-                             discard_depth ? " depth" : "");
-            render_pass = GetDiscardingRenderpass(color, depth, discard_color, discard_depth);
+    // Clears that were held back for this pass. It can do them as it begins if they are all
+    // for attachments of its framebuffer and have one area, which holds the draw: the pass
+    // takes that area and starts those attachments from the clear value.
+    const std::array<vk::Image, 4> attached = framebuffer->Images();
+    std::array<bool, 2> cleared{};
+    std::array<vk::ClearValue, 2> clear_values{};
+    if (!deferred_clears.empty()) {
+        const vk::Rect2D area = deferred_clears.front().area;
+        const vk::Extent2D extent = framebuffer->Extent();
+        const auto right = [](const vk::Rect2D& rect) {
+            return rect.offset.x + static_cast<s32>(rect.extent.width);
+        };
+        const auto top = [](const vk::Rect2D& rect) {
+            return rect.offset.y + static_cast<s32>(rect.extent.height);
+        };
+        bool usable = !legacy && framebuffer->Samples() == 1 && framebuffer->color_level == 0 &&
+                      !framebuffer->shadow_rendering && area.offset.x <= render_area.offset.x &&
+                      area.offset.y <= render_area.offset.y && right(area) >= right(render_area) &&
+                      top(area) >= top(render_area) &&
+                      right(area) <= static_cast<s32>(extent.width) &&
+                      top(area) <= static_cast<s32>(extent.height);
+        for (const DeferredClear& clear : deferred_clears) {
+            usable = usable && clear.area == area &&
+                     (clear.image == attached[0] || clear.image == attached[1]);
+        }
+        if (usable) {
+            for (const DeferredClear& clear : deferred_clears) {
+                const u32 index = clear.image == attached[0] ? 0 : 1;
+                cleared[index] = true;
+                clear_values[index] = clear.value;
+            }
+            deferred_clears.clear();
+            render_area = area;
+        } else {
+            CarryOutClears();
         }
     }
-    const RenderPass new_pass = {
+
+    // Otherwise a pass first loads what its area holds, from memory into the GPU's tile
+    // buffer: a copy of every pixel, which is for nothing if the first draw overwrites them
+    // all. That is how games clear a buffer and how they run a full-screen effect.
+    vk::RenderPass render_pass = framebuffer->RenderPass();
+    const u32 experiments2 = Common::TraceMarkers::Experiments2();
+    const bool never_load = (experiments2 & Common::TraceMarkers::NoAttachmentLoads) != 0;
+    const bool never_store_depth = (experiments2 & Common::TraceMarkers::NoDepthStores) != 0;
+    const VideoCore::PixelFormat color = framebuffer->Format(SurfaceType::Color);
+    const VideoCore::PixelFormat depth = framebuffer->Format(SurfaceType::Depth);
+    if (!legacy && framebuffer->Samples() == 1) {
+        const bool at_start = render_area == drawn_to;
+        const auto load_op = [&](u32 index, VideoCore::PixelFormat format, bool overwritten) {
+            if (format == PixelFormat::Invalid) {
+                return vk::AttachmentLoadOp::eLoad;
+            }
+            if (cleared[index]) {
+                return vk::AttachmentLoadOp::eClear;
+            }
+            return (overwritten && at_start) || never_load ? vk::AttachmentLoadOp::eDontCare
+                                                           : vk::AttachmentLoadOp::eLoad;
+        };
+        const vk::AttachmentLoadOp color_load = load_op(0, color, overwrites_color);
+        const vk::AttachmentLoadOp depth_load = load_op(1, depth, overwrites_depth);
+        const bool store_depth = !never_store_depth || depth == PixelFormat::Invalid;
+        if (color_load != vk::AttachmentLoadOp::eLoad ||
+            depth_load != vk::AttachmentLoadOp::eLoad || !store_depth) {
+            const auto is = [&](vk::AttachmentLoadOp op, const char* colour_text,
+                                const char* depth_text) {
+                return std::string{color_load == op ? colour_text : ""} +
+                       (depth_load == op ? depth_text : "");
+            };
+            CITRA_FRAME_DUMP("  vk renderpass does not load:{} | clears:{}",
+                             is(vk::AttachmentLoadOp::eDontCare, " colour", " depth"),
+                             is(vk::AttachmentLoadOp::eClear, " colour", " depth"));
+            render_pass =
+                GetRenderpassBeginningWith(color, depth, color_load, depth_load, store_depth);
+        }
+    }
+    RenderPass new_pass = {
         .framebuffer = framebuffer->Handle(),
         .render_pass = render_pass,
         .render_area = render_area,
         .clears = {},
-        .do_clear = false,
+        .do_clear = cleared[0] || cleared[1],
     };
-    images = framebuffer->Images();
+    // Clear values go by attachment, and colour is the first one if there is colour
+    u32 attachment = 0;
+    if (color != PixelFormat::Invalid) {
+        new_pass.clears[attachment++] = clear_values[0];
+    }
+    if (depth != PixelFormat::Invalid) {
+        new_pass.clears[attachment++] = clear_values[1];
+    }
+    images = attached;
     aspects = framebuffer->Aspects();
     shadow_rendering = framebuffer->shadow_rendering;
     BeginRendering(new_pass);
@@ -125,6 +194,45 @@ void RenderManager::BeginRendering(const RenderPass& new_pass) {
 }
 
 void RenderManager::EndRendering() {
+    EndPass();
+    CarryOutClears();
+}
+
+void RenderManager::SetClearDeferral(bool on) {
+    defer_clears = on && (Common::TraceMarkers::Experiments2() &
+                          Common::TraceMarkers::LegacyClearBeforePass) == 0;
+    if (!defer_clears) {
+        CarryOutClears();
+    }
+}
+
+void RenderManager::DeferClear(DeferredClear&& clear) {
+    EndPass();
+    // One clear an image, and no more than the two attachments a pass has
+    const bool again = std::ranges::any_of(
+        deferred_clears, [&clear](const DeferredClear& held) { return held.image == clear.image; });
+    if (again || deferred_clears.size() == deferred_clears.capacity()) {
+        CarryOutClears();
+    }
+    deferred_clears.push_back(std::move(clear));
+}
+
+void RenderManager::CarryOutClears() {
+    if (deferred_clears.empty()) {
+        return;
+    }
+    // Taken out first: recording may come back here
+    boost::container::static_vector<DeferredClear, 2> clears;
+    for (DeferredClear& clear : deferred_clears) {
+        clears.push_back(std::move(clear));
+    }
+    deferred_clears.clear();
+    for (const DeferredClear& clear : clears) {
+        clear.carry_out();
+    }
+}
+
+void RenderManager::EndPass() {
     if (!pass.render_pass) {
         return;
     }
@@ -227,16 +335,21 @@ vk::RenderPass RenderManager::GetRenderpass(VideoCore::PixelFormat color,
         renderpass = (sample_count > 1)
                          ? CreateRenderPassMSAA(color_format, depth_format, load_op,
                                                 static_cast<vk::SampleCountFlagBits>(sample_count))
-                         : CreateRenderPass(color_format, depth_format, load_op, load_op);
+                         : CreateRenderPass(color_format, depth_format, load_op, load_op,
+                                            vk::AttachmentStoreOp::eStore);
     }
 
     return *renderpass;
 }
 
-vk::RenderPass RenderManager::GetDiscardingRenderpass(VideoCore::PixelFormat color,
-                                                      VideoCore::PixelFormat depth,
-                                                      bool discard_color, bool discard_depth) {
-    ASSERT(discard_color || discard_depth);
+vk::RenderPass RenderManager::GetRenderpassBeginningWith(VideoCore::PixelFormat color,
+                                                         VideoCore::PixelFormat depth,
+                                                         vk::AttachmentLoadOp color_load,
+                                                         vk::AttachmentLoadOp depth_load,
+                                                         bool store_depth) {
+    static_assert(static_cast<u32>(vk::AttachmentLoadOp::eLoad) == 0 &&
+                  static_cast<u32>(vk::AttachmentLoadOp::eClear) == 1 &&
+                  static_cast<u32>(vk::AttachmentLoadOp::eDontCare) == 2);
     std::scoped_lock lock{cache_mutex};
 
     const u32 color_index =
@@ -248,24 +361,24 @@ vk::RenderPass RenderManager::GetDiscardingRenderpass(VideoCore::PixelFormat col
     ASSERT_MSG(color_index <= NumColorFormats && depth_index <= NumDepthFormats,
                "Invalid color index {} and/or depth_index {}", color_index, depth_index);
 
-    const u32 which = (discard_color ? 1u : 0u) + (discard_depth ? 2u : 0u) - 1u;
-    vk::UniqueRenderPass& renderpass = discarding_renderpasses[color_index][depth_index][which];
+    vk::UniqueRenderPass& renderpass =
+        beginning_renderpasses[color_index][depth_index][store_depth ? 1 : 0]
+                              [static_cast<u32>(color_load)][static_cast<u32>(depth_load)];
     if (!renderpass) {
-        const auto load_op = [](bool discard) {
-            return discard ? vk::AttachmentLoadOp::eDontCare : vk::AttachmentLoadOp::eLoad;
-        };
         // Compatible with the pass that loads both, so framebuffers and pipelines made for
         // that one go with this one as well
-        renderpass =
-            CreateRenderPass(instance.GetTraits(color).native, instance.GetTraits(depth).native,
-                             load_op(discard_color), load_op(discard_depth));
+        renderpass = CreateRenderPass(instance.GetTraits(color).native,
+                                      instance.GetTraits(depth).native, color_load, depth_load,
+                                      store_depth ? vk::AttachmentStoreOp::eStore
+                                                  : vk::AttachmentStoreOp::eDontCare);
     }
     return *renderpass;
 }
 
 vk::UniqueRenderPass RenderManager::CreateRenderPass(vk::Format color, vk::Format depth,
                                                      vk::AttachmentLoadOp color_load_op,
-                                                     vk::AttachmentLoadOp depth_load_op) const {
+                                                     vk::AttachmentLoadOp depth_load_op,
+                                                     vk::AttachmentStoreOp depth_store_op) const {
 
     boost::container::static_vector<vk::AttachmentDescription, 2> attachments{};
     bool use_color = false;
@@ -298,9 +411,9 @@ vk::UniqueRenderPass RenderManager::CreateRenderPass(vk::Format color, vk::Forma
             .format = depth,
             .samples = vk::SampleCountFlagBits::e1,
             .loadOp = depth_load_op,
-            .storeOp = vk::AttachmentStoreOp::eStore,
+            .storeOp = depth_store_op,
             .stencilLoadOp = depth_load_op,
-            .stencilStoreOp = vk::AttachmentStoreOp::eStore,
+            .stencilStoreOp = depth_store_op,
             .initialLayout = vk::ImageLayout::eGeneral,
             .finalLayout = vk::ImageLayout::eGeneral,
         });

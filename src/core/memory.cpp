@@ -2,9 +2,14 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <csignal>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <vector>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/binary_object.hpp>
 #include "audio_core/dsp_interface.h"
@@ -12,10 +17,14 @@
 #include "common/assert.h"
 #include "common/atomic_ops.h"
 #include "common/common_types.h"
+#include "common/hitch_tracker.h"
 #include "common/logging/log.h"
+#include "common/memory_view.h"
 #include "common/optional_helper.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "common/trace_markers.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/exception_handler.h"
 #include "core/core.h"
@@ -44,10 +53,239 @@ constexpr u32 SIGSEGV = 11;
 
 namespace Memory {
 
+namespace {
+
+/// The emulated system's memory when host MMU access is in use: one shared piece that page
+/// tables show in their views. Set for as long as the MemorySystem that owns it lives.
+Common::SharedBacking* host_backing = nullptr;
+
+/// Where the four memories of the emulated system are in it
+constexpr std::size_t BACKING_FCRAM = 0;
+constexpr std::size_t BACKING_VRAM = BACKING_FCRAM + FCRAM_N3DS_SIZE;
+constexpr std::size_t BACKING_N3DS = BACKING_VRAM + VRAM_SIZE;
+constexpr std::size_t BACKING_DSP = BACKING_N3DS + N3DS_EXTRA_RAM_SIZE;
+constexpr std::size_t BACKING_SIZE = BACKING_DSP + DSP_RAM_SIZE;
+
+/// A view takes in all 32 bits of an emulated address. One page more is reserved behind it and
+/// never filled: an access that starts in the last bytes of the address space runs into it
+/// and faults, instead of reaching whatever the host has there.
+constexpr std::size_t HOST_VIEW_SIZE = std::size_t{1} << 32;
+constexpr std::size_t HOST_VIEW_GUARD = CITRA_PAGE_SIZE;
+
+/// Whether the recompiled code is to reach the emulated memory through views of it: the
+/// host's own address translation in place of a lookup for every access (measured on an
+/// Adreno 650 device: 8.5% to 11% fewer cycles of the emulation thread). The way it is done
+/// where it has run, Android on arm64; elsewhere not until it has been tried there.
+bool WantsHostMmu() {
+#if defined(__ANDROID__) && defined(__aarch64__)
+    return (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyMemoryAccess) == 0;
+#else
+    return false;
+#endif
+}
+
+/// Whether the host GPU is to be offered the emulated memory as memory of its own, as on the
+/// console, where processor and GPU have one memory. Like the views, the way it is done where
+/// it has run.
+bool WantsSharedGpuMemory() {
+#if defined(__ANDROID__) && defined(__aarch64__)
+    return (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyVertexCopies) == 0;
+#else
+    return false;
+#endif
+}
+
+/// The emulated memory in one piece is what two things build on: views of it for the
+/// recompiled code, and the host GPU taking it as memory of its own
+std::unique_ptr<Common::SharedBacking> MakeHostBacking() {
+    const bool for_gpu = WantsSharedGpuMemory();
+    if (!WantsHostMmu() && !for_gpu) {
+        return nullptr;
+    }
+    auto backing = std::make_unique<Common::SharedBacking>(BACKING_SIZE);
+    if (!backing->IsValid()) {
+        LOG_WARNING(HW_Memory, "The emulated memory was asked for in one shared piece, but "
+                               "this host has no shared memory in pages of 4 KiB for it");
+        return nullptr;
+    }
+    LOG_INFO(HW_Memory, "The emulated memory is one piece of shared memory{}{}",
+             WantsHostMmu() ? ", shown again in a view of each address space" : "",
+             for_gpu ? ", offered to the host GPU as it is" : "");
+    return backing;
+}
+
+/// One of the emulated system's memories: a part of the shared backing if there is one, or
+/// memory of its own
+class RamBlock {
+public:
+    RamBlock(const Common::SharedBacking* backing, std::size_t offset, std::size_t size) {
+        if (backing) {
+            pointer = backing->Data() + offset;
+        } else {
+            own = std::make_unique<u8[]>(size);
+            pointer = own.get();
+        }
+    }
+
+    [[nodiscard]] u8* get() const {
+        return pointer;
+    }
+
+private:
+    std::unique_ptr<u8[]> own;
+    u8* pointer = nullptr;
+};
+
+} // Anonymous namespace
+
+PageTable::PageTable() {
+    // Nothing is mapped until something is
+    pointers.raw.fill(nullptr);
+    attributes.fill(PageType::Unmapped);
+}
+
+PageTable::~PageTable() = default;
+
+PageTable::Pointers::Pointers() {
+    if (host_backing) {
+        auto view = std::make_unique<Common::AddressSpaceView>(*host_backing,
+                                                               HOST_VIEW_SIZE + HOST_VIEW_GUARD);
+        if (view->IsValid()) {
+            host_view = std::move(view);
+            host_view_backing = host_backing;
+        } else {
+            LOG_ERROR(HW_Memory, "No room for a view of an address space: its code will look "
+                                 "every address up");
+        }
+    }
+}
+
+PageTable::Pointers::~Pointers() = default;
+
+u8* PageTable::Pointers::HostView() const {
+    return host_view ? host_view->Base() : nullptr;
+}
+
+void PageTable::Pointers::BeginChanges() {
+    changes_depth++;
+}
+
+void PageTable::Pointers::EndChanges() {
+    if (changes_depth == 0 || --changes_depth != 0 || changed.empty()) {
+        return;
+    }
+    // Runs of pages next to each other go to the host in one piece
+    std::sort(changed.begin(), changed.end());
+    changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
+    std::size_t run_start = 0;
+    for (std::size_t i = 1; i <= changed.size(); i++) {
+        if (i == changed.size() || changed[i] != changed[i - 1] + 1) {
+            ApplyToView(changed[run_start], i - run_start);
+            run_start = i;
+        }
+    }
+    changed.clear();
+}
+
+void PageTable::Pointers::NoteChange(std::size_t idx) {
+    if (changes_depth != 0) {
+        changed.push_back(static_cast<u32>(idx));
+    } else {
+        ApplyToView(idx, 1);
+    }
+}
+
+void PageTable::Pointers::SetReadOnly(std::size_t idx, u8* memory) {
+    if (!host_view) {
+        return;
+    }
+    const auto it = read_only.find(static_cast<u32>(idx));
+    if (memory == nullptr) {
+        if (it == read_only.end()) {
+            return;
+        }
+        read_only.erase(it);
+    } else {
+        if (it != read_only.end() && it->second == memory) {
+            return;
+        }
+        read_only[static_cast<u32>(idx)] = memory;
+    }
+    NoteChange(idx);
+}
+
+void PageTable::Pointers::ApplyToView(std::size_t first, std::size_t count) {
+    if (!host_view) {
+        return;
+    }
+    // Only memory of the backing this view was made for can show in it. Everything else (a
+    // page without a pointer: not mapped, cached by the renderer, watched; or memory that is
+    // not the emulated system's own) is left empty, so that an access faults and the
+    // recompiled code goes the long way.
+    const Common::SharedBacking* const backing =
+        host_backing == host_view_backing ? host_view_backing : nullptr;
+    // A page with a pointer shows its memory, writable; one without, given to SetReadOnly,
+    // shows it readable only
+    struct Shown {
+        std::size_t offset;
+        bool writable;
+    };
+    const auto shown = [&](std::size_t idx) -> std::optional<Shown> {
+        const u8* pointer = raw[idx];
+        bool writable = true;
+        if (!pointer) {
+            if (read_only.empty()) {
+                return std::nullopt;
+            }
+            const auto it = read_only.find(static_cast<u32>(idx));
+            if (it == read_only.end()) {
+                return std::nullopt;
+            }
+            pointer = it->second;
+            writable = false;
+        }
+        if (!backing || !backing->Contains(pointer)) {
+            return std::nullopt;
+        }
+        const std::size_t offset = static_cast<std::size_t>(pointer - backing->Data());
+        if (offset % CITRA_PAGE_SIZE != 0) {
+            return std::nullopt;
+        }
+        return Shown{offset, writable};
+    };
+    const std::size_t end = first + count;
+    std::size_t idx = first;
+    while (idx < end) {
+        const auto start = shown(idx);
+        std::size_t pages = 1;
+        if (start) {
+            while (idx + pages < end) {
+                const auto next = shown(idx + pages);
+                if (!next || next->writable != start->writable ||
+                    next->offset != start->offset + pages * CITRA_PAGE_SIZE) {
+                    break;
+                }
+                pages++;
+            }
+            host_view->Map(idx * CITRA_PAGE_SIZE, start->offset, pages * CITRA_PAGE_SIZE,
+                           start->writable);
+        } else {
+            while (idx + pages < end && !shown(idx + pages)) {
+                pages++;
+            }
+            host_view->Unmap(idx * CITRA_PAGE_SIZE, pages * CITRA_PAGE_SIZE);
+        }
+        idx += pages;
+    }
+}
+
 void PageTable::Clear() {
     pointers.raw.fill(nullptr);
     pointers.refs.fill(MemoryRef());
     attributes.fill(PageType::Unmapped);
+    pointers.changed.clear();
+    pointers.read_only.clear();
+    pointers.ApplyToView(0, PAGE_TABLE_NUM_ENTRIES);
 }
 
 class RasterizerCacheMarker {
@@ -100,16 +338,307 @@ private:
 
 class MemorySystem::Impl {
 public:
+    /// With host MMU access in use, the shared memory the four below are parts of
+    std::unique_ptr<Common::SharedBacking> backing = MakeHostBacking();
     // Visual Studio would try to allocate these on compile time
     // if they are std::array which would exceed the memory limit.
-    std::unique_ptr<u8[]> fcram = std::make_unique<u8[]>(Memory::FCRAM_N3DS_SIZE);
-    std::unique_ptr<u8[]> vram = std::make_unique<u8[]>(Memory::VRAM_SIZE);
-    std::unique_ptr<u8[]> n3ds_extra_ram = std::make_unique<u8[]>(Memory::N3DS_EXTRA_RAM_SIZE);
-    std::unique_ptr<u8[]> dsp_ram = std::make_unique<u8[]>(Memory::DSP_RAM_SIZE);
+    RamBlock fcram{backing.get(), BACKING_FCRAM, Memory::FCRAM_N3DS_SIZE};
+    RamBlock vram{backing.get(), BACKING_VRAM, Memory::VRAM_SIZE};
+    RamBlock n3ds_extra_ram{backing.get(), BACKING_N3DS, Memory::N3DS_EXTRA_RAM_SIZE};
+    RamBlock dsp_ram{backing.get(), BACKING_DSP, Memory::DSP_RAM_SIZE};
 
     Core::System& system;
     std::shared_ptr<PageTable> current_page_table = nullptr;
     RasterizerCacheMarker cache_marker;
+    /// The pages that are watched for writes, see MemorySystem::RasterizerMarkRegionWatched.
+    /// Not kept in a save state: the rasterizer starts over when one is made or loaded.
+    RasterizerCacheMarker watch_marker;
+    /// The cached pages that may be read without announcing it, see
+    /// MemorySystem::RasterizerMarkRegionReadable. Not kept in a save state either.
+    RasterizerCacheMarker readable_marker;
+    /// The pages armed for a decoder that works behind the game's back, see
+    /// MemorySystem::ArmGpuReferences. To the page tables an armed page is a watched one.
+    RasterizerCacheMarker armed_marker;
+    /// The pages shut for it: what the emulated GPU writes. Neither read nor written directly.
+    RasterizerCacheMarker shut_marker;
+    /// The marks of pages are changed by one thread at a time: the decoder's cache, and the
+    /// emulation thread arming pages and mapping memory
+    std::mutex mark_mutex;
+    std::atomic<bool> track_references{false};
+    std::mutex reference_mutex;
+    /// Pages noted since the last arming, by their place in surface_cells (under the mutex):
+    /// read by the decoder for a command list, read by it for a transfer, written by it
+    std::vector<u32> new_references;
+    std::vector<u32> new_transfer_references;
+    std::vector<u32> new_written;
+    /// Decoder thread: the pages it has noted, bit 0 as read for a list, bit 1 as written,
+    /// bit 4 as read for a transfer. And which of the two it is on.
+    std::vector<u8> reference_noted;
+    u8 gpu_reader{1};
+    /// What the decoder last read a page as (a GpuReference), and the 64-byte cells of it
+    /// that it read. Set by the decoder, looked at by the emulation thread.
+    std::vector<u8> reference_kind;
+    std::vector<u64> reference_cells;
+    /// Emulation thread: bit 0 for a page known to be read by the decoder for a list and bit
+    /// 4 for a transfer, bit 1 while it is armed; bit 2 for one known to be written by it and
+    /// bit 3 while it is shut
+    std::vector<u8> reference_state;
+    /// Emulation thread: the known pages that are not armed, for either kind of command, and
+    /// not shut
+    std::vector<u32> to_arm;
+    std::vector<u32> to_arm_transfer;
+    std::vector<u32> to_shut;
+    /// Emulation thread: the volatile pages (bit 5 of reference_state), in the order of their
+    /// numbers. A page that is written while it is armed becomes one: it is copied at every
+    /// hand-over instead of armed.
+    struct VolatilePage {
+        u32 page{};
+        /// Looks in a row, one at every 32nd copy of it, its contents were the same at
+        u32 same{};
+        u32 turn{};
+        u64 checksum{};
+        /// While it is still armed: the command that has to be done before it need not be
+        u64 disarm_after{~u64{0}};
+    };
+    std::vector<VolatilePage> volatile_pages;
+    /// Those of them a command gets copies of, while they are made
+    std::vector<VolatilePage*> snapshot_wanted;
+    u64 snapshot_bytes_copied{};
+    /// Decoder thread: the copies that came with the command it is on. For each page its
+    /// place among them plus one, or zero.
+    const std::vector<u32>* snapshot_pages{};
+    const u8* snapshot_bytes{};
+    std::vector<u16> snapshot_slot;
+    /// Which of them it read, and the sums of that for the figures
+    std::vector<u8> snapshot_read;
+    std::atomic<u64> snapshot_given_sum{};
+    std::atomic<u64> snapshot_read_sum{};
+    /// What it read across copied and other pages, put together
+    std::deque<std::vector<u8>> stitched;
+
+    static constexpr std::size_t MAX_VOLATILE_PAGES = 1024;
+    /// Looks with the same contents after which a volatile page is armed again: about two
+    /// thousand hand-overs
+    static constexpr u32 VOLATILE_DECAY = 64;
+
+    void AddVolatile(std::size_t page) {
+        if ((reference_state[page] & 32) != 0 || volatile_pages.size() >= MAX_VOLATILE_PAGES) {
+            return;
+        }
+        reference_state[page] |= 32;
+        VolatilePage entry{};
+        entry.page = static_cast<u32>(page);
+        volatile_pages.insert(std::lower_bound(volatile_pages.begin(), volatile_pages.end(), entry,
+                                               [](const VolatilePage& a, const VolatilePage& b) {
+                                                   return a.page < b.page;
+                                               }),
+                              entry);
+    }
+
+    /// Decoder thread: stretches it has noted, each at its place in a small table. What is
+    /// noted is never taken back, so one that is found here has nothing left to note.
+    struct NotedStretch {
+        u64 stretch{};
+        u32 what{};
+    };
+    std::array<NotedStretch, 4096> noted_stretches{};
+
+    /// Decoder thread: notes the pages of a stretch as read (bit 1 or 16) or written (bit 2)
+    void NoteGpuPages(PAddr addr, u32 size, u8 bit, GpuReference kind) {
+        if (!track_references.load(std::memory_order_relaxed) || size == 0) {
+            return;
+        }
+        // A draw notes the same stretches frame after frame
+        const u64 stretch = u64{addr} << 32 | size;
+        const u32 what = u32{bit} << 8 | static_cast<u32>(kind);
+        NotedStretch& noted = noted_stretches[(stretch * 0x9E3779B97F4A7C15ULL) >> 52];
+        if (noted.stretch == stretch && noted.what == what) {
+            return;
+        }
+        noted = {stretch, what};
+        const u64 last = u64{addr} + size - 1;
+        for (u64 at = addr & ~CITRA_PAGE_MASK; at <= last; at += CITRA_PAGE_SIZE) {
+            const auto page = CellPage(static_cast<PAddr>(at));
+            if (!page) {
+                continue;
+            }
+            if (bit != 2) {
+                const u32 first = at < addr ? addr & CITRA_PAGE_MASK : 0;
+                const u32 end = at + CITRA_PAGE_SIZE - 1 > last
+                                    ? static_cast<u32>(last) & CITRA_PAGE_MASK
+                                    : CITRA_PAGE_MASK;
+                reference_cells[*page] |= CellMask(first, end);
+                reference_kind[*page] = static_cast<u8>(kind);
+            }
+            if ((reference_noted[*page] & bit) != 0) {
+                continue;
+            }
+            reference_noted[*page] |= bit;
+            std::scoped_lock lock{reference_mutex};
+            (bit == 1   ? new_references
+             : bit == 2 ? new_written
+                        : new_transfer_references)
+                .push_back(static_cast<u32>(*page));
+        }
+    }
+
+    /// What an access that reaches the rasterizer is to: for telling apart what the game
+    /// waits for the decoder for
+    VideoCore::GPU::WaitReason AccessKind(VAddr vaddr, PAddr paddr, u32 size, FlushMode mode) {
+        using Reason = VideoCore::GPU::WaitReason;
+        const bool write = mode != FlushMode::Flush;
+        Reason found = Reason::MemoryAccess;
+        u32 done = 0;
+        while (done < size) {
+            const VAddr v = vaddr + done;
+            const u32 in_page = (paddr + done) & CITRA_PAGE_MASK;
+            const u32 take = std::min(size - done, CITRA_PAGE_SIZE - in_page);
+            const auto page = CellPage(paddr + done);
+            done += take;
+            if (shut_marker.IsCached(v)) {
+                return write ? Reason::WriteGpuWritten : Reason::ReadGpuWritten;
+            }
+            if (!write) {
+                if (cache_marker.IsCached(v) && !readable_marker.IsCached(v)) {
+                    return Reason::ReadGpuNewer;
+                }
+                if (watch_marker.IsCached(v)) {
+                    found = Reason::ReadWatched;
+                }
+                continue;
+            }
+            const u64 mask = CellMask(in_page, in_page + take - 1);
+            if (page && (surface_cells[*page] & mask) != 0) {
+                return Reason::WriteSurface;
+            }
+            const bool armed = page && armed_marker.IsCached(v);
+            if (armed && (reference_cells[*page] & mask) != 0) {
+                switch (static_cast<GpuReference>(reference_kind[*page])) {
+                case GpuReference::VertexData:
+                    return Reason::WriteVertexData;
+                case GpuReference::IndexData:
+                    return Reason::WriteIndexData;
+                case GpuReference::Texture:
+                    return Reason::WriteTexture;
+                case GpuReference::CalledList:
+                    return Reason::WriteCalledList;
+                default:
+                    return Reason::WriteOtherReference;
+                }
+            }
+            if (watch_marker.IsCached(v)) {
+                found = Reason::WriteWatched;
+            } else if (armed && found == Reason::MemoryAccess) {
+                found = Reason::WriteBesideReference;
+            }
+        }
+        return found;
+    }
+
+    /// Whether a read goes straight to a cached page's memory: nothing newer is held of it,
+    /// and nothing that is still to be decoded writes it
+    bool ReadsDirect(VAddr vaddr) {
+        return readable_marker.IsCached(vaddr) && !shut_marker.IsCached(vaddr);
+    }
+
+    /// Stretches the rasterizer gives the game late, see MemorySystem::ExemptReads
+    /// (emulation thread), and the bytes on their way (under the mutex)
+    struct LateRange {
+        PAddr addr{};
+        u32 size{};
+        u64 last_vblank{};
+    };
+    std::vector<LateRange> late_ranges;
+    u64 late_vblank{};
+    std::mutex late_mutex;
+    std::vector<std::pair<PAddr, std::vector<u8>>> late_writes;
+    std::atomic<bool> has_late_writes{false};
+    /// VBlanks without a late write after which a stretch is read the usual way again
+    static constexpr u64 LATE_RANGE_VBLANKS = 12;
+
+    bool IsExemptRead(PAddr paddr, u32 size) const {
+        for (const LateRange& range : late_ranges) {
+            if (paddr >= range.addr && u64{paddr} + size <= u64{range.addr} + range.size &&
+                late_vblank - range.last_vblank <= LATE_RANGE_VBLANKS) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether the rasterizer has to be asked before `size` bytes are read. Not for pages
+    /// that are only armed: what the decoder reads from them is what is in memory.
+    bool ReadNeedsAnnouncing(VAddr vaddr, u32 size) {
+        if (size == 0) {
+            return true;
+        }
+        const u64 last = u64{vaddr} + size - 1;
+        for (u64 at = vaddr & ~CITRA_PAGE_MASK; at <= last; at += CITRA_PAGE_SIZE) {
+            const VAddr page = static_cast<VAddr>(at);
+            if (cache_marker.IsCached(page) || watch_marker.IsCached(page) ||
+                shut_marker.IsCached(page)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static PAddr CellPageAddress(std::size_t page) {
+        const std::size_t fcram_pages = FCRAM_N3DS_SIZE >> CITRA_PAGE_BITS;
+        if (page < fcram_pages) {
+            return FCRAM_PADDR + static_cast<PAddr>(page << CITRA_PAGE_BITS);
+        }
+        return VRAM_PADDR + static_cast<PAddr>((page - fcram_pages) << CITRA_PAGE_BITS);
+    }
+    /// The cells of 64 bytes a cached surface covers, a bit each, a word a page: main memory's
+    /// pages, then video memory's. See MemorySystem::RasterizerSetSurfaceCells. Empty until
+    /// the first surface is cached.
+    std::vector<u64> surface_cells;
+
+    /// The word of surface_cells for the page the address is in, if that is main or video
+    /// memory
+    static std::optional<std::size_t> CellPage(PAddr paddr) {
+        if (paddr >= FCRAM_PADDR && paddr < FCRAM_N3DS_PADDR_END) {
+            return static_cast<std::size_t>((paddr - FCRAM_PADDR) >> CITRA_PAGE_BITS);
+        }
+        if (paddr >= VRAM_PADDR && paddr < VRAM_PADDR_END) {
+            return static_cast<std::size_t>((FCRAM_N3DS_SIZE >> CITRA_PAGE_BITS) +
+                                            ((paddr - VRAM_PADDR) >> CITRA_PAGE_BITS));
+        }
+        return std::nullopt;
+    }
+
+    /// The bits of the cells that the bytes `first` to `last` of a page lie in
+    static u64 CellMask(u32 first, u32 last) {
+        return (~u64{0} >> (63 - (last >> 6))) & (~u64{0} << (first >> 6));
+    }
+
+    /// Whether the rasterizer has to be told of a write of `size` bytes to a cached page: it
+    /// touches what a surface covers, or a page that is watched for what a draw reads in
+    /// place, or nothing is known of where it goes
+    bool WriteNeedsAnnouncing(VAddr vaddr, PAddr paddr, u32 size) {
+        if (surface_cells.empty() || size == 0 ||
+            (Common::TraceMarkers::Experiments2() &
+             Common::TraceMarkers::LegacyWriteAnnouncements) != 0) {
+            return true;
+        }
+        u32 done = 0;
+        while (done < size) {
+            const auto page = CellPage(paddr + done);
+            if (!page || watch_marker.IsCached(vaddr + done) ||
+                armed_marker.IsCached(vaddr + done) || shut_marker.IsCached(vaddr + done)) {
+                return true;
+            }
+            const u32 in_page = (paddr + done) & CITRA_PAGE_MASK;
+            const u32 take = std::min(size - done, CITRA_PAGE_SIZE - in_page);
+            if ((surface_cells[*page] & CellMask(in_page, in_page + take - 1)) != 0) {
+                return true;
+            }
+            done += take;
+        }
+        return false;
+    }
+
     std::vector<std::shared_ptr<PageTable>> page_table_list;
 
     std::shared_ptr<BackingMem> fcram_mem;
@@ -120,6 +649,7 @@ public:
     PAddr plugin_fb_address{};
 
     Impl(Core::System& system_);
+    ~Impl();
 
     const u8* GetPtr(Region r) const {
         switch (r) {
@@ -195,10 +725,15 @@ public:
                 break;
             }
             case PageType::Memory: {
-                DEBUG_ASSERT(page_table.pointers[page_index]);
-
-                const u8* src_ptr = page_table.pointers[page_index] + page_offset;
-                std::memcpy(dest_buffer, src_ptr, copy_amount);
+                const u8* page = page_table.pointers[page_index];
+                if (!page) [[unlikely]] {
+                    // Marked for the rasterizer since the look at its type, by the thread
+                    // that decodes GPU commands
+                    RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
+                                                 FlushMode::Flush);
+                    page = GetPointerForRasterizerCache(current_vaddr & ~CITRA_PAGE_MASK).GetPtr();
+                }
+                std::memcpy(dest_buffer, page + page_offset, copy_amount);
                 break;
             }
             case PageType::MemoryWatchpoint: {
@@ -213,10 +748,12 @@ public:
             case PageType::RasterizerCachedMemory:
             case PageType::RasterizerCachedMemoryWatchpoint: {
                 if constexpr (!UNSAFE) {
-                    RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
-                                                 FlushMode::Flush);
+                    if (!ReadsDirect(current_vaddr)) {
+                        RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
+                                                     FlushMode::Flush);
+                    }
                 }
-                std::memcpy(dest_buffer, GetPointerForRasterizerCache(current_vaddr), copy_amount);
+                std::memcpy(dest_buffer, RasterizerCachePointer(current_vaddr), copy_amount);
                 break;
             }
             default:
@@ -253,10 +790,15 @@ public:
                 break;
             }
             case PageType::Memory: {
-                DEBUG_ASSERT(page_table.pointers[page_index]);
-
-                u8* dest_ptr = page_table.pointers[page_index] + page_offset;
-                std::memcpy(dest_ptr, src_buffer, copy_amount);
+                u8* page = page_table.pointers[page_index];
+                if (!page) [[unlikely]] {
+                    // Marked for the rasterizer since the look at its type, by the thread
+                    // that decodes GPU commands
+                    RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
+                                                 FlushMode::Invalidate);
+                    page = GetPointerForRasterizerCache(current_vaddr & ~CITRA_PAGE_MASK).GetPtr();
+                }
+                std::memcpy(page + page_offset, src_buffer, copy_amount);
                 break;
             }
             case PageType::MemoryWatchpoint: {
@@ -274,7 +816,7 @@ public:
                     RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
                                                  FlushMode::Invalidate);
                 }
-                std::memcpy(GetPointerForRasterizerCache(current_vaddr), src_buffer, copy_amount);
+                std::memcpy(RasterizerCachePointer(current_vaddr), src_buffer, copy_amount);
                 break;
             }
             default:
@@ -286,6 +828,27 @@ public:
             src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
             remaining_size -= copy_amount;
         }
+    }
+
+    /// As GetPointerForRasterizerCache, the bare pointer: no count of the memory's users is
+    /// taken, which is two atomic operations on a way a game can go ten thousand times a
+    /// frame
+    u8* RasterizerCachePointer(VAddr addr) const {
+        if (addr >= LINEAR_HEAP_VADDR && addr < LINEAR_HEAP_VADDR_END) [[likely]] {
+            return fcram_mem->GetPtr() + (addr - LINEAR_HEAP_VADDR);
+        }
+        if (addr >= NEW_LINEAR_HEAP_VADDR && addr < NEW_LINEAR_HEAP_VADDR_END) {
+            return fcram_mem->GetPtr() + (addr - NEW_LINEAR_HEAP_VADDR);
+        }
+        if (addr >= VRAM_VADDR && addr < VRAM_VADDR_END) {
+            return vram_mem->GetPtr() + (addr - VRAM_VADDR);
+        }
+        if (addr >= PLUGIN_3GX_FB_VADDR && addr < PLUGIN_3GX_FB_VADDR_END && plugin_fb_address) {
+            return fcram_mem->GetPtr() +
+                   (addr - PLUGIN_3GX_FB_VADDR + plugin_fb_address - FCRAM_PADDR);
+        }
+        UNREACHABLE();
+        return nullptr;
     }
 
     MemoryRef GetPointerForRasterizerCache(VAddr addr) const {
@@ -321,16 +884,58 @@ public:
             PAddr physical_start = paddr_region_start + (overlap_start - region_start);
             u32 overlap_size = overlap_end - overlap_start;
 
+            // A write that touches nothing a surface covers is nobody's business
+            if (mode == FlushMode::Invalidate &&
+                !WriteNeedsAnnouncing(overlap_start, physical_start, overlap_size)) {
+                return;
+            }
+            // Nor is a read of pages that are only armed, or not marked at all
+            if (mode == FlushMode::Flush && !ReadNeedsAnnouncing(overlap_start, overlap_size)) {
+                return;
+            }
+            // Nor one of what the rasterizer gives the game late: memory as it is
+            if (mode == FlushMode::Flush && !late_ranges.empty() &&
+                IsExemptRead(physical_start, overlap_size)) {
+                return;
+            }
+
+            // The rasterizer is about to be used from here: not while the thread that decodes
+            // commands is at it
+            const VideoCore::GPU::WaitReason kind =
+                AccessKind(overlap_start, physical_start, overlap_size, mode);
+            if (kind == VideoCore::GPU::WaitReason::WriteBesideReference) {
+                // On a page the decoder reads from, but not what it reads of it: nothing the
+                // decoder or the rasterizer has to know of. While the decoder has work the
+                // page stays as it is, for what it does read of it; otherwise the page is
+                // free until commands are handed over again.
+                system.GPU().NoteAccess(kind);
+                if (!system.GPU().HasPendingWork()) {
+                    system.Memory().Disarm(physical_start, overlap_size, true);
+                } else {
+                    system.Memory().WantVolatile(physical_start, overlap_size);
+                }
+                return;
+            }
+            system.GPU().WaitIdle(kind);
+
             auto* rasterizer = renderer.Rasterizer();
+            Common::Hitches::NoteGpuCall(mode == FlushMode::Flush
+                                             ? Common::Hitches::GpuCall::MemoryRead
+                                             : Common::Hitches::GpuCall::MemoryWrite);
             switch (mode) {
+            // The decoder has been waited for: what is read or written here is free to be
+            // until commands are handed over again
             case FlushMode::Flush:
                 rasterizer->FlushRegion(physical_start, overlap_size);
+                system.Memory().Disarm(physical_start, overlap_size, false);
                 break;
             case FlushMode::Invalidate:
                 rasterizer->InvalidateRegion(physical_start, overlap_size);
+                system.Memory().Disarm(physical_start, overlap_size, true);
                 break;
             case FlushMode::FlushAndInvalidate:
                 rasterizer->FlushAndInvalidateRegion(physical_start, overlap_size);
+                system.Memory().Disarm(physical_start, overlap_size, true);
                 break;
             }
         };
@@ -398,7 +1003,25 @@ MemorySystem::Impl::Impl(Core::System& system_)
     : system{system_}, fcram_mem(std::make_shared<BackingMemImpl<Region::FCRAM>>(*this)),
       vram_mem(std::make_shared<BackingMemImpl<Region::VRAM>>(*this)),
       n3ds_extra_ram_mem(std::make_shared<BackingMemImpl<Region::N3DS>>(*this)),
-      dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {}
+      dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {
+    // Looked at on one thread while another sets them: never grown later
+    surface_cells.resize((FCRAM_N3DS_SIZE + VRAM_SIZE) >> CITRA_PAGE_BITS);
+    reference_noted.resize(surface_cells.size());
+    reference_kind.resize(surface_cells.size());
+    reference_cells.resize(surface_cells.size());
+    reference_state.resize(surface_cells.size());
+    snapshot_slot.resize(surface_cells.size());
+    // The page tables made from here on get their views of it
+    if (WantsHostMmu()) {
+        host_backing = backing.get();
+    }
+}
+
+MemorySystem::Impl::~Impl() {
+    if (backing && host_backing == backing.get()) {
+        host_backing = nullptr;
+    }
+}
 
 MemorySystem::MemorySystem(Core::System& system) : impl(std::make_unique<Impl>(system)) {}
 MemorySystem::~MemorySystem() = default;
@@ -410,12 +1033,25 @@ void MemorySystem::serialize(Archive& ar, const unsigned int file_version) {
 
 SERIALIZE_IMPL(MemorySystem)
 
-void MemorySystem::SetCurrentPageTable(std::shared_ptr<PageTable> page_table) {
-    impl->current_page_table = page_table;
+void MemorySystem::SetCurrentPageTable(const std::shared_ptr<PageTable>& page_table) {
+    if (impl->current_page_table != page_table) {
+        impl->current_page_table = page_table;
+    }
 }
 
 std::shared_ptr<PageTable> MemorySystem::GetCurrentPageTable() const {
     return impl->current_page_table;
+}
+
+bool MemorySystem::UsesHostMmu() const {
+    return impl->backing != nullptr && host_backing == impl->backing.get();
+}
+
+std::span<u8> MemorySystem::GetHostPool() const {
+    if (!impl->backing) {
+        return {};
+    }
+    return {impl->backing->Data(), impl->backing->Size()};
 }
 
 void MemorySystem::RasterizerFlushVirtualRegion(VAddr start, u32 size, FlushMode mode) {
@@ -514,10 +1150,16 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
               base * CITRA_PAGE_SIZE, (base + size) * CITRA_PAGE_SIZE);
 
     if (impl->system.IsPoweredOn()) {
+        // The page tables are about to change: not while the thread that decodes commands
+        // marks pages in them
+        impl->system.GPU().WaitIdle(VideoCore::GPU::WaitReason::MapPages);
         RasterizerFlushVirtualRegion(base << CITRA_PAGE_BITS, size * CITRA_PAGE_SIZE,
                                      FlushMode::FlushAndInvalidate);
     }
 
+    // The host's view of the address space follows in runs of pages, not page by page
+    std::scoped_lock mark_lock{impl->mark_mutex};
+    page_table.pointers.BeginChanges();
     u32 end = base + size;
     while (base != end) {
         ASSERT_MSG(base < PAGE_TABLE_NUM_ENTRIES, "out of range mapping at {:08X}", base);
@@ -526,15 +1168,26 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
         page_table.pointers[base] = memory;
 
         // If the memory to map is already rasterizer-cached, mark the page
-        if (type == PageType::Memory && impl->cache_marker.IsCached(base * CITRA_PAGE_SIZE)) {
+        const bool cached = impl->cache_marker.IsCached(base * CITRA_PAGE_SIZE);
+        const bool shut = impl->shut_marker.IsCached(base * CITRA_PAGE_SIZE);
+        const bool watched = impl->watch_marker.IsCached(base * CITRA_PAGE_SIZE) ||
+                             impl->armed_marker.IsCached(base * CITRA_PAGE_SIZE);
+        if (type == PageType::Memory && (cached || watched || shut)) {
             page_table.attributes[base] = PageType::RasterizerCachedMemory;
             page_table.pointers[base] = nullptr;
+            const bool read_through =
+                !shut &&
+                (cached ? impl->readable_marker.IsCached(base * CITRA_PAGE_SIZE) : watched);
+            page_table.pointers.SetReadOnly(base, read_through ? memory.GetPtr() : nullptr);
+        } else {
+            page_table.pointers.SetReadOnly(base, nullptr);
         }
 
         base += 1;
         if (memory != nullptr && memory.GetSize() > CITRA_PAGE_SIZE)
             memory += CITRA_PAGE_SIZE;
     }
+    page_table.pointers.EndChanges();
 }
 
 void MemorySystem::MapMemoryRegion(PageTable& page_table, VAddr base, u32 size, MemoryRef target) {
@@ -555,10 +1208,13 @@ MemoryRef MemorySystem::GetPointerForRasterizerCache(VAddr addr) const {
 }
 
 void MemorySystem::RegisterPageTable(std::shared_ptr<PageTable> page_table) {
+    // The list is gone through by whoever marks pages, on another thread too
+    std::scoped_lock mark_lock{impl->mark_mutex};
     impl->page_table_list.push_back(page_table);
 }
 
 void MemorySystem::UnregisterPageTable(std::shared_ptr<PageTable> page_table) {
+    std::scoped_lock mark_lock{impl->mark_mutex};
     auto it = std::find(impl->page_table_list.begin(), impl->page_table_list.end(), page_table);
     if (it != impl->page_table_list.end()) {
         impl->page_table_list.erase(it);
@@ -632,6 +1288,12 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
         }
     }
     case PageType::Memory:
+        // The marks of a page are changed by the thread that decodes GPU commands: between
+        // the look at the pointer and the look at the type this one became plain again
+        if (page_table->pointers[vaddr >> CITRA_PAGE_BITS] != nullptr ||
+            page_table->attributes[vaddr >> CITRA_PAGE_BITS] != PageType::Memory) {
+            return Read<T>(page_table, vaddr);
+        }
         ASSERT_MSG(false, "Mapped memory page without a pointer @ {:08X}", vaddr);
         break;
     case PageType::MemoryWatchpoint: {
@@ -651,17 +1313,22 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
         return value;
     }
     [[likely]] case PageType::RasterizerCachedMemory: {
-        RasterizerFlushVirtualRegion(vaddr, read_size, FlushMode::Flush);
+        // Not for a page the rasterizer holds nothing newer of
+        // (nor for one that is only armed: asked here, not after the whole way to the check)
+        if ((!impl->ReadsDirect(vaddr) || !impl->ReadsDirect(vaddr + read_size - 1)) &&
+            impl->ReadNeedsAnnouncing(vaddr, read_size)) {
+            RasterizerFlushVirtualRegion(vaddr, read_size, FlushMode::Flush);
+        }
 
         ReadType value;
-        std::memcpy(&value, GetPointerForRasterizerCache(vaddr), read_size);
+        std::memcpy(&value, impl->RasterizerCachePointer(vaddr), read_size);
         return value;
     }
     case PageType::RasterizerCachedMemoryWatchpoint: {
         RasterizerFlushVirtualRegion(vaddr, read_size, FlushMode::Flush);
 
         ReadType value;
-        std::memcpy(&value, GetPointerForRasterizerCache(vaddr), read_size);
+        std::memcpy(&value, impl->RasterizerCachePointer(vaddr), read_size);
 
 #ifdef ENABLE_GDBSTUB
         if (GDBStub::CheckBreakpoint(vaddr, read_size, GDBStub::BreakpointType::Read)) {
@@ -721,6 +1388,13 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
         (void)UnmappedAccess<T>(vaddr, data, false);
         return;
     case PageType::Memory:
+        // The marks of a page are changed by the thread that decodes GPU commands: between
+        // the look at the pointer and the look at the type this one became plain again
+        if (page_table->pointers[vaddr >> CITRA_PAGE_BITS] != nullptr ||
+            page_table->attributes[vaddr >> CITRA_PAGE_BITS] != PageType::Memory) {
+            Write<T>(page_table, vaddr, data);
+            return;
+        }
         ASSERT_MSG(false, "Mapped memory page without a pointer @ {:08X}", vaddr);
         break;
     case PageType::MemoryWatchpoint: {
@@ -740,12 +1414,12 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
     }
     [[likely]] case PageType::RasterizerCachedMemory: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
-        std::memcpy(GetPointerForRasterizerCache(vaddr), &data, sizeof(T));
+        std::memcpy(impl->RasterizerCachePointer(vaddr), &data, sizeof(T));
         break;
     }
     case PageType::RasterizerCachedMemoryWatchpoint: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
-        std::memcpy(GetPointerForRasterizerCache(vaddr), &data, sizeof(T));
+        std::memcpy(impl->RasterizerCachePointer(vaddr), &data, sizeof(T));
 
 #ifdef ENABLE_GDBSTUB
         if (GDBStub::CheckBreakpoint(vaddr, sizeof(T), GDBStub::BreakpointType::Write)) {
@@ -776,6 +1450,12 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
         (void)UnmappedAccess<T>(vaddr, data, false);
         return true;
     case PageType::Memory:
+        // The marks of a page are changed by the thread that decodes GPU commands: between
+        // the look at the pointer and the look at the type this one became plain again
+        if (impl->current_page_table->pointers[vaddr >> CITRA_PAGE_BITS] != nullptr ||
+            impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] != PageType::Memory) {
+            return WriteExclusive<T>(vaddr, data, expected);
+        }
         ASSERT_MSG(false, "Mapped memory page without a pointer @ {:08X}", vaddr);
         return true;
     case PageType::MemoryWatchpoint: {
@@ -799,13 +1479,13 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
     [[likely]] case PageType::RasterizerCachedMemory: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
         const auto volatile_pointer =
-            reinterpret_cast<volatile T*>(GetPointerForRasterizerCache(vaddr).GetPtr());
+            reinterpret_cast<volatile T*>(impl->RasterizerCachePointer(vaddr));
         return Common::AtomicCompareAndSwap(volatile_pointer, data, expected);
     }
     case PageType::RasterizerCachedMemoryWatchpoint: {
         RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
         const auto volatile_pointer =
-            reinterpret_cast<volatile T*>(GetPointerForRasterizerCache(vaddr).GetPtr());
+            reinterpret_cast<volatile T*>(impl->RasterizerCachePointer(vaddr));
 
 #ifdef ENABLE_GDBSTUB
         if (GDBStub::CheckBreakpoint(vaddr, sizeof(T), GDBStub::BreakpointType::Write)) {
@@ -853,6 +1533,12 @@ u8* MemorySystem::GetPointer(const VAddr vaddr) {
         return GetPointerForRasterizerCache(vaddr);
     }
 
+    // Its marks were changed between the two looks at it, by the thread that decodes GPU
+    // commands
+    if (u8* const again = impl->current_page_table->pointers[vaddr >> CITRA_PAGE_BITS]) {
+        return again + (vaddr & CITRA_PAGE_MASK);
+    }
+
     LOG_ERROR(HW_Memory, "unknown GetPointer @ 0x{:08x} at PC 0x{:08X}", vaddr, impl->GetPC());
     return nullptr;
 }
@@ -868,6 +1554,10 @@ const u8* MemorySystem::GetPointer(const VAddr vaddr) const {
         impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
             PageType::RasterizerCachedMemoryWatchpoint) {
         return GetPointerForRasterizerCache(vaddr);
+    }
+
+    if (const u8* const again = impl->current_page_table->pointers[vaddr >> CITRA_PAGE_BITS]) {
+        return again + (vaddr & CITRA_PAGE_MASK);
     }
 
     LOG_ERROR(HW_Memory, "unknown GetPointer @ 0x{:08x}", vaddr);
@@ -892,49 +1582,31 @@ std::string MemorySystem::ReadCString(VAddr vaddr, std::size_t max_length) {
 }
 
 MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address) {
-    if (address >= phys_mem_region_info_cache.region_start &&
-        address < phys_mem_region_info_cache.region_end) {
-        return phys_mem_region_info_cache;
-    }
-
-    constexpr std::array memory_areas = {
-        std::make_pair(VRAM_PADDR, VRAM_SIZE),
-        std::make_pair(DSP_RAM_PADDR, DSP_RAM_SIZE),
-        std::make_pair(FCRAM_PADDR, FCRAM_N3DS_SIZE),
-        std::make_pair(N3DS_EXTRA_RAM_PADDR, N3DS_EXTRA_RAM_SIZE),
+    // Nothing is remembered from one call to the next. This is called by more than one thread,
+    // and the answer of the call before, kept in a member and handed out again when the address
+    // fits, could be changed by another thread between the check and the handing out: main
+    // memory's start with an address in video memory, a pointer far outside both.
+    //
+    // Note: the region end check is inclusive because the user can pass in an address that
+    // represents an open right bound
+    const auto within = [address](PAddr start, u32 size) {
+        return address >= start && address <= start + size;
     };
-
-    const auto area = std::find_if(memory_areas.begin(), memory_areas.end(), [&](const auto& area) {
-        // Note: the region end check is inclusive because the user can pass in an address that
-        // represents an open right bound
-        return address >= area.first && address <= area.first + area.second;
-    });
-
-    if (area == memory_areas.end()) [[unlikely]] {
-        LOG_ERROR(HW_Memory, "Unknown GetPhysMemRegionInfo @ {:#08X} at PC {:#08X}", address,
-                  impl->GetPC());
-        phys_mem_region_info_cache = PhysMemRegionInfo();
-        return phys_mem_region_info_cache;
+    if (within(FCRAM_PADDR, FCRAM_N3DS_SIZE)) {
+        return {&impl->fcram_mem, FCRAM_PADDR, FCRAM_N3DS_SIZE};
     }
-
-    switch (area->first) {
-    case VRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->vram_mem, area->first, area->second};
-        break;
-    case DSP_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->dsp_mem, area->first, area->second};
-        break;
-    case FCRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->fcram_mem, area->first, area->second};
-        break;
-    case N3DS_EXTRA_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->n3ds_extra_ram_mem, area->first, area->second};
-        break;
-    default:
-        UNREACHABLE();
+    if (within(VRAM_PADDR, VRAM_SIZE)) {
+        return {&impl->vram_mem, VRAM_PADDR, VRAM_SIZE};
     }
-
-    return phys_mem_region_info_cache;
+    if (within(DSP_RAM_PADDR, DSP_RAM_SIZE)) {
+        return {&impl->dsp_mem, DSP_RAM_PADDR, DSP_RAM_SIZE};
+    }
+    if (within(N3DS_EXTRA_RAM_PADDR, N3DS_EXTRA_RAM_SIZE)) {
+        return {&impl->n3ds_extra_ram_mem, N3DS_EXTRA_RAM_PADDR, N3DS_EXTRA_RAM_SIZE};
+    }
+    LOG_ERROR(HW_Memory, "Unknown GetPhysMemRegionInfo @ {:#08X} at PC {:#08X}", address,
+              impl->GetPC());
+    return {};
 }
 
 u8* MemorySystem::GetPhysicalPointer(PAddr address) {
@@ -985,21 +1657,55 @@ std::vector<VAddr> MemorySystem::PhysicalToVirtualAddressForRasterizer(PAddr add
 }
 
 void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached) {
+    MarkRegionForRasterizer(start, size, cached, 0);
+}
+
+void MemorySystem::RasterizerMarkRegionWatched(PAddr start, u32 size, bool watched) {
+    MarkRegionForRasterizer(start, size, watched, 1);
+}
+
+void MemorySystem::MarkRegionForRasterizer(PAddr start, u32 size, bool set, int mark) {
     if (start == 0) {
         return;
     }
+    // `mark`: 0 cached, 1 watched, 2 armed, 3 shut
+    std::scoped_lock mark_lock{impl->mark_mutex};
 
     u32 num_pages = ((start + size - 1) >> CITRA_PAGE_BITS) - (start >> CITRA_PAGE_BITS) + 1;
     PAddr paddr = start;
 
+    // The host's views of the address spaces follow in runs of pages, not page by page
+    for (auto& page_table : impl->page_table_list) {
+        page_table->pointers.BeginChanges();
+    }
+    SCOPE_EXIT({
+        for (auto& page_table : impl->page_table_list) {
+            page_table->pointers.EndChanges();
+        }
+    });
+
     for (unsigned i = 0; i < num_pages; ++i, paddr += CITRA_PAGE_SIZE) {
         for (VAddr vaddr : PhysicalToVirtualAddressForRasterizer(paddr)) {
-            impl->cache_marker.Mark(vaddr, cached);
+            (mark == 0   ? impl->cache_marker
+             : mark == 1 ? impl->watch_marker
+             : mark == 2 ? impl->armed_marker
+                         : impl->shut_marker)
+                .Mark(vaddr, set);
+            if (mark == 0 && !set) {
+                // No longer cached: nothing is left to be readable in spite of
+                impl->readable_marker.Mark(vaddr, false);
+            }
+            // A page is taken out of the direct way by either mark and put back when it has
+            // neither
+            const bool cached = impl->cache_marker.IsCached(vaddr);
+            const bool watched = impl->watch_marker.IsCached(vaddr) ||
+                                 impl->armed_marker.IsCached(vaddr) ||
+                                 impl->shut_marker.IsCached(vaddr);
+            const std::size_t idx = vaddr >> CITRA_PAGE_BITS;
             for (auto& page_table : impl->page_table_list) {
-                PageType& page_type = page_table->attributes[vaddr >> CITRA_PAGE_BITS];
+                PageType& page_type = page_table->attributes[idx];
 
-                if (cached) {
-                    // Switch page type to cached if now cached
+                if (cached || watched) {
                     switch (page_type) {
                     case PageType::Unmapped:
                         // It is not necessary for a process to have this region mapped into its
@@ -1010,34 +1716,465 @@ void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached
                         page_type = (page_type == PageType::Memory)
                                         ? PageType::RasterizerCachedMemory
                                         : PageType::RasterizerCachedMemoryWatchpoint;
-                        page_table->pointers[vaddr >> CITRA_PAGE_BITS] = nullptr;
+                        page_table->pointers[idx] = nullptr;
+                        break;
+                    case PageType::RasterizerCachedMemory:
+                    case PageType::RasterizerCachedMemoryWatchpoint:
+                        // By the other of the two marks already
                         break;
                     default:
                         UNREACHABLE();
                     }
                 } else {
-                    // Switch page type to uncached if now uncached
                     switch (page_type) {
                     case PageType::Unmapped:
-                        // It is not necessary for a process to have this region mapped into its
-                        // address space, for example, a system module need not have a VRAM mapping.
+                    case PageType::Memory:
+                    case PageType::MemoryWatchpoint:
                         break;
                     case PageType::RasterizerCachedMemory:
                     case PageType::RasterizerCachedMemoryWatchpoint: {
-                        page_type = (page_type == PageType::RasterizerCachedMemory)
-                                        ? PageType::Memory
-                                        : PageType::MemoryWatchpoint;
-
-                        if (page_type == PageType::Memory) {
-                            page_table->pointers[vaddr >> CITRA_PAGE_BITS] =
+                        // The pointer first, then the type: another thread that reads the two
+                        // while this goes on must not find a plain page without a pointer
+                        const PageType plain = (page_type == PageType::RasterizerCachedMemory)
+                                                   ? PageType::Memory
+                                                   : PageType::MemoryWatchpoint;
+                        if (plain == PageType::Memory) {
+                            page_table->pointers[idx] =
                                 GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK);
                         }
+                        page_type = plain;
                         break;
                     }
                     default:
                         UNREACHABLE();
                     }
                 }
+
+                ApplyReadThrough(*page_table, vaddr);
+            }
+        }
+    }
+}
+
+void MemorySystem::ApplyReadThrough(PageTable& page_table, VAddr vaddr) {
+    // What reads a page that is only watched, or cached with nothing newer held of it, need
+    // not be told of: recompiled code that reaches memory through a view reads it there
+    const std::size_t idx = vaddr >> CITRA_PAGE_BITS;
+    const bool cached = impl->cache_marker.IsCached(vaddr);
+    const bool read_through =
+        page_table.attributes[idx] == PageType::RasterizerCachedMemory &&
+        !impl->shut_marker.IsCached(vaddr) &&
+        (cached ? impl->readable_marker.IsCached(vaddr)
+                : impl->watch_marker.IsCached(vaddr) || impl->armed_marker.IsCached(vaddr));
+    page_table.pointers.SetReadOnly(
+        idx,
+        read_through ? GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK).GetPtr() : nullptr);
+}
+
+void MemorySystem::RasterizerSetSurfaceCells(PAddr start, u32 size, bool covered) {
+    if (size == 0) {
+        return;
+    }
+    std::vector<u64>& cells = impl->surface_cells;
+    if (cells.empty()) {
+        cells.resize((FCRAM_N3DS_SIZE + VRAM_SIZE) >> CITRA_PAGE_BITS);
+    }
+    u32 done = 0;
+    while (done < size) {
+        const u32 in_page = (start + done) & CITRA_PAGE_MASK;
+        const u32 take = std::min(size - done, CITRA_PAGE_SIZE - in_page);
+        if (const auto page = Impl::CellPage(start + done)) {
+            const u64 mask = Impl::CellMask(in_page, in_page + take - 1);
+            if (covered) {
+                cells[*page] |= mask;
+            } else {
+                cells[*page] &= ~mask;
+            }
+        }
+        done += take;
+    }
+}
+
+void MemorySystem::RasterizerClearSurfaceCells() {
+    std::fill(impl->surface_cells.begin(), impl->surface_cells.end(), u64{0});
+}
+
+void MemorySystem::TrackGpuReferences(bool track) {
+    impl->track_references.store(track);
+}
+
+void MemorySystem::NoteGpuReference(PAddr addr, u32 size, GpuReference kind) {
+    impl->NoteGpuPages(addr, size, impl->gpu_reader, kind);
+}
+
+void MemorySystem::NoteGpuWritten(PAddr addr, u32 size) {
+    impl->NoteGpuPages(addr, size, 2, GpuReference::Other);
+}
+
+void MemorySystem::SetGpuReader(bool transfer) {
+    impl->gpu_reader = transfer ? 16 : 1;
+}
+
+void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued_before, u64 done,
+                                    std::vector<u32>& snapshot_pages,
+                                    std::unique_ptr<u8[]>& snapshot_bytes) {
+    std::vector<u32> fresh_list;
+    std::vector<u32> fresh_transfer;
+    std::vector<u32> fresh_written;
+    {
+        std::scoped_lock lock{impl->reference_mutex};
+        fresh_list.swap(impl->new_references);
+        fresh_transfer.swap(impl->new_transfer_references);
+        fresh_written.swap(impl->new_written);
+    }
+    std::vector<u8>& state = impl->reference_state;
+    const auto learn = [&](const std::vector<u32>& fresh, std::vector<u32>& waiting, u8 known) {
+        for (const u32 page : fresh) {
+            if ((state[page] & known) == 0) {
+                state[page] |= known;
+                waiting.push_back(page);
+            }
+        }
+    };
+    learn(fresh_list, impl->to_arm, 1);
+    learn(fresh_transfer, impl->to_arm_transfer, 16);
+    learn(fresh_written, impl->to_shut, 4);
+
+    // The volatile pages: copied for this command, and no longer armed once the commands
+    // that were handed over without a copy of them are done
+    std::vector<Impl::VolatilePage>& volatile_pages = impl->volatile_pages;
+    bool demoted = false;
+    for (Impl::VolatilePage& entry : volatile_pages) {
+        u8& bits = state[entry.page];
+        if ((bits & 2) != 0) {
+            if (entry.disarm_after == ~u64{0}) {
+                entry.disarm_after = queued_before;
+            }
+            if (done >= entry.disarm_after) {
+                MarkRegionForRasterizer(Impl::CellPageAddress(entry.page), CITRA_PAGE_SIZE, false,
+                                        2);
+                bits &= static_cast<u8>(~2);
+            }
+        }
+        if (!((for_list && (bits & 1) != 0) || (for_transfer && (bits & 16) != 0))) {
+            continue;
+        }
+        impl->snapshot_wanted.push_back(&entry);
+    }
+    if (!impl->snapshot_wanted.empty()) {
+        // One buffer for the command, left as it comes: all of it is written here
+        const std::size_t count = impl->snapshot_wanted.size();
+        snapshot_bytes.reset(new u8[count * CITRA_PAGE_SIZE]);
+        snapshot_pages.reserve(count);
+        u8* copy = snapshot_bytes.get();
+        for (Impl::VolatilePage* const entry : impl->snapshot_wanted) {
+            std::memcpy(copy, GetPhysicalPointer(Impl::CellPageAddress(entry->page)),
+                        CITRA_PAGE_SIZE);
+            snapshot_pages.push_back(entry->page);
+            // Whether the game still writes the page is looked at now and then only: the sum
+            // costs ten times the copy
+            if ((entry->turn++ & 31) == 0) {
+                u64 checksum = 0;
+                for (u32 i = 0; i < CITRA_PAGE_SIZE; i += sizeof(u64)) {
+                    u64 word;
+                    std::memcpy(&word, copy + i, sizeof(word));
+                    checksum = checksum * 31 + word;
+                }
+                u8& bits = state[entry->page];
+                if (checksum != entry->checksum) {
+                    entry->checksum = checksum;
+                    entry->same = 0;
+                } else if (++entry->same >= Impl::VOLATILE_DECAY && (bits & 2) == 0) {
+                    // Left alone for long: armed again, below
+                    bits &= static_cast<u8>(~32);
+                    if ((bits & 1) != 0) {
+                        impl->to_arm.push_back(entry->page);
+                    }
+                    if ((bits & 16) != 0) {
+                        impl->to_arm_transfer.push_back(entry->page);
+                    }
+                    demoted = true;
+                }
+            }
+            copy += CITRA_PAGE_SIZE;
+        }
+        impl->snapshot_bytes_copied += count * CITRA_PAGE_SIZE;
+        impl->snapshot_wanted.clear();
+    }
+    if (demoted) {
+        std::erase_if(volatile_pages, [&](const Impl::VolatilePage& entry) {
+            return (state[entry.page] & 32) == 0;
+        });
+    }
+
+    std::vector<u32> pages;
+    const auto arm = [&](std::vector<u32>& waiting, u8 now, int mark) {
+        if (waiting.empty()) {
+            return;
+        }
+        // A page read for both kinds of command waits in both lists, and a volatile one is
+        // copied instead
+        pages.clear();
+        for (const u32 page : waiting) {
+            if ((state[page] & now) == 0 && (mark != 2 || (state[page] & 32) == 0)) {
+                state[page] |= now;
+                pages.push_back(page);
+            }
+        }
+        waiting.clear();
+        // Pages next to each other in one go
+        std::sort(pages.begin(), pages.end());
+        std::size_t run_start = 0;
+        for (std::size_t i = 1; i <= pages.size(); i++) {
+            if (i == pages.size() || pages[i] != pages[i - 1] + 1 ||
+                pages[i] == (FCRAM_N3DS_SIZE >> CITRA_PAGE_BITS)) {
+                MarkRegionForRasterizer(Impl::CellPageAddress(pages[run_start]),
+                                        static_cast<u32>((i - run_start) << CITRA_PAGE_BITS), true,
+                                        mark);
+                run_start = i;
+            }
+        }
+    };
+    if (for_list) {
+        arm(impl->to_arm, 2, 2);
+    }
+    if (for_transfer) {
+        arm(impl->to_arm_transfer, 2, 2);
+    }
+    arm(impl->to_shut, 8, 3);
+}
+
+void MemorySystem::Disarm(PAddr addr, u32 size, bool written) {
+    std::vector<u8>& state = impl->reference_state;
+    if (size == 0 || !impl->track_references.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 last = u64{addr} + size - 1;
+    for (u64 at = addr & ~CITRA_PAGE_MASK; at <= last; at += CITRA_PAGE_SIZE) {
+        const auto page = Impl::CellPage(static_cast<PAddr>(at));
+        if (!page || (state[*page] & (2 | 8)) == 0) {
+            continue;
+        }
+        u8& bits = state[*page];
+        // What the decoder reads may be read by the game as well. A page that is written is
+        // one the game keeps writing, as a rule: copied at hand-overs from here on, not armed
+        // (the decoder has been waited for, nothing is left that reads it where it is)
+        if (written && (bits & 2) != 0) {
+            MarkRegionForRasterizer(static_cast<PAddr>(at), CITRA_PAGE_SIZE, false, 2);
+            bits &= static_cast<u8>(~2);
+            impl->AddVolatile(*page);
+            if ((bits & 32) == 0) {
+                // No room for more of them: armed again at the next hand-over
+                if ((bits & 1) != 0) {
+                    impl->to_arm.push_back(static_cast<u32>(*page));
+                }
+                if ((bits & 16) != 0) {
+                    impl->to_arm_transfer.push_back(static_cast<u32>(*page));
+                }
+            }
+        }
+        if ((bits & 8) != 0) {
+            MarkRegionForRasterizer(static_cast<PAddr>(at), CITRA_PAGE_SIZE, false, 3);
+            bits &= static_cast<u8>(~8);
+            impl->to_shut.push_back(static_cast<u32>(*page));
+        }
+    }
+}
+
+void MemorySystem::ExemptReads(PAddr addr, u32 size) {
+    for (Impl::LateRange& range : impl->late_ranges) {
+        if (range.addr == addr && range.size == size) {
+            range.last_vblank = impl->late_vblank;
+            return;
+        }
+    }
+    if (impl->late_ranges.size() >= 16) {
+        impl->late_ranges.erase(impl->late_ranges.begin());
+    }
+    impl->late_ranges.push_back({addr, size, impl->late_vblank});
+}
+
+void MemorySystem::PostLateWrite(PAddr addr, std::vector<u8>&& bytes) {
+    std::scoped_lock lock{impl->late_mutex};
+    impl->late_writes.emplace_back(addr, std::move(bytes));
+    impl->has_late_writes.store(true);
+}
+
+void MemorySystem::ApplyLateWrites() {
+    impl->late_vblank++;
+    if (!impl->has_late_writes.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::vector<std::pair<PAddr, std::vector<u8>>> writes;
+    {
+        std::scoped_lock lock{impl->late_mutex};
+        writes.swap(impl->late_writes);
+        impl->has_late_writes.store(false);
+    }
+    for (const auto& [addr, bytes] : writes) {
+        // Only where the game is being given it late: not over what it has since been given
+        // the usual way, or has written itself
+        for (Impl::LateRange& range : impl->late_ranges) {
+            if (addr >= range.addr && u64{addr} + bytes.size() <= u64{range.addr} + range.size &&
+                impl->late_vblank - range.last_vblank <= Impl::LATE_RANGE_VBLANKS + 1) {
+                if (u8* const target = GetPhysicalPointer(addr)) {
+                    std::memcpy(target, bytes.data(), bytes.size());
+                }
+                range.last_vblank = impl->late_vblank;
+                break;
+            }
+        }
+    }
+}
+
+void MemorySystem::DisarmAll() {
+    std::vector<u8>& state = impl->reference_state;
+    for (std::size_t page = 0; page < state.size(); page++) {
+        u8& bits = state[page];
+        if ((bits & (2 | 8)) == 0) {
+            continue;
+        }
+        const PAddr addr = Impl::CellPageAddress(page);
+        if ((bits & 2) != 0) {
+            MarkRegionForRasterizer(addr, CITRA_PAGE_SIZE, false, 2);
+            bits &= static_cast<u8>(~2);
+            if ((bits & 32) == 0) {
+                if ((bits & 1) != 0) {
+                    impl->to_arm.push_back(static_cast<u32>(page));
+                }
+                if ((bits & 16) != 0) {
+                    impl->to_arm_transfer.push_back(static_cast<u32>(page));
+                }
+            }
+        }
+        if ((bits & 8) != 0) {
+            MarkRegionForRasterizer(addr, CITRA_PAGE_SIZE, false, 3);
+            bits &= static_cast<u8>(~8);
+            impl->to_shut.push_back(static_cast<u32>(page));
+        }
+    }
+    for (Impl::VolatilePage& entry : impl->volatile_pages) {
+        entry.disarm_after = ~u64{0};
+    }
+}
+
+void MemorySystem::WantVolatile(PAddr addr, u32 size) {
+    if (size == 0) {
+        return;
+    }
+    const u64 last = u64{addr} + size - 1;
+    for (u64 at = addr & ~CITRA_PAGE_MASK; at <= last; at += CITRA_PAGE_SIZE) {
+        const auto page = Impl::CellPage(static_cast<PAddr>(at));
+        if (page && (impl->reference_state[*page] & 2) != 0) {
+            impl->AddVolatile(*page);
+        }
+    }
+}
+
+void MemorySystem::UseGpuSnapshot(const std::vector<u32>& pages, const u8* bytes) {
+    impl->snapshot_pages = &pages;
+    impl->snapshot_bytes = bytes;
+    impl->snapshot_read.assign(pages.size(), 0);
+    for (std::size_t i = 0; i < pages.size(); i++) {
+        impl->snapshot_slot[pages[i]] = static_cast<u16>(i + 1);
+    }
+}
+
+void MemorySystem::DropGpuSnapshot() {
+    if (!impl->snapshot_pages) {
+        return;
+    }
+    for (const u32 page : *impl->snapshot_pages) {
+        impl->snapshot_slot[page] = 0;
+    }
+    u64 read = 0;
+    for (const u8 was_read : impl->snapshot_read) {
+        read += was_read;
+    }
+    impl->snapshot_given_sum.fetch_add(impl->snapshot_pages->size(), std::memory_order_relaxed);
+    impl->snapshot_read_sum.fetch_add(read, std::memory_order_relaxed);
+    impl->snapshot_pages = nullptr;
+    impl->snapshot_bytes = nullptr;
+    impl->stitched.clear();
+}
+
+const u8* MemorySystem::GpuRead(PAddr addr, u32 size) {
+    const u8* const direct = GetPhysicalPointer(addr);
+    if (!impl->snapshot_pages || size == 0 || !direct) [[likely]] {
+        return direct;
+    }
+    const auto first = Impl::CellPage(addr);
+    const auto last = Impl::CellPage(addr + size - 1);
+    if (!first || !last || *last < *first) {
+        return direct;
+    }
+    const std::vector<u16>& slot = impl->snapshot_slot;
+    bool any = false;
+    bool all = true;
+    for (std::size_t page = *first; page <= *last; page++) {
+        if (slot[page] != 0) {
+            any = true;
+            impl->snapshot_read[slot[page] - 1u] = 1;
+        } else {
+            all = false;
+        }
+    }
+    if (!any) {
+        return direct;
+    }
+    const u32 in_page = addr & CITRA_PAGE_MASK;
+    if (all) {
+        // Pages next to each other are next to each other among the copies
+        return impl->snapshot_bytes + std::size_t{slot[*first] - 1u} * CITRA_PAGE_SIZE + in_page;
+    }
+    std::vector<u8>& whole = impl->stitched.emplace_back(size);
+    u32 done = 0;
+    for (std::size_t page = *first; page <= *last; page++) {
+        const u32 from = page == *first ? in_page : 0;
+        const u32 take = std::min(size - done, CITRA_PAGE_SIZE - from);
+        const u8* const source =
+            slot[page] != 0
+                ? impl->snapshot_bytes + std::size_t{slot[page] - 1u} * CITRA_PAGE_SIZE + from
+                : direct + done;
+        std::memcpy(whole.data() + done, source, take);
+        done += take;
+    }
+    return whole.data();
+}
+
+std::pair<u64, u64> MemorySystem::TakeSnapshotReadFigures() {
+    return {impl->snapshot_given_sum.exchange(0, std::memory_order_relaxed),
+            impl->snapshot_read_sum.exchange(0, std::memory_order_relaxed)};
+}
+
+std::pair<u32, u64> MemorySystem::TakeSnapshotFigures() {
+    return {static_cast<u32>(impl->volatile_pages.size()),
+            std::exchange(impl->snapshot_bytes_copied, 0)};
+}
+
+void MemorySystem::RasterizerMarkRegionReadable(PAddr start, u32 size, bool readable) {
+    if (start == 0 || size == 0) {
+        return;
+    }
+    std::scoped_lock mark_lock{impl->mark_mutex};
+    const u32 num_pages = ((start + size - 1) >> CITRA_PAGE_BITS) - (start >> CITRA_PAGE_BITS) + 1;
+    PAddr paddr = start & ~CITRA_PAGE_MASK;
+
+    for (auto& page_table : impl->page_table_list) {
+        page_table->pointers.BeginChanges();
+    }
+    SCOPE_EXIT({
+        for (auto& page_table : impl->page_table_list) {
+            page_table->pointers.EndChanges();
+        }
+    });
+
+    for (u32 i = 0; i < num_pages; ++i, paddr += CITRA_PAGE_SIZE) {
+        for (VAddr vaddr : PhysicalToVirtualAddressForRasterizer(paddr)) {
+            // Only of a cached page can this be said
+            impl->readable_marker.Mark(vaddr, readable && impl->cache_marker.IsCached(vaddr));
+            for (auto& page_table : impl->page_table_list) {
+                ApplyReadThrough(*page_table, vaddr);
             }
         }
     }
@@ -1173,10 +2310,15 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
             break;
         }
         case PageType::Memory: {
-            DEBUG_ASSERT(page_table.pointers[page_index]);
-
-            u8* dest_ptr = page_table.pointers[page_index] + page_offset;
-            std::memset(dest_ptr, 0, copy_amount);
+            u8* page = page_table.pointers[page_index];
+            if (!page) [[unlikely]] {
+                // Marked for the rasterizer since the look at its type, by the thread that
+                // decodes GPU commands
+                RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
+                                             FlushMode::Invalidate);
+                page = GetPointerForRasterizerCache(current_vaddr & ~CITRA_PAGE_MASK).GetPtr();
+            }
+            std::memset(page + page_offset, 0, copy_amount);
             break;
         }
         case PageType::MemoryWatchpoint: {
@@ -1233,9 +2375,15 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
             break;
         }
         case PageType::Memory: {
-            DEBUG_ASSERT(page_table.pointers[page_index]);
-            const u8* src_ptr = page_table.pointers[page_index] + page_offset;
-            WriteBlock(dest_process, dest_addr, src_ptr, copy_amount);
+            const u8* page = page_table.pointers[page_index];
+            if (!page) [[unlikely]] {
+                // Marked for the rasterizer since the look at its type, by the thread that
+                // decodes GPU commands
+                RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
+                                             FlushMode::Flush);
+                page = GetPointerForRasterizerCache(current_vaddr & ~CITRA_PAGE_MASK).GetPtr();
+            }
+            WriteBlock(dest_process, dest_addr, page + page_offset, copy_amount);
             break;
         }
         case PageType::MemoryWatchpoint: {
@@ -1249,8 +2397,10 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
         }
         case PageType::RasterizerCachedMemory:
         case PageType::RasterizerCachedMemoryWatchpoint: {
-            RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
-                                         FlushMode::Flush);
+            if (!impl->ReadsDirect(current_vaddr)) {
+                RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
+                                             FlushMode::Flush);
+            }
             WriteBlock(dest_process, dest_addr, GetPointerForRasterizerCache(current_vaddr),
                        copy_amount);
             break;

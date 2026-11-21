@@ -102,6 +102,7 @@ void LogSettings() {
     log_setting("Renderer_ShadersAccurateMul", values.shaders_accurate_mul.GetValue());
     log_setting("Renderer_UseShaderJit", values.use_shader_jit.GetValue());
     log_setting("Renderer_UseResolutionFactor", values.resolution_factor.GetValue());
+    log_setting("Renderer_DynamicResolution", values.dynamic_resolution.GetValue());
     log_setting("Renderer_SampleCount", values.antialiasing.GetValue());
     log_setting("Renderer_UseIntegerScaling", values.use_integer_scaling.GetValue());
     log_setting("Renderer_FrameLimit", values.frame_limit.GetValue());
@@ -226,6 +227,7 @@ void RestoreGlobalState(bool is_powered_on) {
     values.use_skip_duplicate_frames.SetGlobal(true);
     values.use_limit_frames_ahead_of_gpu.SetGlobal(true);
     values.resolution_factor.SetGlobal(true);
+    values.dynamic_resolution.SetGlobal(true);
     values.antialiasing.SetGlobal(true);
     values.use_integer_scaling.SetGlobal(true);
     values.frame_limit.SetGlobal(true);

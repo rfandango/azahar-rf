@@ -25,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <mutex>
 #include "common/common_types.h"
 
@@ -43,6 +44,8 @@ public:
         double lead_ms;    ///< How long before its refresh the latest of the recent images came
         double target_ms;  ///< The lead aimed for
         double minimum_ms; ///< The lead below which an image misses its refresh
+        double work_ms;    ///< Of that, the time allowed for an image to get through the GPU
+        double ready_ms;   ///< How early the least ready of the recent images was, as reported
         u32 slips;         ///< Images that came too late for their refresh
         u32 misses;        ///< Images that were on time and still shown late
     };
@@ -50,8 +53,16 @@ public:
     /// The refresh period of the display, and whether it reports display times and takes them.
     void SetDisplay(std::chrono::nanoseconds refresh_period, bool can_schedule);
 
-    /// An image reached the display at the given time (steady clock, nanoseconds).
-    void NoteDisplayed(u32 present_id, u64 display_time_ns);
+    /// What NoteDisplayed is given where the display does not say how early an image was ready
+    static constexpr s64 NO_MARGIN = std::numeric_limits<s64>::min();
+
+    /// An image reached the display at the given time (steady clock, nanoseconds), having
+    /// been ready `margin_ns` before the display had to have it, if the display says.
+    void NoteDisplayed(u32 present_id, u64 display_time_ns, s64 margin_ns = NO_MARGIN);
+
+    /// The image `present_id` has been rendered and is being queued for the display. How long
+    /// that took from its hand-over is part of the lead an image needs.
+    void NoteQueued(u32 present_id, Clock::time_point now);
 
     /// The image `present_id` of VBlank number `vblank` is being handed over. Returns the time it
     /// should be displayed at (steady clock, nanoseconds), or 0 for as soon as possible.
@@ -74,6 +85,8 @@ private:
         u32 present_id;
         s64 target;
         s64 lead;
+        /// How long it took from hand-over to being queued, once that is known
+        s64 work;
     };
     struct HandedOver {
         u32 present_id;
@@ -101,7 +114,15 @@ private:
     u64 reference_vblank{};
     s64 reference_target{};
     bool locked{};
+    /// What the display needs: how long before its refresh an image has to be queued
     s64 minimum_lead{};
+    /// Images the display has said how early they were ready of. From the eighth on the
+    /// lead goes by that: `minimum_lead` is what the display needed for the recent images.
+    u32 margin_reports{};
+    std::array<s64, 32> recent_ready{};
+    /// How long an image may take from hand-over to being queued (rendered by the GPU): the
+    /// longest of the recent ones, let down slowly. The lead asked for is the two together.
+    s64 work_allowance{};
     /// Kept between the minimum lead and the latest recent image. Grows when images come too
     /// late, shrinks slowly while they do not.
     s64 margin{};

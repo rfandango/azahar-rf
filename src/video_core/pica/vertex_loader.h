@@ -24,7 +24,8 @@ public:
 
     template <typename T>
     void LoadAttribute(PAddr source_addr, u32 attrib, AttributeBuffer& out) const {
-        const T* data = reinterpret_cast<const T*>(memory.GetPhysicalPointer(source_addr));
+        const T* data = reinterpret_cast<const T*>(memory.GpuRead(
+            source_addr, static_cast<u32>(sizeof(T)) * vertex_attribute_elements[attrib]));
         for (u32 comp = 0; comp < vertex_attribute_elements[attrib]; ++comp) {
             out[attrib][comp] = f24::FromFloat32(data[comp]);
         }

@@ -53,19 +53,39 @@ PerfStats::~PerfStats() {
 }
 
 void PerfStats::BeginSVCProcessing() {
-    start_svc_time = Clock::now();
+    // A game makes tens of thousands of system calls a second, and reading the clock at both
+    // ends of each took 4% of all CPU time (Xenoblade Chronicles 3D on a Snapdragon 865,
+    // where reading the clock is a system call of the host). One call in sixteen is timed
+    // and stands for the others. The few calls that process GPU commands are far longer
+    // than the rest and would make such an estimate jump: that part is timed every time,
+    // and kept out of what is scaled up.
+    svc_sample_interval =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyEmulationOverheads)
+            ? 1
+            : SVC_SAMPLE_INTERVAL;
+    svc_timed = (svc_count++ % svc_sample_interval) == 0;
+    if (svc_timed) {
+        start_svc_time = Clock::now();
+    }
 }
 
 void PerfStats::EndSVCProcessing() {
-    accumulated_svc_time += (Clock::now() - start_svc_time);
+    if (svc_timed) {
+        accumulated_svc_time += (Clock::now() - start_svc_time);
+        svc_timed = false;
+    }
 }
 
 void PerfStats::BeginIPCProcessing() {
-    start_ipc_time = Clock::now();
+    if (svc_timed) {
+        start_ipc_time = Clock::now();
+    }
 }
 
 void PerfStats::EndIPCProcessing() {
-    accumulated_ipc_time += (Clock::now() - start_ipc_time);
+    if (svc_timed) {
+        accumulated_ipc_time += (Clock::now() - start_ipc_time);
+    }
 }
 
 void PerfStats::BeginGPUProcessing() {
@@ -73,7 +93,11 @@ void PerfStats::BeginGPUProcessing() {
 }
 
 void PerfStats::EndGPUProcessing() {
-    accumulated_gpu_time += (Clock::now() - start_gpu_time);
+    const Clock::duration taken = Clock::now() - start_gpu_time;
+    accumulated_gpu_time += taken;
+    if (svc_timed) {
+        accumulated_gpu_time_in_timed_svc += taken;
+    }
 }
 
 void PerfStats::StartSwap() {
@@ -155,16 +179,22 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
         system_frames ? (duration_cast<DoubleSecs>(accumulated_frametime).count() /
                          static_cast<double>(system_frames))
                       : 0;
-    last_stats.time_hle_svc =
-        system_frames
-            ? (duration_cast<DoubleSecs>(accumulated_svc_time - accumulated_ipc_time).count() /
-               static_cast<double>(system_frames))
-            : 0;
+    // The system calls that were timed stand for all of them, but for the GPU command
+    // processing in them, which is timed in every call
+    const auto for_all_calls = [this](Clock::duration timed) {
+        return (timed - accumulated_gpu_time_in_timed_svc) * svc_sample_interval +
+               accumulated_gpu_time;
+    };
+    const Clock::duration svc_time = for_all_calls(accumulated_svc_time);
+    const Clock::duration ipc_time = for_all_calls(accumulated_ipc_time);
+    last_stats.time_hle_svc = system_frames
+                                  ? (duration_cast<DoubleSecs>(svc_time - ipc_time).count() /
+                                     static_cast<double>(system_frames))
+                                  : 0;
     last_stats.time_hle_ipc =
-        system_frames
-            ? (duration_cast<DoubleSecs>(accumulated_ipc_time - accumulated_gpu_time).count() /
-               static_cast<double>(system_frames))
-            : 0;
+        system_frames ? (duration_cast<DoubleSecs>(ipc_time - accumulated_gpu_time).count() /
+                         static_cast<double>(system_frames))
+                      : 0;
     last_stats.time_gpu = system_frames ? (duration_cast<DoubleSecs>(accumulated_gpu_time).count() /
                                            static_cast<double>(system_frames))
                                         : 0;
@@ -174,11 +204,11 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
                                : 0;
 
     last_stats.time_remaining =
-        system_frames ? (duration_cast<DoubleSecs>((accumulated_frametime - accumulated_svc_time) -
-                                                   accumulated_swap_time)
-                             .count() /
-                         static_cast<double>(system_frames))
-                      : 0;
+        system_frames
+            ? (duration_cast<DoubleSecs>((accumulated_frametime - svc_time) - accumulated_swap_time)
+                   .count() /
+               static_cast<double>(system_frames))
+            : 0;
     last_stats.emulation_speed = system_us_per_second.count() / 1'000'000.0;
     last_stats.artic_transmitted = static_cast<double>(artic_transmitted) / interval;
     last_stats.artic_events.raw = artic_events.raw | prev_artic_event.raw;
@@ -191,6 +221,7 @@ PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_
     accumulated_svc_time = Clock::duration::zero();
     accumulated_ipc_time = Clock::duration::zero();
     accumulated_gpu_time = Clock::duration::zero();
+    accumulated_gpu_time_in_timed_svc = Clock::duration::zero();
     accumulated_swap_time = Clock::duration::zero();
     game_frames = 0;
     artic_transmitted = 0;

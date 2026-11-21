@@ -20,6 +20,7 @@ constexpr const char* LEVEL_PROPERTY = "debug.azahar.trace";
 constexpr const char* EXPERIMENT_PROPERTY = "debug.azahar.experiment";
 
 constexpr const char* EXPERIMENT2_PROPERTY = "debug.azahar.experiment2";
+constexpr const char* EXPERIMENT3_PROPERTY = "debug.azahar.experiment3";
 
 std::uint32_t ReadExperiments(const char* property = EXPERIMENT_PROPERTY) {
     char value[PROP_VALUE_MAX]{};
@@ -32,6 +33,7 @@ std::uint32_t ReadExperiments(const char* property = EXPERIMENT_PROPERTY) {
 // (pipelines built from the disk cache while a game starts).
 std::atomic<std::uint32_t> experiments{ReadExperiments()};
 std::atomic<std::uint32_t> experiments2{ReadExperiments(EXPERIMENT2_PROPERTY)};
+std::atomic<std::uint32_t> experiments3{ReadExperiments(EXPERIMENT3_PROPERTY)};
 
 constexpr const char* STALL_PROPERTY = "debug.azahar.stall";
 
@@ -126,6 +128,10 @@ std::uint32_t Experiments2() {
     return experiments2.load(std::memory_order_relaxed);
 }
 
+std::uint32_t Experiments3() {
+    return experiments3.load(std::memory_order_relaxed);
+}
+
 InjectedStall Stall() {
     const std::uint64_t value = stall.load(std::memory_order_relaxed);
     return {static_cast<std::uint32_t>(value >> 32), static_cast<std::uint32_t>(value)};
@@ -134,6 +140,7 @@ InjectedStall Stall() {
 void EndFrame() {
     experiments.store(ReadExperiments(), std::memory_order_relaxed);
     experiments2.store(ReadExperiments(EXPERIMENT2_PROPERTY), std::memory_order_relaxed);
+    experiments3.store(ReadExperiments(EXPERIMENT3_PROPERTY), std::memory_order_relaxed);
     stall.store(ReadStall(), std::memory_order_relaxed);
 
     if (!IsEnabled(Level::Frame)) {

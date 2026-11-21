@@ -57,6 +57,10 @@ public:
     /// Removes as much state as possible from the rasterizer in preparation for a save/load state
     virtual void ClearAll(bool flush) = 0;
 
+    /// Hands what has been drawn so far to the host GPU, for it to start on, where the
+    /// rasterizer would otherwise keep it until the frame is composed
+    virtual void SubmitPendingWork() {}
+
     /// Attempt to use a faster method to perform a display transfer with is_texture_copy = 0
     virtual bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&) {
         return false;

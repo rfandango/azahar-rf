@@ -70,8 +70,15 @@ std::shared_ptr<Process> KernelSystem::GetCurrentProcess() const {
     return current_process;
 }
 
-void KernelSystem::SetCurrentProcess(std::shared_ptr<Process> process) {
-    current_process = process;
+void KernelSystem::SetCurrentProcess(const std::shared_ptr<Process>& process) {
+    // Every switch between the emulated cores comes through here, tens of thousands of times
+    // a second, and nearly always with the process that is current already. Copying a
+    // shared pointer is two atomic operations: here and below a pointer that does not
+    // change is not assigned again.
+    if (current_process != process ||
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyEmulationOverheads)) {
+        current_process = process;
+    }
     SetCurrentMemoryPageTable(process->vm_manager.page_table);
 }
 
@@ -85,7 +92,7 @@ void KernelSystem::SetCurrentProcessForCPU(std::shared_ptr<Process> process, u32
     }
 }
 
-void KernelSystem::SetCurrentMemoryPageTable(std::shared_ptr<Memory::PageTable> page_table) {
+void KernelSystem::SetCurrentMemoryPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
     memory.SetCurrentPageTable(page_table);
     if (current_cpu != nullptr) {
         current_cpu->SetPageTable(page_table);
@@ -100,7 +107,7 @@ void KernelSystem::SetCPUs(std::vector<std::shared_ptr<Core::ARM_Interface>> cpu
 }
 
 void KernelSystem::SetRunningCPU(Core::ARM_Interface* cpu) {
-    if (current_process) {
+    if (current_process && stored_processes[current_cpu->GetID()] != current_process) {
         stored_processes[current_cpu->GetID()] = current_process;
     }
     current_cpu = cpu;

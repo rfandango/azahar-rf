@@ -90,6 +90,16 @@ private:
     /// Tells the frame pacer and the hitch tracker about the display behind the swapchain.
     void UpdateDisplay();
 
+public:
+    /// By how many degrees the frames for this window are to be drawn turned, see
+    /// Swapchain::GetPreRotation. Any thread.
+    u32 PreRotation() const noexcept {
+        return pre_rotation.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<u32> pre_rotation{};
+
     vk::RenderPass CreateRenderpass();
 
 private:

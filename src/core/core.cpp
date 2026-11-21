@@ -134,6 +134,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
 #endif
 
     ProcessPendingWork();
+    if (gpu) {
+        gpu->DeliverInterrupts();
+    }
 
     Signal signal{Signal::None};
     u32 param{};
@@ -297,6 +300,20 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             cpu_core->PrepareReschedule();
             kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
             max_slice = std::min(max_slice, cpu_core->GetTimer().GetMaxSliceLength());
+        }
+        // With commands still on their way through the thread that decodes them and no core
+        // with anything to run, the next thing to happen is the interrupt that says they are
+        // done. Emulated time is not to run on to whatever comes after it.
+        if (gpu && gpu->HasPendingWork() && !gpu->CompletesEarly()) {
+            bool anything_to_run = false;
+            for (const auto& cpu_core : cpu_cores) {
+                anything_to_run |=
+                    kernel->GetThreadManager(cpu_core->GetID()).GetCurrentThread() != nullptr;
+            }
+            if (!anything_to_run) {
+                gpu->WaitIdle(VideoCore::GPU::WaitReason::NothingToRun);
+                return status;
+            }
         }
         for (auto& cpu_core : cpu_cores) {
             cpu_core->GetTimer().SetNextSlice(max_slice);
@@ -685,7 +702,7 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
             jit_code_cache.reset();
         } else if (!jit_code_cache || jit_code_cache->GetProgramId() != program_id) {
             jit_code_cache.reset();
-            jit_code_cache = std::make_unique<JitCodeCache>(program_id);
+            jit_code_cache = std::make_unique<JitCodeCache>(program_id, memory->UsesHostMmu());
         }
 #endif
         for (u32 i = 0; i < num_cores; ++i) {

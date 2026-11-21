@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -146,6 +149,47 @@ void PollLoadStateRequest() {
     }
 }
 
+/// Writes where the recompiler has the host code of each block of the game when
+/// `debug.azahar.dump_blocks` changes, for telling the samples a CPU profile has in recompiled
+/// code apart by the game's own code. The file, recompiler-blocks.txt next to the frame
+/// dumps, has a line for each block, see ARM_Interface::DumpBlockLocations.
+void PollBlockDumpRequest() {
+    static int last_request = 0;
+    char value[PROP_VALUE_MAX]{};
+    const int request =
+        __system_property_get("debug.azahar.dump_blocks", value) > 0 ? std::atoi(value) : 0;
+    if (request == last_request) {
+        return;
+    }
+    last_request = request;
+    auto& system = Core::System::GetInstance();
+    if (request <= 0 || !system.IsPoweredOn()) {
+        return;
+    }
+    std::string package;
+    if (std::FILE* file = std::fopen("/proc/self/cmdline", "r")) {
+        char data[256]{};
+        const std::size_t read = std::fread(data, 1, sizeof(data) - 1, file);
+        std::fclose(file);
+        package.assign(data, strnlen(data, read));
+    }
+    const std::string dir = fmt::format("/sdcard/Android/data/{}/files", package);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::string path = dir + "/recompiler-blocks.txt";
+    std::FILE* const out = std::fopen(path.c_str(), "w");
+    if (!out) {
+        LOG_ERROR(Frontend, "Could not write {}", path);
+        return;
+    }
+    // On the emulation thread, between two stretches of emulated time: no core is running
+    for (u32 core = 0; core < system.GetNumCores(); core++) {
+        system.GetCore(core).DumpBlockLocations(out);
+    }
+    std::fclose(out);
+    LOG_INFO(Frontend, "Wrote the recompiler's blocks to {}", path);
+}
+
 /// Applies the settings anew when `debug.azahar.reapply` changes, as the app does on another
 /// thread when one of them is changed while a game runs, the layout of the screens for one.
 void PollReapplyRequest() {
@@ -205,6 +249,7 @@ void EmuWindow_Android::ReportFrameWork() {
     KeepOffSlowCores();
 #ifdef CITRA_ENABLE_TRACE_MARKERS
     PollLoadStateRequest();
+    PollBlockDumpRequest();
     PollReapplyRequest();
     PollLayoutRequest();
 #endif

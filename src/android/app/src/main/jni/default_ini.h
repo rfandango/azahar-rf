@@ -188,6 +188,11 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # factor for the 3DS resolution
 )") DECLARE_KEY(resolution_factor) BOOST_HANA_STRING(R"(
 
+# Lower the resolution scale factor (to half of it at the most) while the GPU cannot keep up
+# with the game, and raise it again when it can. Vulkan only.
+# 0 (default): Off, 1: On
+)") DECLARE_KEY(dynamic_resolution) BOOST_HANA_STRING(R"(
+
 # Antialiasing mode
 # 0 (default): None, 1: MSAAx2, 2: MSAAx4, 3: MSAAx8, 4: MSAAx16
 )") DECLARE_KEY(antialiasing) BOOST_HANA_STRING(R"(

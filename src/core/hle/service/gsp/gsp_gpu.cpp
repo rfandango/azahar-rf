@@ -11,6 +11,7 @@
 #include "common/archives.h"
 #include "common/bit_field.h"
 #include "common/hacks/hack_manager.h"
+#include "common/hitch_tracker.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -376,6 +377,7 @@ void GSP_GPU::WriteHWRegRepeat(Kernel::HLERequestContext& ctx) {
 }
 
 void GSP_GPU::ReadHWRegs(Kernel::HLERequestContext& ctx) {
+    Common::Hitches::NoteGpuCall(Common::Hitches::GpuCall::RegisterRead);
     IPC::RequestParser rp(ctx);
     u32 reg_addr = rp.Pop<u32>();
     u32 input_size = rp.Pop<u32>();
@@ -870,8 +872,29 @@ void GSP_GPU::TriggerCmdReqQueue(Kernel::HLERequestContext& ctx) {
 
         // Decode and execute command
         system.perf_stats->BeginGPUProcessing();
-        const Result result = gpu.Execute(command);
+        const Result result = gpu.Submit(command);
         system.perf_stats->EndGPUProcessing();
+        switch (command.id) {
+        case CommandId::SubmitCmdList:
+            Common::Hitches::NoteGpuCall(Common::Hitches::GpuCall::CommandList);
+            break;
+        case CommandId::MemoryFill:
+            Common::Hitches::NoteGpuCall(Common::Hitches::GpuCall::Fill);
+            break;
+        case CommandId::DisplayTransfer:
+        case CommandId::TextureCopy:
+            Common::Hitches::NoteGpuCall(Common::Hitches::GpuCall::Transfer);
+            break;
+        default:
+            Common::Hitches::NoteGpuCall(Common::Hitches::GpuCall::OtherCommand);
+            break;
+        }
+        if (command.id == CommandId::SubmitCmdList) {
+            if (const Kernel::Thread* const thread =
+                    system.Kernel().GetCurrentThreadManager().GetCurrentThread()) {
+                Common::Hitches::NoteCommandListDone(thread->GetThreadId());
+            }
+        }
 
         // The GSP module stores the error of a failed command and keeps going.
         if (result.IsError()) {

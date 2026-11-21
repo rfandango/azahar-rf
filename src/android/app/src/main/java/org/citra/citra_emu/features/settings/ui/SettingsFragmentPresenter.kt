@@ -967,6 +967,16 @@ class SettingsFragmentPresenter(
             add(
                 SwitchSetting(
                     editingSettings,
+                    BooleanSetting.DYNAMIC_RESOLUTION,
+                    R.string.dynamic_resolution,
+                    R.string.dynamic_resolution_description,
+                    BooleanSetting.DYNAMIC_RESOLUTION.key,
+                    BooleanSetting.DYNAMIC_RESOLUTION.defaultValue
+                )
+            )
+            add(
+                SwitchSetting(
+                    editingSettings,
                     BooleanSetting.USE_INTEGER_SCALING,
                     R.string.use_integer_scaling,
                     R.string.use_integer_scaling_description,

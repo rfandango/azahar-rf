@@ -580,6 +580,7 @@ struct Values {
         true, Keys::use_display_refresh_rate_detection};
     Setting<bool> use_shader_jit{true, Keys::use_shader_jit};
     SwitchableSetting<u32, true> resolution_factor{1, 0, 18, Keys::resolution_factor};
+    SwitchableSetting<bool> dynamic_resolution{false, Keys::dynamic_resolution};
     SwitchableSetting<AntiAliasingMethod> antialiasing{AntiAliasingMethod::None, "antialiasing"};
     SwitchableSetting<bool> use_integer_scaling{false, Keys::use_integer_scaling};
     SwitchableSetting<double, true> frame_limit{100, 0, 1000, Keys::frame_limit};

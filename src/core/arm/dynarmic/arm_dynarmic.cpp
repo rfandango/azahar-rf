@@ -11,6 +11,7 @@
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/code_cache.h>
 #include <dynarmic/interface/optimization_flags.h>
+#include <fmt/format.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
@@ -393,6 +394,15 @@ void ARM_Dynarmic::InvalidateCacheRange(u32 start_address, std::size_t length) {
     jit->InvalidateCacheRange(start_address, length);
 }
 
+void ARM_Dynarmic::DumpBlockLocations(std::FILE* out) const {
+    for (const auto& [page_table, table_jit] : jits) {
+        for (const Dynarmic::A32::Jit::BlockLocation& block : table_jit->GetBlockLocations()) {
+            fmt::print(out, "{:x} {:x} {:x} {:x}\n", GetID(), block.host_address, block.host_size,
+                       block.location);
+        }
+    }
+}
+
 void ARM_Dynarmic::ClearExclusiveState() {
     jit->ClearExclusiveState();
 }
@@ -402,6 +412,14 @@ std::shared_ptr<Memory::PageTable> ARM_Dynarmic::GetPageTable() const {
 }
 
 void ARM_Dynarmic::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
+    // The table that is set already means the same recompiler with the registers it has:
+    // nothing to save, look up and load back. This is called at every switch between the
+    // emulated cores, which mostly run threads of one process.
+    if (jit != nullptr && current_page_table == page_table &&
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyEmulationOverheads) ==
+            0) {
+        return;
+    }
     current_page_table = page_table;
     ThreadContext ctx{};
     if (jit) {
@@ -438,9 +456,22 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     config.code_cache = code_cache.get();
     if (current_page_table) {
         config.page_table = &current_page_table->GetPointerArray();
+        // Host MMU access, if it is in use: an access goes straight to the address in the
+        // host's view of the address space, and where that faults (nothing of the emulated
+        // system's memory is there) the block is made again with a look into the page table
+        // for that access
+        if (u8* const view = current_page_table->pointers.HostView()) {
+            config.fastmem_pointer = reinterpret_cast<std::uintptr_t>(view);
+        }
     }
     config.coprocessors[15] = std::make_shared<DynarmicCP15>(cp15_state);
     config.define_unpredictable_behaviour = true;
+
+    // The recompiler's dispatcher looks in its own table of recent blocks before it calls out
+    // for one; a profiling switch has it call out every time, as it used to
+    if (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyDispatcher) {
+        config.optimizations &= ~Dynarmic::OptimizationFlag::FastDispatch;
+    }
 
     // Multi-process state
     config.processor_id = GetID();

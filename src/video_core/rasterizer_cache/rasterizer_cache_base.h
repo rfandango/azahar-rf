@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <functional>
 #include <list>
 #include <optional>
@@ -14,9 +15,11 @@
 #include <tsl/robin_map.h>
 
 #include "video_core/rasterizer_cache/framebuffer_base.h"
+#include "video_core/rasterizer_cache/node_pool.h"
 #include "video_core/rasterizer_cache/sampler_params.h"
 #include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/rasterizer_cache/texture_cube.h"
+#include "video_core/rasterizer_cache/utils.h"
 
 namespace Memory {
 class MemorySystem;
@@ -69,9 +72,10 @@ class RasterizerCache {
     using Framebuffer = typename T::Framebuffer;
     using DebugScope = typename T::DebugScope;
 
-    using SurfaceMap = boost::icl::interval_map<PAddr, SurfaceId, boost::icl::partial_absorber,
-                                                std::less, boost::icl::inplace_plus,
-                                                boost::icl::inter_section, SurfaceInterval>;
+    using SurfaceMap =
+        boost::icl::interval_map<PAddr, SurfaceId, boost::icl::partial_absorber, std::less,
+                                 boost::icl::inplace_plus, boost::icl::inter_section,
+                                 SurfaceInterval, NodePoolAllocator>;
 
     using SurfaceRect_Tuple = std::pair<SurfaceId, Common::Rectangle<u32>>;
     using PageMap = boost::icl::interval_map<u32, int>;
@@ -147,6 +151,45 @@ public:
 
     /// Clear all cached resources tracked by this cache manager
     void ClearAll(bool flush);
+
+    /// Has `callback` called before the cache writes into the emulated memory itself, with the
+    /// stretch it is about to write: what a surface holds, put back where the game can read
+    /// it. For whoever lets the host GPU read emulated memory in place: a draw that is not
+    /// through the GPU yet must not find it changed.
+    void SetGuestWriteCallback(std::function<void(PAddr, u32)> callback) {
+        on_guest_write = std::move(callback);
+    }
+
+    /// Whether the host GPU holds anything newer than the emulated memory in the stretch
+    [[nodiscard]] bool HoldsNewer(PAddr addr, u32 size) const {
+        return dirty_regions.find(SurfaceInterval{addr, addr + size}) != dirty_regions.end();
+    }
+
+    /// The game read the stretch, which came here because its pages are cached. Pages of it
+    /// the host GPU holds nothing newer of are made readable from now on, see
+    /// Memory::MemorySystem::RasterizerMarkRegionReadable: most of what a game reads on cached
+    /// pages only shares the page with a texture (measured: all of 37,000 reads a frame in
+    /// one game).
+    void NoteCpuRead(PAddr addr, u32 size);
+
+    /// The game is about to read the stretch, which may make the cache read a surface back
+    /// from the host GPU and wait for it. A small render target that is read back frame
+    /// after frame (an image of the screen shrunk to 8x8, to tell how bright it is) is given
+    /// to the game late from then on, see ServeLateReadbacks. Before FlushRegion.
+    void NoteReadbackForGame(PAddr addr, u32 size);
+
+    /// Once a frame: copies the small targets the game reads every frame out of the host GPU
+    /// without waiting, and hands over what the GPU has finished of earlier copies
+    /// (Memory::MemorySystem::PostLateWrite). The game's reads of such a stretch do not wait
+    /// (Memory::MemorySystem::ExemptReads): it reads what was there a frame or two ago.
+    void ServeLateReadbacks();
+
+    /// Whether a cached surface covers any of the stretch
+    [[nodiscard]] bool TouchesSurface(PAddr addr, u32 size) {
+        bool any = false;
+        ForEachSurfaceInRegion(addr, size, [&any](SurfaceId, Surface&) { any = true; });
+        return any;
+    }
 
 private:
     /// Iterate over all page indices in a range
@@ -226,6 +269,11 @@ private:
     /// Increase/decrease the number of surface in pages touching the specified region
     void UpdatePagesCachedCount(PAddr addr, u32 size, int delta);
 
+    /// Takes back that the pages of the stretch are readable (NoteCpuRead): the host GPU is
+    /// about to hold something newer there, or they stop being cached. With `tell_memory`
+    /// unset only the note here is dropped, for when the memory system drops its own.
+    void DropReadable(PAddr addr, u32 size, bool tell_memory = true);
+
 private:
     Memory::MemorySystem& memory;
     CustomTexManager& custom_tex_manager;
@@ -242,6 +290,77 @@ private:
     Common::SlotVector<Framebuffer> slot_framebuffers;
     SurfaceMap dirty_regions;
     PageMap cached_pages;
+    std::function<void(PAddr, u32)> on_guest_write;
+
+    /// What GetFramebufferSurfaces was asked for and found the last time. A game draws many
+    /// times into one target, and finding the target was 4% of the emulation thread in one
+    /// game; the next draw that asks for the same takes this, if no surface came or went and
+    /// nothing changed of what is valid of any (SurfaceBase::validity_epoch).
+    struct LastTarget {
+        bool valid{};
+        // Asked for
+        PAddr color_addr{};
+        PAddr depth_addr{};
+        u32 color_format{};
+        u32 depth_format{};
+        u32 width{};
+        u32 height{};
+        Common::Rectangle<s32> viewport{};
+        bool using_color{};
+        bool using_depth{};
+        bool shadow_rendering{};
+        u32 res_scale{};
+        u32 sample_count{};
+        u64 validity_epoch{};
+        // Found
+        SurfaceId color_id{};
+        SurfaceId depth_id{};
+        u32 color_level{};
+        u32 depth_level{};
+        Common::Rectangle<u32> fb_rect{};
+    };
+    LastTarget last_target;
+
+    /// Counts the surfaces that come and go, what else decides which surface a lookup finds,
+    /// and the frames. A lookup of before holds while this and SurfaceBase::validity_epoch
+    /// stand still.
+    u64 surface_set_epoch{};
+
+    /// The textures looked up this frame, by where they are: most draws of a frame use
+    /// textures a draw before them used, and the lookup was 2% to 3% of the emulation thread
+    struct TextureLookup {
+        PAddr address{};
+        u32 width{};
+        u32 height{};
+        u32 format{};
+        u32 max_level{};
+        bool shadow_source{};
+        u64 set_epoch{};
+        u64 validity_epoch{};
+        SurfaceId surface_id{};
+    };
+    std::array<TextureLookup, 64> texture_lookups{};
+    /// One bit a page of the emulated memory, by its physical address: readable, see NoteCpuRead
+    std::vector<u64> readable_pages;
+    u32 readable_count{};
+    /// A small render target and how the game reads it back, see NoteReadbackForGame
+    struct LateReadback {
+        PAddr addr{};
+        u32 size{};
+        /// The frame it was last read back in for the game, and frames in a row it was
+        u64 last_read_frame{};
+        u32 streak{};
+        /// Given to the game late from here on
+        bool late{};
+        /// A copy is on its way: the tick it was recorded under, where it lands, what of
+        bool pending{};
+        u64 pending_tick{};
+        StagingData staging{};
+        SurfaceParams info{};
+        bool convert{};
+    };
+    std::vector<LateReadback> late_readbacks;
+    u64 late_frame{};
     u32 resolution_scale_factor;
     u8 sample_count;
     FramebufferParams fb_params;

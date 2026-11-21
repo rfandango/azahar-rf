@@ -47,6 +47,7 @@ object SettingKeys {
     external fun use_skip_duplicate_frames(): String
     external fun use_shader_jit(): String
     external fun resolution_factor(): String
+    external fun dynamic_resolution(): String
     external fun frame_limit(): String
     external fun turbo_limit(): String
     external fun texture_filter(): String

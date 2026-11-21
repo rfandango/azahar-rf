@@ -52,4 +52,32 @@ if (ENABLE_FREECAM)
     set(COMBINED "${COMBINED}ENABLE_FREECAM")
 endif()
 string(MD5 SHADER_CACHE_VERSION "${COMBINED}")
+
+# The recompiler keeps the machine code it makes between runs (core/arm/dynarmic/jit_code_cache).
+# That code is only right for the recompiler that made it, so what is kept is tied to a hash
+# of the recompiler's sources and of how it is set up: it then outlives the builds that leave
+# them alone, and no others.
+file(GLOB_RECURSE RECOMPILER_FILES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/externals/dynarmic/src/dynarmic/*"
+    "${CMAKE_SOURCE_DIR}/src/core/arm/dynarmic/*"
+)
+list(SORT RECOMPILER_FILES)
+set(COMBINED "")
+foreach (F IN LISTS RECOMPILER_FILES)
+    file(MD5 "${F}" TMP)
+    file(RELATIVE_PATH NAME "${CMAKE_SOURCE_DIR}" "${F}")
+    string(APPEND COMBINED "${NAME}=${TMP}\n")
+endforeach()
+get_cmake_property(RECOMPILER_OPTIONS CACHE_VARIABLES)
+list(SORT RECOMPILER_OPTIONS)
+foreach (OPTION IN LISTS RECOMPILER_OPTIONS)
+    if (OPTION MATCHES "^DYNARMIC_")
+        string(APPEND COMBINED "${OPTION}=${${OPTION}}\n")
+    endif()
+endforeach()
+string(MD5 RECOMPILER_CACHE_VERSION "${COMBINED}")
+# The hash is made when the build is configured: a change to any of the files has to bring
+# that about
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RECOMPILER_FILES})
+
 configure_file("${CMAKE_SOURCE_DIR}/src/common/scm_rev.cpp.in" "scm_rev.cpp" @ONLY)

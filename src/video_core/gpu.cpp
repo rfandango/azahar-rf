@@ -4,17 +4,24 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/hitch_tracker.h"
 #include "common/microprofile.h"
+#include "common/thread.h"
 #include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/loader/loader.h"
+#include "core/movie.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/frame_liveness.h"
 #include "video_core/frame_state_dump.h"
@@ -29,6 +36,36 @@
 #include "video_core/video_core.h"
 
 namespace VideoCore {
+
+namespace {
+
+/// For the hitch summary: how much of a command list is what the list last sent from the same
+/// address had in the same place. A game builds its lists anew every frame, in the two or
+/// three buffers it takes turns with; where most of a list is what it was, most of decoding
+/// it is decoding the same again. Emulation thread only.
+void MeasureListRepeat(const u8* data, u32 size, PAddr address) {
+    static std::unordered_map<PAddr, std::vector<u32>> last_lists;
+    if (!data || size < 4) {
+        return;
+    }
+    // A game that sends its lists from ever new places is not to fill the memory with them
+    if (last_lists.size() > 64) {
+        last_lists.clear();
+    }
+    std::vector<u32> list(size / 4);
+    std::memcpy(list.data(), data, list.size() * 4);
+    std::vector<u32>& previous = last_lists[address];
+    const std::size_t common = std::min(list.size(), previous.size());
+    u32 same = 0;
+    for (std::size_t i = 0; i < common; i++) {
+        same += list[i] == previous[i];
+    }
+    Common::Hitches::NoteCommandListWords(static_cast<u32>(list.size()), same,
+                                          list.size() == previous.size() && same == list.size());
+    previous = std::move(list);
+}
+
+} // Anonymous namespace
 
 constexpr VAddr VADDR_LCD = 0x1ED02000;
 constexpr VAddr VADDR_GPU = 0x1EF00000;
@@ -93,6 +130,17 @@ public:
 MICROPROFILE_DEFINE(GPU_DisplayTransfer, "GPU", "DisplayTransfer", MP_RGB(100, 100, 255));
 MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(100, 255, 100));
 
+/// Whether the commands a game sends are decoded on a thread of their own while the game goes
+/// on. The way it is done where it has run, Android on arm64; elsewhere not until it has been
+/// tried there.
+static bool WantsDecoderThread() {
+#if defined(__ANDROID__) && defined(__aarch64__)
+    return (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyGpuDecoding) == 0;
+#else
+    return false;
+#endif
+}
+
 GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
          Frontend::EmuWindow* secondary_window)
     : right_eye_disabler{std::make_unique<RightEyeDisabler>(*this)},
@@ -106,9 +154,516 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
     impl->pica.SetDrawFilter(frame_liveness.get());
+
+    if (WantsDecoderThread()) {
+        LOG_INFO(HW_GPU, "Commands are decoded on a thread of their own");
+        impl->early_completion =
+            (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LateGpuCompletion) == 0 &&
+            impl->renderer->ComposesApart();
+        if (impl->early_completion) {
+            LOG_INFO(HW_GPU, "The game is told a command is done when it hands it over");
+            impl->memory.TrackGpuReferences(true);
+        }
+        impl->decoder = std::thread([this] { DecoderLoop(); });
+    }
 }
 
-GPU::~GPU() = default;
+GPU::~GPU() {
+    StopDecoder();
+}
+
+namespace {
+
+/// How long either side of a hand-off looks for the other before it goes to sleep. Waking a
+/// sleeping thread takes the kernel tens of microseconds and more, and a frame has dozens of
+/// hand-offs.
+constexpr std::chrono::microseconds HANDOFF_SPIN{150};
+
+/// The kinds of commands that raise the same interrupts: what one raised the last time is
+/// what the game is told at the next hand-over of its kind. A fill raises one for each of
+/// its two halves that is used.
+u32 EarlyKind(const Service::GSP::Command& command) {
+    u32 shape = 0;
+    if (command.id == Service::GSP::CommandId::MemoryFill) {
+        shape = (command.memory_fill.start1 != 0 ? 1u : 0u) |
+                (command.memory_fill.start2 != 0 ? 2u : 0u);
+    }
+    return (static_cast<u32>(command.id.Value()) & 7) * 4 + shape;
+}
+
+inline void SpinPause() {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+
+} // Anonymous namespace
+
+void GPU::DecoderLoop() {
+    Common::SetCurrentThreadName("GpuDecoder");
+    impl->decoder_id.store(std::this_thread::get_id());
+    std::unique_lock lock{impl->decoder_mutex};
+    while (true) {
+        if (impl->queued.empty() && !impl->stop_decoder && !impl->early_completion) {
+            // The game waits for this command to be done, and the next one mostly comes
+            // within the time it takes to go to sleep and be woken: looked for a little while
+            // first. (Where the game is told "done" at hand-over nothing waits for the
+            // decoder, and looking was a tenth of this thread's time for nothing.)
+            lock.unlock();
+            const auto until = std::chrono::steady_clock::now() + HANDOFF_SPIN;
+            while (!impl->has_queued.load(std::memory_order_relaxed) &&
+                   std::chrono::steady_clock::now() < until) {
+                SpinPause();
+            }
+            lock.lock();
+        }
+        impl->decoder_wake.wait(lock,
+                                [this] { return impl->stop_decoder || !impl->queued.empty(); });
+        if (impl->queued.empty()) {
+            // Asked to stop, with nothing left
+            return;
+        }
+        const Impl::QueuedCommand next = std::move(impl->queued.front());
+        impl->queued.pop_front();
+        if (impl->queued.empty()) {
+            impl->has_queued.store(false);
+        }
+        impl->working_submit_ticks = next.submit_ticks;
+        impl->working_early = next.early;
+        impl->working_raised.clear();
+        lock.unlock();
+        const auto start = std::chrono::steady_clock::now();
+        const bool is_command = !next.is_swap && !next.is_present;
+        if (next.is_present) {
+            const u64 lag = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(start - next.queued_at)
+                    .count());
+            impl->compose_lag_ns.fetch_add(lag, std::memory_order_relaxed);
+            impl->compose_lags.fetch_add(1, std::memory_order_relaxed);
+            if (lag > impl->compose_lag_max_ns.load(std::memory_order_relaxed)) {
+                impl->compose_lag_max_ns.store(lag, std::memory_order_relaxed);
+            }
+            // The image of a VBlank, of what was handed over before it
+            frame_liveness->NoteDisplay();
+            CITRA_TRACE_SCOPE("VBlank::SwapBuffers");
+            CITRA_HITCH_SCOPE(Compose);
+            impl->memory.SetGpuReader(true);
+            impl->renderer->ComposeFrame(next.present_vblank);
+        } else if (next.is_swap) {
+            SetBufferSwap(next.swap_screen, next.swap_info);
+        } else {
+            if (!next.list_copy.empty()) {
+                impl->pica.UseCommandListCopy(next.list_copy.data());
+            }
+            impl->memory.SetGpuReader(next.command.id != Service::GSP::CommandId::SubmitCmdList);
+            if (!next.snapshot_pages.empty()) {
+                impl->memory.UseGpuSnapshot(next.snapshot_pages, next.snapshot_bytes.get());
+            }
+            Execute(next.command);
+            impl->memory.DropGpuSnapshot();
+            if (impl->early_completion &&
+                next.command.id == Service::GSP::CommandId::SubmitCmdList) {
+                // The host GPU can start on this list's drawing now, while the rest of the
+                // frame is decoded: kept until the image is composed, the whole frame's
+                // drawing would only begin then, and the image be ready that much later
+                impl->rasterizer->SubmitPendingWork();
+            }
+        }
+        if (is_command) {
+            impl->decoder_nanoseconds.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+            impl->decoder_commands.fetch_add(1, std::memory_order_relaxed);
+        }
+        impl->done_seq.store(next.seq);
+        if (is_command && impl->early_completion) {
+            if (!next.early && !impl->working_raised.empty()) {
+                impl->told_late.fetch_add(1, std::memory_order_relaxed);
+            }
+            for (const Impl::RaisedInterrupt& interrupt : impl->working_raised) {
+                for (std::size_t i = 0; i < next.early_ids.size(); i++) {
+                    if (next.early_ids[i] != interrupt.id) {
+                        continue;
+                    }
+                    const u64 told = next.early_delays[i];
+                    impl->told_ns.fetch_add(told, std::memory_order_relaxed);
+                    if (told > interrupt.delay) {
+                        impl->told_long_ns.fetch_add(told - interrupt.delay,
+                                                     std::memory_order_relaxed);
+                    } else {
+                        impl->told_short_ns.fetch_add(interrupt.delay - told,
+                                                      std::memory_order_relaxed);
+                    }
+                    break;
+                }
+            }
+        }
+        lock.lock();
+        if (is_command) {
+            if (next.early) {
+                // What it raised that the game was not told of at hand-over still has to
+                // reach the game
+                for (const Impl::RaisedInterrupt& interrupt : impl->working_raised) {
+                    if (std::ranges::find(next.early_ids, interrupt.id) == next.early_ids.end()) {
+                        impl->raised.push_back(interrupt);
+                        impl->has_raised.store(true);
+                    }
+                }
+            }
+            const u32 kind = EarlyKind(next.command);
+            impl->early_known[kind] = impl->working_raised;
+            if (next.ordinal < impl->early_at.size()) {
+                impl->early_at[next.ordinal].kind = kind;
+                impl->early_at[next.ordinal].raised = impl->working_raised;
+            }
+        }
+        if (next.is_present) {
+            impl->presents_done.fetch_add(1);
+            impl->decoder_idle.notify_all();
+        }
+        if (--impl->pending == 0) {
+            impl->has_pending.store(false);
+            impl->decoder_idle.notify_all();
+        }
+    }
+}
+
+void GPU::StopDecoder() {
+    if (!impl->decoder.joinable()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{impl->decoder_mutex};
+        impl->stop_decoder = true;
+    }
+    impl->decoder_wake.notify_all();
+    impl->decoder.join();
+}
+
+Result GPU::Submit(const Service::GSP::Command& command) {
+    using Service::GSP::CommandId;
+    // Only what the emulated GPU does by itself goes to the thread. A copy between two places
+    // of a process's memory (DMA) works with the process as it is now.
+    const bool uses_decoder = UsesDecoder();
+    const bool to_decoder =
+        uses_decoder &&
+        (command.id == CommandId::SubmitCmdList || command.id == CommandId::MemoryFill ||
+         command.id == CommandId::DisplayTransfer || command.id == CommandId::TextureCopy);
+    if (!to_decoder) {
+        // Where the decoder works behind the game's back, what is left touches nothing of the
+        // emulated GPU itself: the memory system asks for the decoder page by page
+        if (!impl->early_completion || !uses_decoder) {
+            WaitIdle(WaitReason::Command);
+        }
+        return Execute(command);
+    }
+    impl->emulation_id.store(std::this_thread::get_id());
+
+    Impl::QueuedCommand item{};
+    item.command = command;
+    item.submit_ticks = static_cast<u64>(impl->timing.GetGlobalTicks());
+    item.seq = impl->queued_seq + 1;
+    bool may_tell_early = impl->early_completion;
+    PAddr pace_target = 0;
+    if (impl->early_completion) {
+        // The game is about to be told this is done. What the command reads must not change
+        // before the decoder has read it, and what it writes must not be looked at before it
+        // is written: its own bytes are taken along, and the pages the decoder has read from
+        // or written to before cannot be touched from here on without waiting for it.
+        impl->memory.ArmGpuReferences(
+            command.id == CommandId::SubmitCmdList,
+            command.id == CommandId::DisplayTransfer || command.id == CommandId::TextureCopy,
+            impl->queued_seq, impl->done_seq.load(), item.snapshot_pages, item.snapshot_bytes);
+        if (command.id == CommandId::SubmitCmdList) {
+            const auto& list = command.submit_gpu_cmdlist;
+            const auto address = VirtualToPhysicalAddress(list.address, list.size);
+            const u8* const bytes = address ? impl->memory.GetPhysicalPointer(*address) : nullptr;
+            if (bytes && list.size != 0 &&
+                impl->memory.GetPhysicalPointer(*address + list.size - 1) ==
+                    bytes + list.size - 1) {
+                item.list_copy.assign(bytes, bytes + list.size);
+            } else {
+                may_tell_early = false;
+            }
+        } else if (command.id != CommandId::MemoryFill) {
+            pace_target = PaceTargetOf(command);
+        }
+    }
+    std::vector<Impl::RaisedInterrupt> tell;
+    {
+        std::scoped_lock lock{impl->decoder_mutex};
+        const u32 kind = EarlyKind(command);
+        item.ordinal = impl->frame_ordinal++;
+        if (may_tell_early) {
+            const bool same_place =
+                item.ordinal < impl->early_at.size() && impl->early_at[item.ordinal].kind == kind;
+            tell = same_place ? impl->early_at[item.ordinal].raised : impl->early_known[kind];
+            item.early = !tell.empty();
+            for (const Impl::RaisedInterrupt& interrupt : tell) {
+                item.early_ids.push_back(interrupt.id);
+                item.early_delays.push_back(interrupt.delay);
+            }
+        }
+        ++impl->queued_seq;
+        impl->queued.push_back(std::move(item));
+        ++impl->pending;
+        impl->has_pending.store(true);
+        impl->has_queued.store(true);
+    }
+    impl->decoder_wake.notify_one();
+
+    if (pace_target != 0) {
+        // The pacing of a game that renders ahead of the display, see MemoryTransfer: the
+        // copy that completes a second image for the top screen within one VBlank period is
+        // not reported as done until the VBlank
+        const bool paced =
+            (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyRenderPace) == 0;
+        if (paced && !tell.empty() && render_pace.filled != 0 &&
+            render_pace.filled != pace_target && render_pace.held == 0) {
+            if (!render_pace.reported) {
+                render_pace.reported = true;
+                LOG_INFO(HW_GPU, "The game renders faster than the display shows: its images for "
+                                 "the top screen are paced to the VBlank");
+            }
+            render_pace.held = pace_target;
+            render_pace.held_delay = tell.front().delay;
+            return ResultSuccess;
+        }
+        render_pace.filled = pace_target;
+    }
+    for (const Impl::RaisedInterrupt& interrupt : tell) {
+        impl->deliver_interrupt(interrupt.id, interrupt.delay);
+    }
+    return ResultSuccess;
+}
+
+bool GPU::CompletesEarly() const {
+    return impl->early_completion;
+}
+
+bool GPU::UsesDecoder() const {
+    if (!impl->decoder.joinable()) {
+        return false;
+    }
+    // A movie plays back right only with every interrupt where it was when it was recorded:
+    // commands are then decoded where the game hands them over, as they always were
+    const Core::Movie::PlayMode movie = impl->system.Movie().GetPlayMode();
+    return movie != Core::Movie::PlayMode::Recording && movie != Core::Movie::PlayMode::Playing;
+}
+
+PAddr GPU::PaceTargetOf(const Service::GSP::Command& command) {
+    // As Execute fills the registers of the transfer engine and MemoryTransfer reads them
+    PAddr output_start = 0;
+    u32 output_size = 0;
+    u32 output_extent = 0;
+    if (command.id == Service::GSP::CommandId::DisplayTransfer) {
+        const auto& params = command.display_transfer;
+        if ((params.flags & 8) != 0) {
+            // A copy by way of the transfer command: its size is what was in the registers
+            return 0;
+        }
+        output_start = VirtualToPhysicalAddress(params.out_buffer_address, 1).value_or(0) & ~7u;
+        output_size = (params.out_buffer_size & 0xFFFF) * (params.out_buffer_size >> 16) *
+                      BytesPerPixel(static_cast<Pica::PixelFormat>((params.flags >> 12) & 7));
+        output_extent = output_size;
+    } else {
+        const auto& params = command.texture_copy;
+        if ((params.flags & 8) == 0) {
+            return 0;
+        }
+        output_start =
+            VirtualToPhysicalAddress(params.out_buffer_address, params.size).value_or(0) & ~7u;
+        output_size = params.size;
+        output_extent = output_size;
+        const u32 row = (params.out_width_gap & 0xFFFF) * 16;
+        const u32 gap = (params.out_width_gap >> 16) * 16;
+        if (row != 0 && gap != 0 && output_size > row) {
+            output_extent = (output_size / row - 1) * (row + gap) + row;
+        }
+    }
+    if (output_start == 0) {
+        return 0;
+    }
+    const u32 buffer_size = render_pace.stride * impl->pica.regs.framebuffer_config[0].height;
+    PAddr target = 0;
+    for (const PAddr buffer : render_pace.shown) {
+        if (buffer != 0 && output_start < buffer + buffer_size &&
+            buffer < output_start + output_extent) {
+            target = buffer;
+        }
+    }
+    return target;
+}
+
+void GPU::WaitForPresent() {
+    const auto done = [this] { return impl->presents_done.load() >= impl->presents_queued; };
+    if (done()) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto until = start + HANDOFF_SPIN;
+    while (!done() && std::chrono::steady_clock::now() < until) {
+        SpinPause();
+    }
+    if (!done()) {
+        std::unique_lock lock{impl->decoder_mutex};
+        impl->decoder_idle.wait(lock, done);
+    }
+    Impl::Waited& waited = impl->waited[static_cast<std::size_t>(WaitReason::VBlank)];
+    waited.times.fetch_add(1, std::memory_order_relaxed);
+    waited.nanoseconds.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count(),
+                                 std::memory_order_relaxed);
+}
+
+bool GPU::HasPendingWork() const {
+    return impl->has_pending.load(std::memory_order_relaxed);
+}
+
+void GPU::NoteAccess(WaitReason reason) {
+    impl->touched[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void GPU::WaitIdle(WaitReason reason) {
+    if (!impl->decoder.joinable() || std::this_thread::get_id() == impl->decoder_id.load()) {
+        return;
+    }
+    impl->touched[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    if (impl->has_pending.load()) {
+        const auto start = std::chrono::steady_clock::now();
+        // What is left is mostly less than going to sleep and being woken takes
+        const auto until = start + HANDOFF_SPIN;
+        while (impl->has_pending.load(std::memory_order_relaxed) &&
+               std::chrono::steady_clock::now() < until) {
+            SpinPause();
+        }
+        if (impl->has_pending.load()) {
+            std::unique_lock lock{impl->decoder_mutex};
+            impl->decoder_idle.wait(lock, [this] { return impl->pending == 0; });
+        }
+        Impl::Waited& waited = impl->waited[static_cast<std::size_t>(reason)];
+        waited.times.fetch_add(1, std::memory_order_relaxed);
+        waited.nanoseconds.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count(),
+                                     std::memory_order_relaxed);
+    }
+    DeliverInterrupts();
+}
+
+void GPU::ReportDecoderWaits() {
+    static constexpr u32 REPORT_VBLANKS = 600;
+    if (!impl->decoder.joinable() || ++impl->report_vblanks < REPORT_VBLANKS) {
+        return;
+    }
+    impl->report_vblanks = 0;
+    static constexpr std::array<const char*, static_cast<std::size_t>(WaitReason::Count)> NAMES = {
+        "other",
+        "a command executed here",
+        "a register",
+        "a buffer swap",
+        "the vblank",
+        "a memory access",
+        "a mapping",
+        "nothing to run",
+        "read of what a surface has newer",
+        "read of what the gpu writes",
+        "read of what a draw reads in place",
+        "write into a surface",
+        "write to what a draw reads in place",
+        "write to vertex data",
+        "write to index data",
+        "write to a texture",
+        "write to a called list",
+        "write to something else it read",
+        "write beside what it read",
+        "write to what the gpu writes"};
+    // For each: how often it was come by, and of those how often and how long it waited
+    std::string waits;
+    double waited_ms = 0.0;
+    for (std::size_t i = 0; i < impl->waited.size(); i++) {
+        const u32 touched = impl->touched[i].exchange(0, std::memory_order_relaxed);
+        const u32 times = impl->waited[i].times.exchange(0, std::memory_order_relaxed);
+        const u64 ns = impl->waited[i].nanoseconds.exchange(0, std::memory_order_relaxed);
+        if (times == 0 && touched < REPORT_VBLANKS / 10) {
+            continue;
+        }
+        waited_ms += static_cast<double>(ns) / 1e6 / REPORT_VBLANKS;
+        waits += fmt::format("{}{} {:.1f} ({:.1f} waited, {:.2f} ms)", waits.empty() ? "" : "; ",
+                             NAMES[i], static_cast<double>(touched) / REPORT_VBLANKS,
+                             static_cast<double>(times) / REPORT_VBLANKS,
+                             static_cast<double>(ns) / 1e6 / REPORT_VBLANKS);
+    }
+    const auto [volatile_pages, copied] = impl->memory.TakeSnapshotFigures();
+    waits += fmt::format("; {} pages copied at hand-over, {:.0f} KiB a vblank", volatile_pages,
+                         static_cast<double>(copied) / 1024.0 / REPORT_VBLANKS);
+    if (const u64 twins = impl->pica.TakeLeftOutTwins(); twins != 0) {
+        waits += fmt::format("; {:.1f} draws a vblank left out as the second pass of a scene "
+                             "drawn twice",
+                             static_cast<double>(twins) / REPORT_VBLANKS);
+    }
+    const auto [copies_given, copies_read] = impl->memory.TakeSnapshotReadFigures();
+    if (copies_given != 0) {
+        waits +=
+            fmt::format(", {:.1f}% of the copies read", 100.0 * static_cast<double>(copies_read) /
+                                                            static_cast<double>(copies_given));
+    }
+    const auto per_vblank_ms = [](std::atomic<u64>& ns) {
+        return static_cast<double>(ns.exchange(0, std::memory_order_relaxed)) / 1e6 /
+               REPORT_VBLANKS;
+    };
+    const u32 composed = impl->compose_lags.exchange(0, std::memory_order_relaxed);
+    const u64 lag_sum = impl->compose_lag_ns.exchange(0, std::memory_order_relaxed);
+    const u64 lag_max = impl->compose_lag_max_ns.exchange(0, std::memory_order_relaxed);
+    waits += fmt::format("; an image is composed {:.2f} ms after its vblank, {:.1f} at the most",
+                         composed != 0 ? static_cast<double>(lag_sum) / 1e6 / composed : 0.0,
+                         static_cast<double>(lag_max) / 1e6);
+    const double told = per_vblank_ms(impl->told_ns);
+    const double told_long = per_vblank_ms(impl->told_long_ns);
+    const double told_short = per_vblank_ms(impl->told_short_ns);
+    waits +=
+        fmt::format("; delays told at hand-over {:.2f} ms a vblank, {:.2f} too long and "
+                    "{:.2f} too short, {:.2f} commands a vblank told late",
+                    told, told_long, told_short,
+                    static_cast<double>(impl->told_late.exchange(0, std::memory_order_relaxed)) /
+                        REPORT_VBLANKS);
+    const double decoder_ms =
+        static_cast<double>(impl->decoder_nanoseconds.exchange(0, std::memory_order_relaxed)) /
+        1e6 / REPORT_VBLANKS;
+    const double commands =
+        static_cast<double>(impl->decoder_commands.exchange(0, std::memory_order_relaxed)) /
+        REPORT_VBLANKS;
+    LOG_INFO(HW_GPU,
+             "Decoder thread, a vblank: {:.2f} ms of work in {:.1f} commands; the emulation "
+             "thread waited {:.2f} ms for it: {}",
+             decoder_ms, commands, waited_ms, waits);
+}
+
+void GPU::DeliverInterrupts() {
+    if (!impl->has_raised.load(std::memory_order_relaxed) ||
+        std::this_thread::get_id() != impl->emulation_id.load()) {
+        return;
+    }
+    std::vector<Impl::RaisedInterrupt> raised;
+    {
+        std::scoped_lock lock{impl->decoder_mutex};
+        raised.swap(impl->raised);
+        impl->has_raised.store(false);
+    }
+    // The emulated GPU would have taken `delay` from when the command was sent. Of that,
+    // what the game has run through in the meantime is gone already.
+    const u64 now = static_cast<u64>(impl->timing.GetGlobalTicks());
+    for (const Impl::RaisedInterrupt& interrupt : raised) {
+        const u64 elapsed = now > interrupt.submit_ticks ? now - interrupt.submit_ticks : 0;
+        impl->deliver_interrupt(interrupt.id,
+                                interrupt.delay > elapsed ? interrupt.delay - elapsed : 0);
+    }
+}
 
 constexpr Result ResultInvalidGpuBuffer(ErrorDescription::InvalidAddress, ErrorModule::GX,
                                         ErrorSummary::InvalidArgument,
@@ -152,19 +707,39 @@ std::optional<PAddr> GPU::VirtualToPhysicalAddress(VAddr addr, u32 size) {
 }
 
 void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
-    impl->signal_interrupt = handler;
-    impl->pica.SetInterruptHandler(handler);
+    impl->deliver_interrupt = handler;
+    // The service's handler schedules an event and wakes threads of the game: emulation
+    // thread only. What the decoding thread raises is kept for DeliverInterrupts.
+    Service::GSP::InterruptHandler raise = [this](Service::GSP::InterruptId id, u64 delay) {
+        if (std::this_thread::get_id() == impl->decoder_id.load()) {
+            impl->working_raised.push_back({id, delay, impl->working_submit_ticks});
+            if (!impl->working_early) {
+                std::scoped_lock lock{impl->decoder_mutex};
+                impl->raised.push_back({id, delay, impl->working_submit_ticks});
+                impl->has_raised.store(true);
+            }
+            return;
+        }
+        impl->deliver_interrupt(id, delay);
+    };
+    impl->signal_interrupt = raise;
+    impl->pica.SetInterruptHandler(raise);
 }
 
 void GPU::FlushRegion(PAddr addr, u32 size) {
+    WaitIdle();
     impl->rasterizer->FlushRegion(addr, size);
 }
 
 void GPU::InvalidateRegion(PAddr addr, u32 size) {
+    WaitIdle();
     impl->rasterizer->InvalidateRegion(addr, size);
 }
 
 void GPU::ClearAll(bool flush) {
+    WaitIdle();
+    // The state may be about to be written out, page tables and all
+    impl->memory.DisarmAll();
     impl->rasterizer->ClearAll(flush);
 }
 
@@ -209,6 +784,10 @@ Result GPU::Execute(const Service::GSP::Command& command) {
         cmdbuffer.addr[0].Assign(address >> 3);
         cmdbuffer.size[0].Assign(params.size >> 3);
         cmdbuffer.trigger[0] = 1;
+        if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureCommandLists) != 0)
+            [[unlikely]] {
+            MeasureListRepeat(impl->memory.GetPhysicalPointer(address), params.size, address);
+        }
 
         // Trigger processing of the command list
         SubmitCmdList(0);
@@ -312,6 +891,32 @@ Result GPU::Execute(const Service::GSP::Command& command) {
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
+    const bool from_queue = std::this_thread::get_id() == impl->decoder_id.load();
+    if (impl->early_completion && !from_queue && UsesDecoder()) {
+        // What the pacing rule goes by is kept where the game is told "done": here
+        if (screen_id == 0) {
+            if (const auto left = VirtualToPhysicalAddress(info.address_left, info.stride)) {
+                if (std::ranges::find(render_pace.shown, *left) == render_pace.shown.end()) {
+                    render_pace.shown[render_pace.shown_next++ % render_pace.shown.size()] = *left;
+                }
+                render_pace.stride = info.stride;
+            }
+            // The game's frame ends here, whenever the decoder gets to it
+            impl->system.perf_stats->EndGameFrame();
+            Common::Hitches::NoteGameFrame();
+            impl->frame_ordinal = 0;
+        }
+        // The transfer that fills the buffer may still be on its way through the decoder:
+        // the swap keeps its place behind it
+        Impl::QueuedCommand item{};
+        item.is_swap = true;
+        item.swap_screen = screen_id;
+        item.swap_info = info;
+        item.submit_ticks = static_cast<u64>(impl->timing.GetGlobalTicks());
+        impl->Queue(std::move(item));
+        return;
+    }
+    WaitIdle(WaitReason::BufferSwap);
     // The GSP module does not apply a framebuffer outside GPU visible memory. The right address
     // is used only for the top screen in stereoscopic mode and when it is not zero.
     // Otherwise the left address is used for both eyes.
@@ -339,7 +944,7 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     } else {
         framebuffer.address_left2 = *phys_address_left;
     }
-    if (screen_id == 0 &&
+    if (screen_id == 0 && !from_queue &&
         std::ranges::find(render_pace.shown, *phys_address_left) == render_pace.shown.end()) {
         render_pace.shown[render_pace.shown_next++ % render_pace.shown.size()] = *phys_address_left;
     }
@@ -356,8 +961,11 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
 
     if (screen_id == 0) {
         MicroProfileFlip();
-        impl->system.perf_stats->EndGameFrame();
-        Common::Hitches::NoteGameFrame();
+        // (Counted at hand-over where the swap came through the decoder's queue)
+        if (!from_queue) {
+            impl->system.perf_stats->EndGameFrame();
+            Common::Hitches::NoteGameFrame();
+        }
         // Steps once per guest frame (top screen buffer swap).
         CITRA_TRACE_SET_COUNTER("azahar.game_frame", impl->system.perf_stats->GetGameFrameCount());
         CITRA_FRAME_DUMP("bufferswap top (guest frame end) to {:08X}, {} bytes a row, {} rows",
@@ -368,12 +976,14 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
 }
 
 void GPU::SetColorFill(const Pica::ColorFill& fill) {
+    WaitIdle(WaitReason::BufferSwap);
     impl->pica.regs_lcd.color_fill_top = fill;
     impl->pica.regs_lcd.color_fill_bottom = fill;
     impl->renderer->NotifyScreenChanged();
 }
 
 u32 GPU::ReadReg(VAddr addr) {
+    WaitIdle(WaitReason::Register);
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -396,6 +1006,7 @@ u32 GPU::ReadReg(VAddr addr) {
 }
 
 void GPU::WriteReg(VAddr addr, u32 data) {
+    WaitIdle(WaitReason::Register);
     // Registers written this way include the ones that select and configure what is displayed
     impl->renderer->NotifyScreenChanged();
 
@@ -462,11 +1073,13 @@ GraphicsDebugger& GPU::Debugger() {
 
 #ifdef ENABLE_FREECAM
 void GPU::SetFreeCam(const std::array<f32, 16>& matrix, bool skip_2d) {
+    WaitIdle();
     impl->rasterizer->SetFreeCam(matrix, skip_2d);
 }
 #endif
 
 void GPU::ApplyPerProgramSettings(u64 program_ID) {
+    WaitIdle();
     auto hack = Common::Hacks::hack_manager.GetHack(
         Common::Hacks::HackType::ACCURATE_MULTIPLICATION, program_ID);
     bool use_accurate_mul = Settings::values.shaders_accurate_mul.GetValue();
@@ -548,6 +1161,7 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
     if (!config.trigger) {
         return;
     }
+    impl->pica.NoteTargetCommand();
 
     CITRA_TRACE_SCOPE("GPU::MemoryFill");
     CITRA_HITCH_SCOPE(GpuEmulation);
@@ -564,6 +1178,8 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
     } else if (!impl->rasterizer->AccelerateFill(config)) {
         CITRA_TRACE_SCOPE("GPU::MemoryFill (software fallback)");
         CITRA_FRAME_DUMP("  fill: SOFTWARE fallback");
+        impl->memory.NoteGpuWritten(config.GetStartAddress(),
+                                    config.GetEndAddress() - config.GetStartAddress());
         impl->sw_blitter->MemoryFill(config);
     }
 
@@ -594,6 +1210,7 @@ void GPU::MemoryTransfer() {
     if (!config.trigger.Value()) {
         return;
     }
+    impl->pica.NoteTargetCommand();
 
     MICROPROFILE_SCOPE(GPU_DisplayTransfer);
     CITRA_TRACE_SCOPE(config.is_texture_copy ? "GPU::TextureCopy" : "GPU::DisplayTransfer");
@@ -631,6 +1248,7 @@ void GPU::MemoryTransfer() {
         } else if (!impl->rasterizer->AccelerateTextureCopy(config)) {
             CITRA_TRACE_SCOPE("GPU::TextureCopy (software fallback)");
             CITRA_FRAME_DUMP("  texcopy: SOFTWARE fallback");
+            impl->memory.NoteGpuWritten(output_start, output_size);
             impl->sw_blitter->TextureCopy(config);
         }
         CITRA_FRAME_DUMP("texcopy end");
@@ -651,6 +1269,7 @@ void GPU::MemoryTransfer() {
             if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
                 CITRA_TRACE_SCOPE("GPU::DisplayTransfer (software fallback)");
                 CITRA_FRAME_DUMP("  transfer: SOFTWARE fallback");
+                impl->memory.NoteGpuWritten(output_start, output_size);
                 impl->sw_blitter->DisplayTransfer(config);
             }
         }
@@ -661,6 +1280,12 @@ void GPU::MemoryTransfer() {
 
     // Complete transfer.
     config.trigger.Assign(0);
+
+    if (impl->early_completion && std::this_thread::get_id() == impl->decoder_id.load()) {
+        // The game was told at hand-over, and the pacing below was done there: see Submit
+        impl->signal_interrupt(Service::GSP::InterruptId::PPF, delay);
+        return;
+    }
 
     // Some games do not wait for the display: they render into one of several buffers as fast
     // as the GPU finishes their work and show the newest at each VBlank. How fast that is here
@@ -711,6 +1336,7 @@ void GPU::MemoryTransfer() {
 }
 
 void GPU::FinishHeldTransfer() {
+    WaitIdle();
     if (render_pace.held == 0) {
         return;
     }
@@ -719,6 +1345,40 @@ void GPU::FinishHeldTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+    if (impl->early_completion && UsesDecoder() && impl->renderer->ComposesApart()) {
+        // The decoder works behind the game: at a VBlank it may still be on what was handed
+        // over since the VBlank before, and on no more than that. Its composing of the image
+        // goes into the queue in its place, and the frame ends here for the emulation only.
+        WaitForPresent();
+        DeliverInterrupts();
+        ReportDecoderWaits();
+        impl->memory.ApplyLateWrites();
+        impl->deliver_interrupt(Service::GSP::InterruptId::PDC0, 0);
+        impl->deliver_interrupt(Service::GSP::InterruptId::PDC1, 0);
+
+        // The image whose completion was held for this VBlank is the first of the new period
+        if (render_pace.held != 0) {
+            impl->deliver_interrupt(Service::GSP::InterruptId::PPF, render_pace.held_delay);
+            render_pace.filled = std::exchange(render_pace.held, 0);
+        } else {
+            render_pace.filled = 0;
+        }
+
+        Impl::QueuedCommand item{};
+        item.is_present = true;
+        item.queued_at = std::chrono::steady_clock::now();
+        item.present_vblank = impl->renderer->GetCurrentFrame();
+        item.submit_ticks = static_cast<u64>(impl->timing.GetGlobalTicks());
+        ++impl->presents_queued;
+        impl->Queue(std::move(item));
+        impl->renderer->EndEmulatedFrame();
+
+        impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
+        return;
+    }
+    WaitIdle(WaitReason::VBlank);
+    ReportDecoderWaits();
+    impl->memory.ApplyLateWrites();
     // Signal to GSP that GPU interrupt has occurred
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
@@ -743,6 +1403,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 }
 
 void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {
+    WaitIdle();
     // Reset the renderer (this will destroy OpenGL resources)
     impl->renderer.reset();
 
@@ -782,6 +1443,7 @@ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow*
 }
 
 void GPU::ReleaseRenderer() {
+    WaitIdle();
     // Just reset the renderer to release OpenGL resources
     // Don't null out rasterizer pointer as it will become dangling
     impl->renderer.reset();
@@ -791,6 +1453,7 @@ void GPU::ReleaseRenderer() {
 
 template <class Archive>
 void GPU::serialize(Archive& ar, const u32 file_version) {
+    WaitIdle();
     ar & impl->pica;
 }
 

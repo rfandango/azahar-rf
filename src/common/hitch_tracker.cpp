@@ -183,6 +183,11 @@ struct VBlankSample {
     CategoryTimes times;
     /// Share of the period each emulated core was running a thread, in percent
     std::array<u8, GUEST_CORES> guest_load;
+    /// Of the emulated time threads ran for: the share that ran after a thread had handed the
+    /// GPU a command list and before that thread next waited, by that thread alone and by
+    /// all threads, in percent
+    u8 after_list_own;
+    u8 after_list_all;
 };
 
 struct FrameSample {
@@ -209,6 +214,7 @@ struct PresentSample {
     u32 game_frame;
     Clock::time_point submitted;
     Clock::time_point queued;
+    u64 desired_time;    ///< The display time asked for, or zero
     bool first_of_frame; ///< No earlier image of the same game frame
     bool shown;          ///< Reported by the display, or given up on
 };
@@ -227,6 +233,8 @@ struct SharedState {
     std::mutex mutex;
 
     Ring<VBlankSample, 128> vblanks;
+    /// VBlanks since the last summary: what is counted between two summaries goes by these
+    u64 vblanks_since_summary{};
     Ring<FrameSample, 256> frames;
     Ring<HitchSample, 256> hitches;
 
@@ -235,6 +243,7 @@ struct SharedState {
     Nanos refresh_period{};
     const char* present_mode{""};
     Pacing pacing{};
+    HostGpu host_gpu{.load = -1.0f};
     Ring<PresentSample, 64> presents;
     Ring<ScreenSample, 1024> screen;
     Ring<DropSample, 256> drops;
@@ -287,6 +296,13 @@ struct ThreadState {
     /// in the current VBlank period
     GuestTicks guest_busy{};
     GuestTicks guest_idle{};
+    /// The thread that last handed the GPU a command list, whether it has run on since
+    /// without waiting, and the emulated time it and all threads ran for in that state in
+    /// the current VBlank period
+    u32 list_thread{};
+    bool list_thread_runs_on{};
+    u64 after_list_own{};
+    u64 after_list_all{};
 
     // The game frame in progress
     GuestTicks frame_guest_busy{};
@@ -735,13 +751,13 @@ std::string Summarize(Clock::time_point now) {
         const Pacing& pacing = shared.pacing;
         if (pacing.active) {
             fmt::format_to(out,
-                           "\npacing: {}, speed {:+.2f}%, lead {:.0f} ms (aim {:.0f}), {} late, "
-                           "{} missed",
+                           "\npacing: {}, speed {:+.2f}%, lead {:.0f} ms (aim {:.0f}, {:.0f} of it "
+                           "to be queued), ready {:.0f} ms early at the least, {} late, {} missed",
                            pacing.overloaded ? "cannot keep up, images shown as they come"
                            : pacing.locked   ? "in step with the display"
                                              : "by vblank number",
                            (pacing.speed - 1.0) * 100.0, pacing.lead_ms, pacing.target_ms,
-                           pacing.slips, pacing.misses);
+                           pacing.work_ms, pacing.ready_ms, pacing.slips, pacing.misses);
         } else {
             text += "\npacing: off";
         }
@@ -749,6 +765,10 @@ std::string Summarize(Clock::time_point now) {
 
     // Emulation thread
     const std::size_t vblank_count = std::min(shared.vblanks.Size(), USUAL_WINDOW);
+    // What is counted between two summaries is counted over all the VBlanks between them, not
+    // only over those the window holds
+    const double counted_vblanks =
+        static_cast<double>(std::max<u64>(std::exchange(shared.vblanks_since_summary, 0), 1));
     CategoryTimes sums{};
     Nanos wall_sum = 0;
     Nanos wall_max = 0;
@@ -804,6 +824,131 @@ std::string Summarize(Clock::time_point now) {
         fmt::format_to(out, " {}", load_full[core]);
     }
     fmt::format_to(out, " of {}", vblank_count);
+    // What of the game's work runs between a command list and its thread's next wait
+    u32 after_list_own = 0;
+    u32 after_list_all = 0;
+    for (std::size_t i = 0; i < vblank_count; i++) {
+        after_list_own += shared.vblanks[i].after_list_own;
+        after_list_all += shared.vblanks[i].after_list_all;
+    }
+    fmt::format_to(out,
+                   "\nafter a command list: its thread runs on for {}% of the game's work before "
+                   "it waits ({}% with the other threads meanwhile)",
+                   after_list_own / vblank_count, after_list_all / vblank_count);
+    {
+        std::array<double, static_cast<std::size_t>(GpuCall::Count)> calls;
+        for (std::size_t i = 0; i < calls.size(); i++) {
+            calls[i] =
+                static_cast<double>(Detail::GpuCalls()[i].exchange(0, std::memory_order_relaxed)) /
+                counted_vblanks;
+        }
+        const auto of = [&](GpuCall call) { return calls[static_cast<std::size_t>(call)]; };
+        fmt::format_to(out,
+                       "\ngame to gpu, a vblank: handed over {:.1f} command lists, {:.1f} fills, "
+                       "{:.1f} transfers and copies, {:.1f} other; has to wait for {:.1f} "
+                       "register reads, {:.1f} reads and {:.1f} writes of memory the gpu keeps",
+                       of(GpuCall::CommandList), of(GpuCall::Fill), of(GpuCall::Transfer),
+                       of(GpuCall::OtherCommand), of(GpuCall::RegisterRead),
+                       of(GpuCall::MemoryRead), of(GpuCall::MemoryWrite));
+        fmt::format_to(out,
+                       "\nof those: {:.1f} reads of what the gpu has newer, {:.1f} writes into a "
+                       "cached surface",
+                       of(GpuCall::MemoryReadNewer), of(GpuCall::MemoryWriteSurface));
+        {
+            Detail::CommandListWords& called = Detail::CalledListWords();
+            const u64 called_words = called.words.exchange(0, std::memory_order_relaxed);
+            const u64 called_same = called.same.exchange(0, std::memory_order_relaxed);
+            const u32 called_lists = called.lists.exchange(0, std::memory_order_relaxed);
+            const u32 called_identical = called.identical.exchange(0, std::memory_order_relaxed);
+            if (called_words != 0 && called_lists != 0) {
+                fmt::format_to(out,
+                               "\nlists called from them: {:.1f} KiB a vblank; {:.0f}% of their "
+                               "words as last time at that address, {} of {} the same throughout",
+                               static_cast<double>(called_words) * 4.0 / 1024.0 / counted_vblanks,
+                               100.0 * static_cast<double>(called_same) /
+                                   static_cast<double>(called_words),
+                               called_identical, called_lists);
+            }
+        }
+        {
+            std::array<double, static_cast<std::size_t>(DrawSite::Count)> sites;
+            for (std::size_t i = 0; i < sites.size(); i++) {
+                sites[i] = static_cast<double>(
+                    Detail::DrawSites()[i].exchange(0, std::memory_order_relaxed));
+            }
+            const auto of = [&](DrawSite what) { return sites[static_cast<std::size_t>(what)]; };
+            const double draws = of(DrawSite::Draws);
+            const double others = draws - of(DrawSite::Same) - of(DrawSite::Fresh);
+            if (draws > 0) {
+                const auto share = [&](DrawSite what) {
+                    return others > 0 ? 100.0 * of(what) / others : 0.0;
+                };
+                fmt::format_to(
+                    out,
+                    "\ndraw sites: {:.0f} draws a vblank; {:.0f}% find every register as the "
+                    "last time at their place, {:.0f}% come from a new place; the others differ "
+                    "in rasterizer {:.0f}%, texturing {:.0f}%, framebuffer {:.0f}%, lighting "
+                    "{:.0f}%, geometry {:.0f}%, geometry shader {:.0f}%, vertex shader {:.0f}%",
+                    draws / counted_vblanks, 100.0 * of(DrawSite::Same) / draws,
+                    100.0 * of(DrawSite::Fresh) / draws, share(DrawSite::Rasterizer),
+                    share(DrawSite::Texturing), share(DrawSite::Framebuffer),
+                    share(DrawSite::Lighting), share(DrawSite::Geometry),
+                    share(DrawSite::GeometryShader), share(DrawSite::VertexShader));
+            }
+        }
+        Detail::CommandListWords& list_words = Detail::ListWords();
+        const u64 words = list_words.words.exchange(0, std::memory_order_relaxed);
+        const u64 same = list_words.same.exchange(0, std::memory_order_relaxed);
+        const u32 lists = list_words.lists.exchange(0, std::memory_order_relaxed);
+        const u32 identical = list_words.identical.exchange(0, std::memory_order_relaxed);
+        if (words != 0 && lists != 0) {
+            fmt::format_to(out,
+                           "\ncommand lists: {:.1f} KiB a vblank; {:.0f}% of their words are as "
+                           "in the list last sent from the same address, {} of {} lists the "
+                           "same throughout",
+                           static_cast<double>(words) * 4.0 / 1024.0 / counted_vblanks,
+                           100.0 * static_cast<double>(same) / static_cast<double>(words),
+                           identical, lists);
+        }
+    }
+    {
+        std::array<double, static_cast<std::size_t>(PixelMove::Count)> megapixels;
+        std::array<double, static_cast<std::size_t>(PixelMove::Count)> times;
+        double all = 0;
+        for (std::size_t i = 0; i < megapixels.size(); i++) {
+            megapixels[i] = static_cast<double>(
+                                Detail::PixelMoves()[i].exchange(0, std::memory_order_relaxed)) /
+                            1e6 / counted_vblanks;
+            times[i] = static_cast<double>(
+                           Detail::PixelMoveCounts()[i].exchange(0, std::memory_order_relaxed)) /
+                       counted_vblanks;
+            if (static_cast<PixelMove>(i) != PixelMove::Spared) {
+                all += megapixels[i];
+            }
+        }
+        if (all > 0) {
+            const auto of = [&](PixelMove kind) {
+                return fmt::format("{:.2f} in {:.1f}", megapixels[static_cast<std::size_t>(kind)],
+                                   times[static_cast<std::size_t>(kind)]);
+            };
+            fmt::format_to(out,
+                           "\npixels moved, millions a vblank: {:.2f} (blits {}, plain copies {}, "
+                           "other layout {}, second image {}, clears {}); blits given up "
+                           "unused {}",
+                           all, of(PixelMove::Blit), of(PixelMove::Copy), of(PixelMove::Relayout),
+                           of(PixelMove::SecondImage), of(PixelMove::Clear), of(PixelMove::Spared));
+        }
+    }
+    if (shared.host_gpu.load >= 0.0f) {
+        fmt::format_to(out,
+                       "\nhost gpu: at work {:.0f}% of the time ({:.1f} ms a vblank), waited "
+                       "for {:.0f}%, scale {}x",
+                       100.0 * shared.host_gpu.load, shared.host_gpu.load * wall_mean,
+                       100.0 * shared.host_gpu.waited, shared.host_gpu.scale);
+        if (shared.host_gpu.scale != shared.host_gpu.asked_scale) {
+            fmt::format_to(out, " of the {}x asked for", shared.host_gpu.asked_scale);
+        }
+    }
     SummarizeAudio(text, now);
     return text;
 }
@@ -980,6 +1125,21 @@ void MoveTime(Category from, Category to, std::chrono::nanoseconds time) {
     ts.times[Index(to)] += time.count();
 }
 
+void Detail::NoteCommandListDone(u32 thread) {
+    ThreadState& ts = thread_state;
+    if (ts.tracked) {
+        ts.list_thread = thread;
+        ts.list_thread_runs_on = true;
+    }
+}
+
+void Detail::NoteGuestThreadWaits(u32 thread) {
+    ThreadState& ts = thread_state;
+    if (ts.tracked && ts.list_thread_runs_on && thread == ts.list_thread) {
+        ts.list_thread_runs_on = false;
+    }
+}
+
 void Detail::NoteGuestSlice(u32 core, bool idle, u32 thread, u32 priority, u64 ticks) {
     ThreadState& ts = thread_state;
     if (!ts.tracked || core >= GUEST_CORES) {
@@ -990,6 +1150,12 @@ void Detail::NoteGuestSlice(u32 core, bool idle, u32 thread, u32 priority, u64 t
         return;
     }
     ts.guest_busy[core] += ticks;
+    if (ts.list_thread_runs_on) {
+        ts.after_list_all += ticks;
+        if (thread == ts.list_thread) {
+            ts.after_list_own += ticks;
+        }
+    }
     for (u32 i = 0; i < ts.frame_guest_thread_count; i++) {
         GuestThread& known = ts.frame_guest_threads[i];
         if (known.id == thread) {
@@ -1066,12 +1232,19 @@ void EndVBlank() {
         ts.frame_times[i] += times[i];
     }
     std::array<u8, GUEST_CORES> guest_load{};
+    u64 all_busy = 0;
     for (std::size_t i = 0; i < GUEST_CORES; i++) {
         const u64 total = guest_busy[i] + guest_idle[i];
         guest_load[i] = total == 0 ? 0 : static_cast<u8>(guest_busy[i] * 100 / total);
+        all_busy += guest_busy[i];
         ts.frame_guest_busy[i] += guest_busy[i];
         ts.frame_guest_idle[i] += guest_idle[i];
     }
+    const u64 after_list_own = std::exchange(ts.after_list_own, 0);
+    const u64 after_list_all = std::exchange(ts.after_list_all, 0);
+    const auto share_of_busy = [all_busy](u64 ticks) {
+        return all_busy == 0 ? u8{0} : static_cast<u8>(std::min<u64>(ticks * 100 / all_busy, 100));
+    };
     ts.frame_wall += wall;
     ts.frame_longest_vblank = std::max(ts.frame_longest_vblank, wall);
     ts.frame_pipeline_stall += pipeline_stall;
@@ -1086,7 +1259,14 @@ void EndVBlank() {
     std::string summary;
     {
         std::scoped_lock lock{shared.mutex};
-        shared.vblanks.Push(VBlankSample{.wall = wall, .times = times, .guest_load = guest_load});
+        shared.vblanks_since_summary++;
+        shared.vblanks.Push(VBlankSample{
+            .wall = wall,
+            .times = times,
+            .guest_load = guest_load,
+            .after_list_own = share_of_busy(after_list_own),
+            .after_list_all = share_of_busy(after_list_all),
+        });
         if (game_frame != ts.last_game_frame) {
             ts.last_game_frame = game_frame;
             hitch_line = FinishFrame(ts, game_frame, now);
@@ -1118,6 +1298,42 @@ void SetPacing(const Pacing& pacing) {
     shared.pacing = pacing;
 }
 
+std::array<std::atomic<u64>, static_cast<std::size_t>(PixelMove::Count)>& Detail::PixelMoves() {
+    static std::array<std::atomic<u64>, static_cast<std::size_t>(PixelMove::Count)> pixels{};
+    return pixels;
+}
+
+std::array<std::atomic<u32>, static_cast<std::size_t>(PixelMove::Count)>&
+Detail::PixelMoveCounts() {
+    static std::array<std::atomic<u32>, static_cast<std::size_t>(PixelMove::Count)> counts{};
+    return counts;
+}
+
+std::array<std::atomic<u32>, static_cast<std::size_t>(GpuCall::Count)>& Detail::GpuCalls() {
+    static std::array<std::atomic<u32>, static_cast<std::size_t>(GpuCall::Count)> calls{};
+    return calls;
+}
+
+Detail::CommandListWords& Detail::ListWords() {
+    static CommandListWords counts;
+    return counts;
+}
+
+std::array<std::atomic<u64>, static_cast<std::size_t>(DrawSite::Count)>& Detail::DrawSites() {
+    static std::array<std::atomic<u64>, static_cast<std::size_t>(DrawSite::Count)> counts{};
+    return counts;
+}
+
+Detail::CommandListWords& Detail::CalledListWords() {
+    static CommandListWords counts;
+    return counts;
+}
+
+void SetHostGpu(const HostGpu& gpu) {
+    std::scoped_lock lock{shared.mutex};
+    shared.host_gpu = gpu;
+}
+
 void NoteAudioOutput(const AudioOutput& output) {
     if (!IsEnabled()) {
         return;
@@ -1136,7 +1352,7 @@ void NoteAudioOutput(const AudioOutput& output) {
     audio_next.store(next + 1, std::memory_order_release);
 }
 
-void NotePresentQueued(u32 id, u32 game_frame, Clock::time_point submitted) {
+void NotePresentQueued(u32 id, u32 game_frame, Clock::time_point submitted, u64 desired_time_ns) {
     if (!IsEnabled() || id == 0) {
         return;
     }
@@ -1148,6 +1364,7 @@ void NotePresentQueued(u32 id, u32 game_frame, Clock::time_point submitted) {
         .game_frame = game_frame,
         .submitted = submitted,
         .queued = Clock::now(),
+        .desired_time = desired_time_ns,
         .first_of_frame = first_of_frame,
         .shown = false,
     });
@@ -1159,6 +1376,7 @@ void NotePresentShown(u32 present_id, u64 display_time_ns, u64 margin_ns) {
     }
     std::string log_line;
     std::string detail_line;
+    std::string dropped_lines;
     {
         std::scoped_lock lock{shared.mutex};
         const Clock::time_point now = Clock::now();
@@ -1185,6 +1403,23 @@ void NotePresentShown(u32 present_id, u64 display_time_ns, u64 margin_ns) {
                 .first_of_frame = shared.presents[i].first_of_frame,
             });
             dropped++;
+            if (TraceMarkers::Experiments() & TraceMarkers::LogPresents) {
+                const PresentSample& lost = shared.presents[i];
+                const Nanos handed = ToNanos(lost.submitted.time_since_epoch());
+                dropped_lines += fmt::format(
+                    "{}Present {} frame {} never shown: handed over at {:.1f}, queued +{:.1f}, "
+                    "asked for +{:.1f}; the one shown in its place, {}, was asked for {:.1f} "
+                    "after it",
+                    dropped_lines.empty() ? "" : "\n", lost.id, lost.game_frame,
+                    ToMs(handed % (100'000 * MS)), ToMs(ToNanos(lost.queued - lost.submitted)),
+                    lost.desired_time != 0 ? ToMs(static_cast<Nanos>(lost.desired_time) - handed)
+                                           : 0.0,
+                    present.id,
+                    lost.desired_time != 0 && present.desired_time != 0
+                        ? ToMs(static_cast<Nanos>(present.desired_time) -
+                               static_cast<Nanos>(lost.desired_time))
+                        : 0.0);
+            }
         }
 
         // Two images reported for the same refresh: the earlier one was never seen
@@ -1220,10 +1455,14 @@ void NotePresentShown(u32 present_id, u64 display_time_ns, u64 margin_ns) {
                 ToMs(ToNanos(present.submitted.time_since_epoch()) % (100'000 * MS));
             detail_line = fmt::format(
                 "Present {} frame {}{}: handed over at {:.1f}, {:.1f} ms into the refresh, queued "
-                "+{:.1f}, shown +{:.1f}, ready {:.1f} early, {} dropped before it",
+                "+{:.1f}, shown +{:.1f}, ready {:.1f} early, {} dropped before it, asked for "
+                "+{:.1f}",
                 present.id, present.game_frame, present.first_of_frame ? " (new)" : "", handed_over,
                 ToMs(phase), ToMs(ToNanos(present.queued - present.submitted)), ToMs(latency),
-                ToMs(margin), dropped);
+                ToMs(margin), dropped,
+                present.desired_time != 0 ? ToMs(static_cast<Nanos>(present.desired_time) -
+                                                 ToNanos(present.submitted.time_since_epoch()))
+                                          : 0.0);
         }
 
         if (!shared.has_shown) {
@@ -1242,6 +1481,9 @@ void NotePresentShown(u32 present_id, u64 display_time_ns, u64 margin_ns) {
             shared.shown_game_frame = present.game_frame;
             shared.shown_since = display_time_ns;
         }
+    }
+    if (!dropped_lines.empty()) {
+        LOG_INFO(Common, "{}", dropped_lines);
     }
     if (!detail_line.empty()) {
         LOG_INFO(Common, "{}", detail_line);

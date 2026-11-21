@@ -11,6 +11,7 @@
 #include "common/archives.h"
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/serialization/boost_flat_set.h"
 #include "common/settings.h"
@@ -168,6 +169,11 @@ void ThreadManager::SwitchContext(Thread* new_thread) {
             // yielding execution (i.e. an event triggered, system core time-sliced, etc)
             ready_queue.push_front(previous_thread->current_priority, previous_thread);
             previous_thread->status = ThreadStatus::Ready;
+        } else if (previous_thread->status != ThreadStatus::WaitIPC) {
+            // It gave up the core to wait for something. The wait for the reply of a system
+            // service does not count: the service is emulated in no time, and the thread
+            // goes on as if it had not waited.
+            Common::Hitches::NoteGuestThreadWaits(previous_thread->thread_id);
         }
     }
 

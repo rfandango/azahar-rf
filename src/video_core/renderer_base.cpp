@@ -2,7 +2,10 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <algorithm>
+#include <chrono>
 #include "common/hitch_tracker.h"
+#include "common/logging/log.h"
 #include "common/settings.h"
 #include "common/trace_markers.h"
 #include "core/core.h"
@@ -22,7 +25,43 @@ RendererBase::RendererBase(Core::System& system_, Frontend::EmuWindow& window,
 
 RendererBase::~RendererBase() = default;
 
-u32 RendererBase::GetResolutionScaleFactor() {
+namespace {
+
+/// VBlanks the GPU's load is added up over before anything is made of it
+constexpr u32 LOAD_WINDOW = 30;
+/// Such stretches with the emulation behind, in a row of stretches with the GPU holding it
+/// back, before the scale is lowered
+constexpr u32 OVERLOADED_WINDOWS = 3;
+/// Stretches in a row with room for the next scale, as far as the load tells, before it is
+/// raised
+constexpr u32 ROOMY_WINDOWS = 10;
+/// Stretches in a row without the GPU holding anything back before the next scale is tried
+/// although the load does not promise room for it: to begin with, and at the most. Doubled
+/// each time a raise had to be taken back.
+constexpr u32 CALM_WINDOWS = 60;
+constexpr u32 MAX_CALM_WINDOWS = 1200;
+/// A raise that lasted this many stretches was right
+constexpr u32 PROVEN_WINDOWS = 40;
+/// Stretches after a change that are not judged: they hold the cost of the change itself
+constexpr u32 SETTLING_WINDOWS = 2;
+/// Share of the time the GPU is at work from which it can be what holds the emulation back
+constexpr float BUSY_LOAD = 0.85f;
+/// Share of the time the emulation waits for the GPU from which it is held back by it
+constexpr float HELD_BACK = 0.10f;
+/// Share of the time the GPU may be at work at the next scale, going by the pixels. The host
+/// lowers the GPU's clock when it has little to do, which makes the share measured too high
+/// rather than too low.
+constexpr float ROOM_LOAD = 0.80f;
+
+/// The lowest scale the governor goes to from the one asked for: half of it, and never the
+/// console's own resolution
+constexpr u32 LowestGovernedScale(u32 asked) {
+    return asked <= 2 ? asked : (asked + 1) / 2;
+}
+
+} // Anonymous namespace
+
+u32 RendererBase::AskedResolutionScaleFactor() {
     const auto graphics_api = Settings::GetWorkingGraphicsAPI();
     if (graphics_api == Settings::GraphicsAPI::Software) {
         // Software renderer always render at native resolution
@@ -32,6 +71,139 @@ u32 RendererBase::GetResolutionScaleFactor() {
     const u32 scale_factor = Settings::values.resolution_factor.GetValue();
     return scale_factor != 0 ? scale_factor
                              : render_window.GetFramebufferLayout().GetScalingRatio();
+}
+
+u32 RendererBase::GetResolutionScaleFactor() {
+    const u32 asked = AskedResolutionScaleFactor();
+    const u32 reduction = scale_reduction.load(std::memory_order_relaxed);
+    return asked - std::min(reduction, asked - LowestGovernedScale(asked));
+}
+
+void RendererBase::GovernResolution() {
+    const bool governs = Settings::values.dynamic_resolution.GetValue();
+    const auto busy = TakeGpuTime(governs || Common::Hitches::IsEnabled());
+    if (!busy) {
+        scale_reduction.store(0, std::memory_order_relaxed);
+        load_window_open = false;
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto restart = [&] {
+        load_window_open = true;
+        load_window_start = now;
+        load_window_vblanks = 0;
+        load_window_busy = {};
+        load_window_waited = {};
+        load_window_work = {};
+        load_window_emulated = {};
+    };
+    if (!load_window_open) {
+        // What was just taken is of a time that was not followed
+        restart();
+        return;
+    }
+    load_window_busy += *busy;
+    load_window_work += system.frame_limiter.LastIntervalWork();
+    load_window_emulated += system.frame_limiter.LastIntervalEmulated();
+    if (++load_window_vblanks < LOAD_WINDOW) {
+        return;
+    }
+
+    const double wall = std::chrono::duration<double>(now - load_window_start).count();
+    const auto share = [wall](std::chrono::nanoseconds time) {
+        return wall > 0.0 ? static_cast<float>(std::chrono::duration<double>(time).count() / wall)
+                          : 0.0f;
+    };
+    const float load = share(load_window_busy);
+    const float waited = share(load_window_waited);
+    const double limit = Settings::GetFrameLimit() / 100.0;
+    // Behind: the host worked for longer than the time it emulated, with nothing left for the
+    // frame limiter to wait for. With the GPU setting the pace that is already too slow: a
+    // game half a percent behind shows a frame twice every few seconds.
+    const bool behind =
+        limit > 0.0 && static_cast<double>(load_window_work.count()) >
+                           static_cast<double>(load_window_emulated.count()) / limit * 1.003;
+    restart();
+
+    const u32 asked = AskedResolutionScaleFactor();
+    const u32 lowest = LowestGovernedScale(asked);
+    u32 reduction = std::min(scale_reduction.load(std::memory_order_relaxed), asked - lowest);
+    const u32 scale = asked - reduction;
+    Common::Hitches::SetHostGpu({
+        .load = load,
+        .waited = waited,
+        .scale = scale,
+        .asked_scale = asked,
+    });
+
+    // Only at the console's own speed: faster than that, the GPU is meant to be the limit
+    if (!governs || limit <= 0.0 || limit > 1.0) {
+        if (!governs) {
+            scale_reduction.store(0, std::memory_order_relaxed);
+        }
+        overloaded_windows = roomy_windows = calm_windows = 0;
+        return;
+    }
+    if (settling_windows != 0) {
+        settling_windows--;
+        return;
+    }
+    if (raise_patience == 0) {
+        raise_patience = CALM_WINDOWS;
+    }
+    if (raise_unproven && ++windows_since_raise >= PROVEN_WINDOWS) {
+        raise_unproven = false;
+        raise_patience = CALM_WINDOWS;
+    }
+
+    // The GPU holds the emulation back: the emulation spends its time waiting for the GPU to
+    // finish frames, the GPU is at work nearly all the time, and the emulation is behind. At
+    // the limit it is behind in some stretches and just in time in others, so a stretch in
+    // which it only waits does not take back what the others counted.
+    if (waited >= HELD_BACK && load >= BUSY_LOAD) {
+        roomy_windows = calm_windows = 0;
+        if (behind && ++overloaded_windows >= OVERLOADED_WINDOWS && scale > lowest) {
+            reduction++;
+            scale_reduction.store(reduction, std::memory_order_relaxed);
+            overloaded_windows = 0;
+            settling_windows = SETTLING_WINDOWS;
+            if (raise_unproven) {
+                // The raise was too early: wait twice as long before the next one
+                raise_unproven = false;
+                raise_patience = std::min(raise_patience * 2, MAX_CALM_WINDOWS);
+            }
+            LOG_INFO(Render,
+                     "Resolution scale lowered to {}x of {}x: the GPU was at work {:.0f}% of "
+                     "the time and the emulation waited for it {:.0f}%",
+                     asked - reduction, asked, 100.0f * load, 100.0f * waited);
+        }
+        return;
+    }
+    overloaded_windows = 0;
+    if (reduction == 0) {
+        roomy_windows = calm_windows = 0;
+        return;
+    }
+
+    // Back up: at once if the load leaves room for the pixels of the next scale, and
+    // otherwise after a while without the GPU holding anything back, as a try
+    const float pixels =
+        static_cast<float>((scale + 1) * (scale + 1)) / static_cast<float>(scale * scale);
+    roomy_windows = load * pixels <= ROOM_LOAD ? roomy_windows + 1 : 0;
+    calm_windows = waited < HELD_BACK ? calm_windows + 1 : 0;
+    const bool room = roomy_windows >= ROOMY_WINDOWS;
+    if (room || calm_windows >= raise_patience) {
+        reduction--;
+        scale_reduction.store(reduction, std::memory_order_relaxed);
+        roomy_windows = calm_windows = 0;
+        settling_windows = SETTLING_WINDOWS;
+        windows_since_raise = 0;
+        raise_unproven = true;
+        LOG_INFO(Render,
+                 "Resolution scale raised to {}x of {}x ({}): the GPU was at work {:.0f}% of "
+                 "the time",
+                 asked - reduction, asked, room ? "room for it" : "as a try", 100.0f * load);
+    }
 }
 
 u8 RendererBase::GetSampleCount() const {
@@ -93,56 +265,85 @@ bool RendererBase::ShouldPresentImage() {
 }
 
 void RendererBase::EndFrame() {
-    // One "EmuFrame" async slice per emulated VBlank period, excluding GPU throttling and frame
-    // limiting below.
-    CITRA_TRACE_ASYNC_END("EmuFrame", current_frame);
-    CITRA_TRACE_END_FRAME();
-    CITRA_FRAME_DUMP_VBLANK();
-    Common::Hitches::EndVBlank();
+    EndFrameParts(true, true);
+}
 
-    current_frame++;
+void RendererBase::EndEmulatedFrame() {
+    EndFrameParts(true, false);
+}
 
-    system.perf_stats->EndSystemFrame();
+void RendererBase::EndGpuFrame() {
+    EndFrameParts(false, true);
+}
 
-    render_window.PollEvents();
+void RendererBase::EndFrameParts(bool emulation, bool gpu) {
+    if (emulation) {
+        // One "EmuFrame" async slice per emulated VBlank period, excluding GPU throttling and
+        // frame limiting below.
+        CITRA_TRACE_ASYNC_END("EmuFrame", current_frame);
+        CITRA_TRACE_END_FRAME();
+        CITRA_FRAME_DUMP_VBLANK();
+        Common::Hitches::EndVBlank();
 
-    // Wait for the GPU to finish and to be at most one game frame behind.
-    // Below 60 FPS a guest frame spans several VBlanks, and its GPU work may still run while the
-    // next one is emulated.
-    const u64 game_frames = system.perf_stats->GetGameFrameCount();
-    if (game_frames != limited_game_frames) {
-        limited_game_frames = game_frames;
-        if (Settings::values.use_limit_frames_ahead_of_gpu.GetValue() ||
-            AlwaysLimitsFramesAheadOfGpu()) {
-            CITRA_TRACE_SCOPE("LimitFramesAheadOfGpu");
-            CITRA_HITCH_SCOPE_ABSORB(GpuBehind);
-            LimitFramesAheadOfGpu();
+        current_frame++;
+
+        system.perf_stats->EndSystemFrame();
+
+        render_window.PollEvents();
+    }
+
+    if (gpu) {
+        // Wait for the GPU to finish and to be at most one game frame behind.
+        // Below 60 FPS a guest frame spans several VBlanks, and its GPU work may still run
+        // while the next one is emulated.
+        const u64 game_frames = system.perf_stats->GetGameFrameCount();
+        if (game_frames != limited_game_frames) {
+            limited_game_frames = game_frames;
+            if (Settings::values.use_limit_frames_ahead_of_gpu.GetValue() ||
+                AlwaysLimitsFramesAheadOfGpu()) {
+                CITRA_TRACE_SCOPE("LimitFramesAheadOfGpu");
+                CITRA_HITCH_SCOPE_ABSORB(GpuBehind);
+                if (load_window_open) {
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    LimitFramesAheadOfGpu();
+                    load_window_waited += std::chrono::steady_clock::now() - wait_start;
+                } else {
+                    LimitFramesAheadOfGpu();
+                }
+            }
         }
     }
 
-    {
-        CITRA_TRACE_SCOPE("FrameLimiter");
-        CITRA_HITCH_SCOPE_ABSORB(Limiter);
-        system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
+    if (emulation) {
+        {
+            CITRA_TRACE_SCOPE("FrameLimiter");
+            CITRA_HITCH_SCOPE_ABSORB(Limiter);
+            system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
+        }
+        const Core::Movie::PlayMode movie = system.Movie().GetPlayMode();
+        system.CoreTiming().GovernProcessorClock(
+            system.frame_limiter.LastIntervalEmulated(), system.frame_limiter.LastIntervalWork(),
+            Settings::GetFrameLimit() / 100.0,
+            movie == Core::Movie::PlayMode::Recording || movie == Core::Movie::PlayMode::Playing);
     }
-    const Core::Movie::PlayMode movie = system.Movie().GetPlayMode();
-    system.CoreTiming().GovernProcessorClock(
-        system.frame_limiter.LastIntervalEmulated(), system.frame_limiter.LastIntervalWork(),
-        Settings::GetFrameLimit() / 100.0,
-        movie == Core::Movie::PlayMode::Recording || movie == Core::Movie::PlayMode::Playing);
-
-    // On fast enough devices, the time limiter sleep spans most of the 16ms period
-    // between VBlank events. If an input event lands in that period, then the change
-    // will not reflect in HID until the next HID event. For applications that only
-    // check the input just after VBlank, it will cause them to lose the event until
-    // the next frame. Sacrifice HID timing accuracy for input latency by triggering
-    // the event just after VBlank (frame limiting behaviour is not accurate anyways).
-    if (const auto hid = Service::HID::GetModule(system)) {
-        hid->RestartPadUpdates();
+    if (gpu) {
+        GovernResolution();
     }
 
-    system.perf_stats->BeginSystemFrame();
-    CITRA_TRACE_ASYNC_BEGIN("EmuFrame", current_frame);
+    if (emulation) {
+        // On fast enough devices, the time limiter sleep spans most of the 16ms period
+        // between VBlank events. If an input event lands in that period, then the change
+        // will not reflect in HID until the next HID event. For applications that only
+        // check the input just after VBlank, it will cause them to lose the event until
+        // the next frame. Sacrifice HID timing accuracy for input latency by triggering
+        // the event just after VBlank (frame limiting behaviour is not accurate anyways).
+        if (const auto hid = Service::HID::GetModule(system)) {
+            hid->RestartPadUpdates();
+        }
+
+        system.perf_stats->BeginSystemFrame();
+        CITRA_TRACE_ASYNC_BEGIN("EmuFrame", current_frame);
+    }
 }
 
 bool RendererBase::IsScreenshotPending() const {

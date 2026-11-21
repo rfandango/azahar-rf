@@ -5,13 +5,22 @@
 #pragma once
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <utility>
+#include <vector>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/vector.hpp>
 #include "common/common_types.h"
 #include "common/memory_ref.h"
 #include "common/swap.h"
+
+namespace Common {
+class AddressSpaceView;
+class SharedBacking;
+} // namespace Common
 
 namespace Kernel {
 class Process;
@@ -59,6 +68,9 @@ enum class PageType : u8 {
  * requires an indexed fetch and a check for NULL.
  */
 struct PageTable {
+    PageTable();
+    ~PageTable();
+
     /**
      * Array of memory pointers backing each page. An entry can only be non-null if the
      * corresponding entry in the `attributes` array is of type `Memory`.
@@ -67,6 +79,8 @@ struct PageTable {
     // The reason for this rigmarole is to keep the 'raw' and 'refs' arrays in sync.
     // We need 'raw' for dynarmic and 'refs' for serialization
     struct Pointers {
+        Pointers();
+        ~Pointers();
 
         struct Entry {
             Entry(Pointers& pointers_, VAddr idx_) : pointers(pointers_), idx(idx_) {}
@@ -74,6 +88,9 @@ struct PageTable {
             Entry& operator=(MemoryRef value) {
                 pointers.raw[idx] = value.GetPtr();
                 pointers.refs[idx] = std::move(value);
+                if (pointers.host_view) [[unlikely]] {
+                    pointers.NoteChange(idx);
+                }
                 return *this;
             }
 
@@ -94,9 +111,40 @@ struct PageTable {
             return refs[idx];
         }
 
+        /**
+         * With host MMU access in use: the start of this address space laid out once more in
+         * the host's own (4 GiB, see Common::AddressSpaceView), where each page that has a
+         * pointer here to the emulated system's memory is found at its emulated address and
+         * an access to any other faults. Kept in step with the entries as they are set.
+         * Null otherwise.
+         */
+        [[nodiscard]] u8* HostView() const;
+
+        /// Between the two, changes to the entries are gathered and brought to the host's
+        /// view at the end, a run of pages at a time. They nest.
+        void BeginChanges();
+        void EndChanges();
+
+        /// A page without a pointer is empty in the host's view. Given the memory it stands
+        /// for here, it shows there all the same, readable only: recompiled code reads it
+        /// where it is, and a write faults and goes the long way. For pages whose writes have
+        /// to be announced while their reads need not, see
+        /// MemorySystem::RasterizerMarkRegionWatched. Null takes it back. Does nothing
+        /// without a view.
+        void SetReadOnly(std::size_t idx, u8* memory);
+
     private:
+        void NoteChange(std::size_t idx);
+        void ApplyToView(std::size_t first, std::size_t count);
+
         std::array<u8*, PAGE_TABLE_NUM_ENTRIES> raw;
         std::array<MemoryRef, PAGE_TABLE_NUM_ENTRIES> refs;
+        std::unique_ptr<Common::AddressSpaceView> host_view;
+        const Common::SharedBacking* host_view_backing = nullptr;
+        u32 changes_depth = 0;
+        std::vector<u32> changed;
+        /// The pages given to SetReadOnly, with their memory
+        std::unordered_map<u32, u8*> read_only;
         friend struct PageTable;
     };
 
@@ -138,6 +186,10 @@ private:
         ar & watchpoint_pages_map;
         for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
             pointers.raw[i] = pointers.refs[i].GetPtr();
+        }
+        if (Archive::is_loading::value) {
+            pointers.read_only.clear();
+            pointers.ApplyToView(0, PAGE_TABLE_NUM_ENTRIES);
         }
     }
     friend class boost::serialization::access;
@@ -264,6 +316,10 @@ enum class FlushMode {
     FlushAndInvalidate,
 };
 
+/// What the decoder of GPU commands read a stretch of memory as, see
+/// MemorySystem::NoteGpuReference
+enum class GpuReference : u8 { Other, VertexData, IndexData, Texture, CalledList };
+
 class MemorySystem {
 public:
     explicit MemorySystem(Core::System& system);
@@ -282,7 +338,18 @@ public:
     void UnmapRegion(PageTable& page_table, VAddr base, u32 size);
 
     /// Currently active page table
-    void SetCurrentPageTable(std::shared_ptr<PageTable> page_table);
+    void SetCurrentPageTable(const std::shared_ptr<PageTable>& page_table);
+
+    /// Whether the emulated memory is set up for host MMU access, see
+    /// PageTable::Pointers::HostView
+    [[nodiscard]] bool UsesHostMmu() const;
+
+    /// The emulated system's memories (FCRAM, VRAM, the New 3DS's extra RAM, the DSP's) as
+    /// the one piece of host memory they are parts of, if they are kept that way: it starts
+    /// and ends on a page of the host. Every pointer to emulated memory then points into it,
+    /// which lets a host GPU that can take memory by its address use the emulated memory
+    /// where it is. Empty otherwise.
+    [[nodiscard]] std::span<u8> GetHostPool() const;
     std::shared_ptr<PageTable> GetCurrentPageTable() const;
 
     /**
@@ -660,6 +727,92 @@ public:
      */
     void RasterizerMarkRegionCached(PAddr start, u32 size, bool cached);
 
+    /**
+     * Has what the emulation writes to the pages of the stretch announced like writes to cached
+     * pages are (the rasterizer's InvalidateRegion), or no longer, without a surface being
+     * cached there: for what else the rasterizer keeps in step with the emulated memory, vertex
+     * data it lets the host GPU read in place. Reads of such a page need no announcing, and where
+     * the recompiled code reaches memory through a view of the address space
+     * (PageTable::Pointers::HostView) it reads the page directly; without views every access
+     * goes the long way, as for a cached page. A page that is cached as well is a cached page.
+     */
+    void RasterizerMarkRegionWatched(PAddr start, u32 size, bool watched);
+
+    /**
+     * Says of cached pages that the rasterizer holds nothing newer than the emulated memory there,
+     * or takes that back: what is read from such a page then needs no announcing (FlushRegion), and
+     * recompiled code that reaches memory through a view reads it directly. Writes are announced as
+     * before. Ends by itself when the page stops being cached.
+     */
+    void RasterizerMarkRegionReadable(PAddr start, u32 size, bool readable);
+
+    /**
+     * Says which bytes of the emulated memory a cached surface covers, or covers no longer, kept in
+     * cells of 64 bytes. A page is marked as cached as a whole, but most of what a game writes on
+     * such a page only shares it with a texture (measured: all of 4,100 writes a frame in one
+     * game): a write is announced to the rasterizer only if it touches a covered cell, or the page
+     * is watched. Taking back clears every cell the stretch touches; the caller then sets again
+     * what other surfaces still cover of them.
+     */
+    void RasterizerSetSurfaceCells(PAddr start, u32 size, bool covered);
+
+    /// No surface covers anything any more
+    void RasterizerClearSurfaceCells();
+
+    /**
+     * For an emulated GPU whose commands are decoded behind the game's back (it is told "done"
+     * at hand-over): the pages the decoder reads what a command points at from (vertex and
+     * index data, textures, command lists called from others) and the pages it writes (render
+     * targets, the ends of transfers and fills). TrackGpuReferences switches the noting on;
+     * NoteGpuReference and NoteGpuWritten are the decoder saying it read or wrote a stretch
+     * (its thread only). ArmGpuReferences, at every hand-over on the emulation thread, arms
+     * every page noted so far: the next write to a page the decoder reads, and the next read
+     * or write of a page it writes, waits for the decoder like any access to memory the
+     * rasterizer keeps, and the page is free again until the next hand-over (Disarm).
+     */
+    void TrackGpuReferences(bool track);
+    void NoteGpuReference(PAddr addr, u32 size, GpuReference kind = GpuReference::Other);
+    void NoteGpuWritten(PAddr addr, u32 size);
+    /// Decoder thread: whether what it is on is a transfer or copy, and not a command list.
+    /// What is noted as read is armed again only for commands of that kind.
+    void SetGpuReader(bool transfer);
+    /// At a hand-over. `for_list`, `for_transfer`: what is being handed over (a fill reads
+    /// nothing). `queued_before` is the number of the last command handed over before this
+    /// one and `done` that of the last the decoder has finished. Returns in `pages` and
+    /// `bytes` the copies of the volatile pages the command may read (4 KiB each, in the
+    /// order of `pages`): pages the game keeps writing are not armed but copied.
+    void ArmGpuReferences(bool for_list, bool for_transfer, u64 queued_before, u64 done,
+                          std::vector<u32>& pages, std::unique_ptr<u8[]>& bytes);
+    /// A write went to a page the decoder reads from while the decoder has work: the page is
+    /// to be copied at hand-overs from now on, and stays armed until what is queued is done
+    void WantVolatile(PAddr addr, u32 size);
+    /// Decoder thread: the copies that came with the command it is on, and none again
+    void UseGpuSnapshot(const std::vector<u32>& pages, const u8* bytes);
+    void DropGpuSnapshot();
+    /// Where the decoder reads `size` bytes of the emulated memory from: the copy that came
+    /// with the command, for a volatile page, or the memory itself. Valid until
+    /// DropGpuSnapshot.
+    const u8* GpuRead(PAddr addr, u32 size);
+    /// Volatile pages now, and bytes copied for them since this was last asked
+    std::pair<u32, u64> TakeSnapshotFigures();
+    /// Pages copied for commands that are done, and how many of those copies the decoder
+    /// read, since this was last asked
+    std::pair<u64, u64> TakeSnapshotReadFigures();
+    void Disarm(PAddr addr, u32 size, bool written);
+
+    /// For what the rasterizer gives the game late (a small image the game reads back every
+    /// frame): the game's reads of the stretch go to memory as it is, without the rasterizer
+    /// being asked, for as long as late writes for it keep coming (emulation thread).
+    void ExemptReads(PAddr addr, u32 size);
+    /// Bytes for the emulated memory that are put there at the next VBlank (any thread)
+    void PostLateWrite(PAddr addr, std::vector<u8>&& bytes);
+    /// Once a VBlank, on the emulation thread
+    void ApplyLateWrites();
+    /// Frees every page that is armed or shut, to be armed again at the next hand-over. With
+    /// the decoder idle: before the emulated system's state is written out, page tables and
+    /// all.
+    void DisarmAll();
+
     /// For a rasterizer-accessible PAddr, gets a list of all possible VAddr
     std::vector<VAddr> PhysicalToVirtualAddressForRasterizer(PAddr addr);
 
@@ -749,11 +902,16 @@ private:
 
     void MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef memory, PageType type);
 
+    /// RasterizerMarkRegionCached and RasterizerMarkRegionWatched: sets or takes back one of
+    /// the two marks and gives each page the state the two together ask for
+    void MarkRegionForRasterizer(PAddr start, u32 size, bool set, int mark);
+
+    /// Shows the page in the host's view readable only, or not at all, as its marks ask for
+    void ApplyReadThrough(PageTable& page_table, VAddr vaddr);
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl;
-
-    PhysMemRegionInfo phys_mem_region_info_cache{};
 
     friend class boost::serialization::access;
     template <class Archive>

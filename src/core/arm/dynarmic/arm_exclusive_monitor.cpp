@@ -8,7 +8,10 @@ namespace Core {
 
 DynarmicExclusiveMonitor::DynarmicExclusiveMonitor(Memory::MemorySystem& memory_,
                                                    std::size_t core_count_)
-    : monitor{core_count_}, memory{memory_} {}
+    // Every emulated core runs on the emulation thread, one after the other: the monitor needs
+    // no lock of its own. A game that spins on a lock (Monster Hunter 4's opening video
+    // does, for the whole of every frame) spent a third of the thread's time taking it.
+    : monitor{core_count_, true}, memory{memory_} {}
 
 DynarmicExclusiveMonitor::~DynarmicExclusiveMonitor() = default;
 

@@ -215,6 +215,7 @@ class EmulationFragment :
         binding.drawerLayout.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED)
         binding.drawerLayout.addDrawerListener(object : DrawerListener {
             override fun onDrawerSlide(drawerView: View, slideOffset: Float) {
+                binding.surfaceInputOverlay.setDrawerShowing(slideOffset > 0f)
                 binding.surfaceInputOverlay.dispatchTouchEvent(
                     MotionEvent.obtain(
                         SystemClock.uptimeMillis(),
@@ -243,7 +244,12 @@ class EmulationFragment :
             }
 
             override fun onDrawerStateChanged(newState: Int) {
-                // No op
+                // Before the menu has moved: it is about to lie over the game's picture
+                if (newState != DrawerLayout.STATE_IDLE) {
+                    binding.surfaceInputOverlay.setDrawerShowing(true)
+                } else if (!binding.drawerLayout.isDrawerVisible(binding.inGameMenu)) {
+                    binding.surfaceInputOverlay.setDrawerShowing(false)
+                }
             }
         })
         binding.inGameMenu.menu.findItem(R.id.menu_lock_drawer).apply {

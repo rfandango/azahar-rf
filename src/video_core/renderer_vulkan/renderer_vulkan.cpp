@@ -57,6 +57,34 @@ constexpr std::array<f32, 4 * 4> MakeOrthographicMatrix(u32 width, u32 height) {
     // clang-format on
 }
 
+/// The same, for a frame that is drawn turned by so many degrees (clockwise as seen on the
+/// frame): a point at (x, y) of the upright picture goes to (-y, x), (-x, -y) or (y, -x)
+constexpr std::array<f32, 4 * 4> MakeOrthographicMatrix(u32 width, u32 height, u32 rotation) {
+    const f32 w = 2.f / width;
+    const f32 h = 2.f / height;
+    // clang-format off
+    switch (rotation) {
+    case 90:
+        return { 0.f, -h,   0.f,  1.f,
+                 w,    0.f, 0.f, -1.f,
+                 0.f,  0.f, 1.f,  0.f,
+                 0.f,  0.f, 0.f,  1.f};
+    case 180:
+        return {-w,    0.f, 0.f,  1.f,
+                 0.f, -h,   0.f,  1.f,
+                 0.f,  0.f, 1.f,  0.f,
+                 0.f,  0.f, 0.f,  1.f};
+    case 270:
+        return { 0.f,  h,   0.f, -1.f,
+                -w,    0.f, 0.f,  1.f,
+                 0.f,  0.f, 1.f,  0.f,
+                 0.f,  0.f, 0.f,  1.f};
+    default:
+        return MakeOrthographicMatrix(width, height);
+    }
+    // clang-format on
+}
+
 constexpr static std::array<vk::DescriptorSetLayoutBinding, 1> PRESENT_BINDINGS = {{
     {0, vk::DescriptorType::eCombinedImageSampler, 3, vk::ShaderStageFlagBits::eFragment},
 }};
@@ -200,18 +228,19 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
     scheduler.Record([this, layout, frame, present_set,
                       renderpass = main_present_window.Renderpass(),
                       index = current_pipeline](vk::CommandBuffer cmdbuf) {
+        // (the frame is as large as the layout, or the layout lying on its side)
         const vk::Viewport viewport = {
             .x = 0.0f,
             .y = 0.0f,
-            .width = static_cast<float>(layout.width),
-            .height = static_cast<float>(layout.height),
+            .width = static_cast<float>(frame->width),
+            .height = static_cast<float>(frame->height),
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
         };
 
         const vk::Rect2D scissor = {
             .offset = {0, 0},
-            .extent = {layout.width, layout.height},
+            .extent = {frame->width, frame->height},
         };
 
         cmdbuf.setViewport(0, viewport);
@@ -243,10 +272,15 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
         Core::PerfStats::game_frames_updated) {
         Frame* frame = window.GetRenderFrame();
 
-        if (layout.width != frame->width || layout.height != frame->height) {
+        // Where the display's panel lies turned the frame is drawn the way it lies
+        frame_rotation = window.PreRotation();
+        const bool sideways = frame_rotation == 90 || frame_rotation == 270;
+        const u32 frame_width = sideways ? layout.height : layout.width;
+        const u32 frame_height = sideways ? layout.width : layout.height;
+        if (frame_width != frame->width || frame_height != frame->height) {
             window.WaitPresent();
             scheduler.Finish();
-            window.RecreateFrame(frame, layout.width, layout.height);
+            window.RecreateFrame(frame, frame_width, frame_height);
         }
 
         clear_color.float32[0] = Settings::values.bg_red.GetValue();
@@ -255,8 +289,9 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
         clear_color.float32[3] = 1.0f;
 
         DrawScreens(frame, layout, flipped);
+        frame_rotation = 0;
         scheduler.Flush(frame->render_ready);
-        window.Present(frame, current_frame);
+        window.Present(frame, composing_vblank);
         if ((secondaryWindowEnabled && isSecondaryWindow) || (!secondaryWindowEnabled)) {
             Core::PerfStats::game_frames_updated = false;
             screenRendered = true;
@@ -1029,7 +1064,7 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
 
     const auto& top_screen = layout.top_screen;
     const auto& bottom_screen = layout.bottom_screen;
-    draw_info.modelview = MakeOrthographicMatrix(layout.width, layout.height);
+    draw_info.modelview = MakeOrthographicMatrix(layout.width, layout.height, frame_rotation);
 
     draw_info.layer = 0;
 
@@ -1103,7 +1138,7 @@ void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
 
     // 12 vertices = 4 triangles (2 for vertical bar, 2 for horizontal bar)
     // clang-format off
-    const float vertices[] = {
+    float vertices[] = {
         // Vertical bar
         vl, vt,  vr, vt,  vr, vb,
         vl, vt,  vr, vb,  vl, vb,
@@ -1112,6 +1147,21 @@ void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
         hl, ht,  hr, hb,  hl, hb,
     };
     // clang-format on
+    // Turned with the frame, see MakeOrthographicMatrix
+    for (std::size_t i = 0; i + 1 < std::size(vertices); i += 2) {
+        const float x = vertices[i];
+        const float y = vertices[i + 1];
+        if (frame_rotation == 90) {
+            vertices[i] = -y;
+            vertices[i + 1] = x;
+        } else if (frame_rotation == 180) {
+            vertices[i] = -x;
+            vertices[i + 1] = -y;
+        } else if (frame_rotation == 270) {
+            vertices[i] = y;
+            vertices[i + 1] = -x;
+        }
+    }
 
     const u64 size = sizeof(vertices);
     auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
@@ -1127,6 +1177,18 @@ void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
 }
 
 void RendererVulkan::SwapBuffers() {
+    composing_vblank = current_frame;
+    Compose();
+    EndFrame();
+}
+
+void RendererVulkan::ComposeFrame(u64 vblank) {
+    composing_vblank = vblank;
+    Compose();
+    EndGpuFrame();
+}
+
+void RendererVulkan::Compose() {
     system.perf_stats->StartSwap();
     screenRendered = false;
 #ifndef ANDROID
@@ -1202,7 +1264,6 @@ void RendererVulkan::SwapBuffers() {
 
     system.perf_stats->EndSwap();
     rasterizer.TickFrame();
-    EndFrame();
 }
 
 bool RendererVulkan::AlwaysLimitsFramesAheadOfGpu() const {
@@ -1215,6 +1276,10 @@ bool RendererVulkan::AlwaysLimitsFramesAheadOfGpu() const {
     // screen is no older than it has to be.
     return (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyFrameHandoff) == 0;
 #endif
+}
+
+std::optional<std::chrono::nanoseconds> RendererVulkan::TakeGpuTime(bool wanted) {
+    return scheduler.TakeGpuTime(wanted);
 }
 
 void RendererVulkan::LimitFramesAheadOfGpu() {

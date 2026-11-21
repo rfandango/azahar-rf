@@ -12,6 +12,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Rect
+import android.graphics.Region
 import android.graphics.drawable.VectorDrawable
 import android.os.Build
 import android.util.AttributeSet
@@ -57,6 +58,9 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
     // Stores the ID of the pointer that interacted with the 3DS touchscreen.
     private var touchscreenPointerId = -1
 
+    // Whether the in-game menu, with the shade behind it, lies over the game's picture.
+    private var drawerShowing = false
+
     init {
         if (!preferences.getBoolean("OverlayInit", false)) {
             defaultOverlay()
@@ -89,6 +93,35 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
         overlayButtons.forEach { it.draw(canvas) }
         overlayDpads.forEach { it.draw(canvas) }
         overlayJoysticks.forEach { it.draw(canvas) }
+    }
+
+    /**
+     * The game's picture is on a surface behind this window and shows through the window's
+     * transparent region, which tells the system's compositor where the window has nothing
+     * to blend over it. A view that draws takes its bounds out of that region, and this one
+     * covers the whole screen: with it nothing was left of the region, and the compositor
+     * blended the whole window over every frame of the game. While this overlay has no
+     * controls to draw and nothing else of the window lies over the picture, it leaves the
+     * region as it is.
+     */
+    override fun gatherTransparentRegion(region: Region?): Boolean {
+        val drawsNothing =
+            overlayButtons.isEmpty() && overlayDpads.isEmpty() && overlayJoysticks.isEmpty()
+        if (drawsNothing && !isInEditMode && !drawerShowing) {
+            return false
+        }
+        return super.gatherTransparentRegion(region)
+    }
+
+    /**
+     * To be told when the in-game menu starts to slide in and when it is gone again.
+     */
+    fun setDrawerShowing(showing: Boolean) {
+        if (drawerShowing != showing) {
+            drawerShowing = showing
+            // The window's transparent region is worked out anew after a layout
+            requestLayout()
+        }
     }
 
     private fun swapScreen() {
@@ -658,6 +691,8 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
             addOverlayControls(orientation)
         }
         invalidate()
+        // What this view covers of the game's picture may have changed
+        requestLayout()
     }
 
     private fun saveControlPosition(sharedPrefsId: Int, x: Int, y: Int, orientation: String) {
@@ -669,6 +704,7 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
 
     fun setIsInEditMode(isInEditMode: Boolean) {
         this.isInEditMode = isInEditMode
+        requestLayout()
     }
 
     private fun defaultOverlay() {

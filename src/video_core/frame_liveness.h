@@ -86,6 +86,9 @@ public:
     }
     /// Whether any of them shares memory with the range and can be read as it
     bool Intersects(const MemoryRange& range) const;
+    /// The range from the first to the last byte it has in common with those that can be
+    /// read as it; empty if there is none
+    MemoryRange Hull(const MemoryRange& range) const;
     void Add(MemoryRange range);
     /// Takes the memory of the range out, whatever it is laid out as
     void Remove(const MemoryRange& range);
@@ -96,6 +99,15 @@ public:
 
 private:
     boost::container::small_vector<MemoryRange, 16> ranges;
+};
+
+/// How the texture coordinates of a draw go with the rows of its target, for each set of
+/// coordinates where that is a straight line: v = scale * row + offset, the row counted
+/// from the bottom of the target as the viewport counts it
+struct DrawTextureRows {
+    std::array<bool, 3> known{};
+    std::array<f32, 3> scale{};
+    std::array<f32, 3> offset{};
 };
 
 /**
@@ -122,6 +134,15 @@ private:
  * memory it would have written counts as stale, and so does what other work makes from it.
  * Should anything stale get on display or to the game, the guess was wrong: everything is
  * rendered again, for longer each time.
+ *
+ * A game may also keep both eyes in one buffer, one above the other, and process the two
+ * with one draw over all of it. So a draw is taken to write the rows its viewport and
+ * scissor confine it to, and what is needed of it is followed by rows: a row it writes is
+ * made from the same row of what its target held, and, where its texture coordinates go
+ * with the rows in a straight line (a rectangle on the screen), from the rows of the
+ * texture that line gives. The reach of a filter beyond those is not followed: where two
+ * images meet in a buffer, a game's filter takes in a row of the other one, and that row
+ * is not kept as it was for it.
  */
 class FrameLiveness {
 public:
@@ -137,10 +158,15 @@ public:
     /// cover the viewport. Cheap, to be asked before the triangles are looked at.
     bool MayReplaceTarget(const Pica::RegsInternal& regs) const;
 
+    /// Whether a draw with these registers samples something the GPU drew in a way that
+    /// makes it worth finding out how its texture coordinates go with the rows of its
+    /// target. Cheap, to be asked before the vertices are looked at.
+    bool WantsTextureRows(const Pica::RegsInternal& regs) const;
+
     /// Called for each draw. Returns false for the ones to leave out, which are none if the
     /// draw cannot be left out any more.
     bool ShouldAllowDraw(const Pica::RegsInternal& regs, bool replaces_target,
-                         bool may_leave_out = true);
+                         bool may_leave_out = true, const DrawTextureRows* texture_rows = nullptr);
 
     /// Called for each texture copy and display transfer. Returns false for the ones to leave
     /// out; the game is told they are done as usual.
@@ -161,6 +187,24 @@ public:
 private:
     enum class Kind : u8 { Draw, Copy, Transfer, Fill, GuestRead, Count };
 
+    /// How something a draw reads goes with the rows of its target
+    struct Link {
+        enum class How : u8 {
+            Whole,  ///< Any of it may go into any row
+            Rows,   ///< What the target held, colour or depth: row for row
+            Mapped, ///< A texture whose rows go with those of the target in a straight line
+        };
+        How how{How::Whole};
+        /// Rows: 0 for the colour buffer, 1 for the depth buffer
+        u8 buffer{};
+        /// Mapped: row of the texture = scale * row of the target + offset, both as rows
+        /// of memory; the bytes a row of the texture takes and how many rows it has
+        f32 scale{};
+        f32 offset{};
+        u32 row_bytes{};
+        u32 rows{};
+    };
+
     /// A piece of work
     struct Step {
         /// What makes it the same piece of work in another frame
@@ -171,6 +215,17 @@ private:
         /// The memory it reads that the GPU may have written, including what it writes to
         /// unless it replaces that
         boost::container::static_vector<MemoryRange, 12> reads;
+        /// For a draw, one for each read: how it goes with the rows written
+        boost::container::static_vector<Link, 12> links;
+        /// For a draw: the rows of memory of its target it is confined to, in the eights
+        /// memory holds them in. Both zero for other work.
+        u32 first_row{};
+        u32 last_row{};
+        /// For a draw: where its colour and its depth buffer begin, what a row of each
+        /// takes and what each is laid out as
+        std::array<PAddr, 2> buffer_start{};
+        std::array<u32, 2> row_bytes{};
+        std::array<u32, 2> buffer_layout{};
         Kind kind{};
         /// Nothing of what the first place it writes held is left afterwards
         bool replaces{};
@@ -202,6 +257,17 @@ private:
     /// Finishes a step, decides whether it is carried out and notes it
     bool Submit(Step& step);
     void AddRead(Step& step, const MemoryRange& range) const;
+    void AddRead(Step& step, const MemoryRange& range, const Link& link) const;
+    /// Rows of one of the buffers of a draw, as memory
+    static MemoryRange RowsOf(const Step& step, u32 buffer, u32 first, u32 last);
+    /// The rows of its target a draw has to produce for what is read after it. False if
+    /// none.
+    static bool NeededRows(const Step& step, const MemoryRanges& live, u32& first, u32& last);
+    /// Adds what a draw reads to produce those rows
+    static void AddReadsFor(const Step& step, u32 first, u32 last, MemoryRanges& live);
+    /// The rows of its target a draw makes from stale memory, and one of the stale reads.
+    /// False if none.
+    bool StaleRows(const Step& step, u32& first, u32& last, const MemoryRange*& read) const;
     /// The key of a copy, transfer or fill, which tells apart the times it comes up since an
     /// image was last put in a place for display
     u64 NextOccurrence(u64 base);

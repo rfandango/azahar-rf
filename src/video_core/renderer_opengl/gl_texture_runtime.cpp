@@ -531,7 +531,7 @@ void Surface::UploadCustom(const VideoCore::Material* material, u32 level) {
 }
 
 void Surface::Download(const VideoCore::BufferTextureCopy& download,
-                       const VideoCore::StagingData& staging) {
+                       const VideoCore::StagingData& staging, [[maybe_unused]] bool wait) {
     const DebugScope scope(*runtime, Common::Vec4f{}, "Surface::Download");
 
     ASSERT(stride * GetFormatBytesPerPixel(pixel_format) % 4 == 0);

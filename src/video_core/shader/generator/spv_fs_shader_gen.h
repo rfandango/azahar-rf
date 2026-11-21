@@ -5,6 +5,8 @@
 #pragma once
 
 #include <array>
+#include <utility>
+#include <vector>
 #include <sirit/sirit.h>
 
 #include "video_core/pica/regs_framebuffer.h"
@@ -81,8 +83,32 @@ private:
     [[nodiscard]] Id AppendProcTexCombineAndMap(Pica::TexturingRegs::ProcTexCombiner combiner, Id u,
                                                 Id v, Id offset);
 
-    /// Rounds the provided variable to the nearest 1/255th
+    /// Rounds the provided variable to the nearest 1/255th, unless it is known to hold
+    /// nothing else already
     [[nodiscard]] Id Byteround(Id variable_id, u32 size = 1);
+
+    /// What can be known of a value while the shader is made
+    enum Known : u8 {
+        /// Every component is what rounding to 1/255 gives. That is so for the result of
+        /// the rounding and for what is made of it without arithmetic that could leave
+        /// another value: picking components, clamping to 0..1 and multiplying by a power
+        /// of two. Rounding such a value again gives the same bits, at three instructions
+        /// a component that no driver can take out.
+        KnownRounded = 1,
+        /// Every component is zero, or every component is one (and so rounded as well)
+        KnownZero = 2,
+        KnownOne = 4,
+    };
+
+    /// Notes what is known of a value, and returns the value
+    Id Note(Id id, u8 known);
+    [[nodiscard]] u8 KnownOf(Id id) const;
+    Id Snapped(Id id) {
+        return Note(id, KnownRounded);
+    }
+    [[nodiscard]] bool IsSnapped(Id id) const {
+        return (KnownOf(id) & KnownRounded) != 0;
+    }
 
     /// LUT sampling uitlity
     /// For NoiseLUT/ColorMap/AlphaMap, coord=0.0 is lut[0], coord=127.0/128.0 is lut[127] and
@@ -267,6 +293,11 @@ private:
     Id texture_buffer_lut_rgba{};
 
     Id rounded_primary_color{};
+    /// The values something is known of, with what that is
+    std::vector<std::pair<u32, u8>> known_values;
+    /// Whether values that are rounded already are rounded again all the same, as they
+    /// used to be
+    bool legacy_rounding{};
     Id primary_fragment_color{};
     Id secondary_fragment_color{};
     Id combiner_buffer{};

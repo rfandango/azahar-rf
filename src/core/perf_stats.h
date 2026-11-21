@@ -172,8 +172,17 @@ private:
     /// Visible duration for the frame prior to previous_frame_length
     Clock::duration previous_previous_frame_length = Clock::duration::zero();
 
+    /// One system call in this many is timed and stands for the others, see
+    /// BeginSVCProcessing
+    static constexpr u32 SVC_SAMPLE_INTERVAL = 16;
+    u32 svc_count = 0;
+    u32 svc_sample_interval = SVC_SAMPLE_INTERVAL;
+    bool svc_timed = false;
+    /// The time of the system calls that were timed, and of requests to services in them
     Clock::time_point start_svc_time = reset_point;
     Clock::duration accumulated_svc_time = Clock::duration::zero();
+    /// The GPU command processing inside the system calls that were timed
+    Clock::duration accumulated_gpu_time_in_timed_svc = Clock::duration::zero();
 
     Clock::time_point start_ipc_time = reset_point;
     Clock::duration accumulated_ipc_time = Clock::duration::zero();

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include "video_core/rasterizer_accelerated.h"
 #include "video_core/renderer_vulkan/vk_descriptor_update_queue.h"
+#include "video_core/renderer_vulkan/vk_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
 #include "video_core/renderer_vulkan/vk_stream_buffer.h"
@@ -55,6 +56,7 @@ public:
     void InvalidateRegion(PAddr addr, u32 size) override;
     void FlushAndInvalidateRegion(PAddr addr, u32 size) override;
     void ClearAll(bool flush) override;
+    void SubmitPendingWork() override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
@@ -111,6 +113,16 @@ private:
     /// Setup the fixed attribute emulation in vulkan
     void SetupFixedAttribs();
 
+    /// The emulation is about to write the stretch: vertex and index data there is no longer
+    /// read in place, and a draw that still is to read it there gets through the GPU first
+    void WaitForDataInPlace(PAddr addr, u32 size);
+
+    /// Whether the draw being set up may read the stretch of emulated memory where it is
+    bool MayReadInPlace(PAddr addr, u32 size);
+
+    /// Finds what is kept for the place the draw being set up is issued from, see DrawSite
+    void LookUpDrawSite();
+
     /// Setup vertex shader for AccelerateDrawBatch
     bool SetupVertexShader();
 
@@ -131,6 +143,9 @@ private:
 
     VertexLayout software_layout;
     std::array<u32, 16> binding_offsets{};
+    /// One bit a vertex binding: set if its data is taken from the emulated memory, where the
+    /// game has it, and the offset is one into guest_memory; from stream_buffer otherwise
+    u16 bindings_in_guest_memory{};
     std::array<bool, 16> enable_attributes{};
     std::array<vk::Buffer, 16> vertex_buffers;
     VertexArrayInfo vertex_info;
@@ -140,6 +155,66 @@ private:
     StreamBuffer uniform_buffer;    ///< Uniform buffer
     StreamBuffer texture_buffer;    ///< Texture buffer
     StreamBuffer texture_lf_buffer; ///< Texture Light-Fog buffer
+    /// The emulated memory as a buffer, if the device takes it: vertex and index data are
+    /// then used where they are instead of being copied to stream_buffer
+    GuestMemory guest_memory;
+    /// Which of that data may be used where it is: what the game leaves alone
+    InPlaceData in_place_data;
+    /// Set while a draw looks at its own vertex and index data, which is no read by the game
+    bool reading_draw_data{false};
+
+    /// What a draw resolved to, kept by the state it was issued in: the hash of all registers
+    /// that shape a draw (ShapingHash) and the vertex shader's code. Games send, and call,
+    /// command lists that are the same from frame to frame (measured: 99% of the draws of
+    /// one game find every register as it was the time before), so most draws are issued in
+    /// a state seen before and can take what was resolved then: the choice of shaders, and
+    /// the range of their indices if those have been read in place, unwritten, since.
+    struct DrawSite {
+        bool filled{};
+        u64 shaping{};
+        u64 vs_code_hash{};
+        u64 vs_swizzle_hash{};
+        const void* shader_cache{};
+        Pica::Shader::UserConfig user_config{};
+        PipelineCache::ChosenShader vs;
+        PipelineCache::ChosenShader gs;
+        PipelineCache::ChosenShader fs;
+        bool has_vs{};
+        bool has_gs{};
+        bool has_fs{};
+        bool fs_depth_from_viewport{};
+        bool fs_host_scissor{};
+        bool fs_color_unused{};
+        /// The lowest and highest index of the draw, good while has_index_range is set and
+        /// InPlaceData::Generation() is index_generation
+        bool has_index_range{};
+        u32 index_min{};
+        u32 index_max{};
+        u64 index_generation{};
+    };
+    std::vector<DrawSite> draw_sites;
+    /// Of the draw being set up; null if none is kept for it
+    DrawSite* site{};
+    /// Whether what `site` holds is good for this draw
+    bool site_matches{};
+
+    /// What a binding of the texture descriptor set holds
+    struct TextureBinding {
+        vk::ImageView view{};
+        vk::Sampler sampler{};
+        bool operator==(const TextureBinding&) const = default;
+    };
+    /// The texture set of the draw before: what it holds, and the tick of the commands it was
+    /// taken for. A draw that asks for the same within the same commands uses it again.
+    struct LastTextureSet {
+        std::array<TextureBinding, 4> bindings{};
+        u64 tick{};
+        bool valid{};
+    };
+    LastTextureSet last_texture_set;
+    /// Measuring only, see Common::TraceMarkers::MeasureVertexData
+    GuestDataWatch data_watch;
+    bool watch_data{false};
     vk::UniqueBufferView texture_lf_view;
     vk::UniqueBufferView texture_rg_view;
     vk::UniqueBufferView texture_rgba_view;

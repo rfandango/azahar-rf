@@ -25,11 +25,13 @@ namespace Core {
  * checks a block against the guest code in memory before using it, so blocks of other code that
  * was at the same address are harmless, and several are kept per location.
  *
- * A file is only read back by the build that wrote it.
+ * A file is only read back by a build with the recompiler that wrote it.
  */
 class JitCodeCache {
 public:
-    explicit JitCodeCache(u64 program_id);
+    /// `host_mmu`: whether the recompiler is set up for host MMU access, which makes for
+    /// other code: what is kept of one kind is not taken for the other
+    JitCodeCache(u64 program_id, bool host_mmu);
     ~JitCodeCache();
 
     JitCodeCache(const JitCodeCache&) = delete;
@@ -60,6 +62,7 @@ private:
     void LogActivity(std::chrono::steady_clock::time_point now);
 
     u64 program_id;
+    bool host_mmu;
     std::string path;
 
     /// The records of all blocks, as they are in the file after its header
@@ -69,7 +72,8 @@ private:
     /// How much of data the file holds, and whether the file has to be written from scratch
     std::size_t flushed_size{};
     bool rewrite_file{true};
-    /// The file, kept open for adding to it: opening it can take long on some storage
+    /// The file, open for adding to it from the moment it was read or written anew: opening
+    /// it can take long on some storage
     FileUtil::IOFile append_file;
     bool full{};
     std::chrono::steady_clock::time_point last_flush{};

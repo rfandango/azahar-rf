@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -33,6 +34,10 @@ constexpr int MAX_ROUNDS = 8;
 constexpr std::size_t MAX_SHOWN_PLACES = 16;
 /// Times the same copy, transfer or fill is told apart between two images put up for display
 constexpr u32 MAX_OCCURRENCES = 255;
+/// Rows are kept in memory eight at a time, in tiles
+constexpr u32 TILE_ROWS = 8;
+/// What a row worked out from texture coordinates may be off by, in rows
+constexpr f32 ROW_SLACK = 1.f / 32.f;
 
 /// The one tracker there is, for the reads that reach it from the surface cache
 FrameLiveness* instance = nullptr;
@@ -76,6 +81,24 @@ bool MemoryRanges::Intersects(const MemoryRange& range) const {
     return std::ranges::any_of(ranges, [&range](const MemoryRange& other) {
         return other.Overlaps(range) && other.SameImage(range);
     });
+}
+
+MemoryRange MemoryRanges::Hull(const MemoryRange& range) const {
+    MemoryRange hull{};
+    for (const MemoryRange& other : ranges) {
+        if (!other.Overlaps(range) || !other.SameImage(range)) {
+            continue;
+        }
+        const PAddr start = std::max(other.start, range.start);
+        const PAddr end = std::min(other.end, range.end);
+        if (hull.Empty()) {
+            hull = {start, end, range.layout};
+        } else {
+            hull.start = std::min(hull.start, start);
+            hull.end = std::max(hull.end, end);
+        }
+    }
+    return hull;
 }
 
 void MemoryRanges::Add(MemoryRange range) {
@@ -179,12 +202,123 @@ bool FrameLiveness::IsShown(const MemoryRange& range) const {
 }
 
 void FrameLiveness::AddRead(Step& step, const MemoryRange& range) const {
+    AddRead(step, range, Link{});
+}
+
+void FrameLiveness::AddRead(Step& step, const MemoryRange& range, const Link& link) const {
     // Memory the GPU never wrote holds what the game put there, which is always as it should
     if (range.Empty() || !written.Intersects(range)) {
         return;
     }
     ASSERT(step.reads.size() < step.reads.capacity());
     step.reads.push_back(range);
+    step.links.push_back(link);
+}
+
+MemoryRange FrameLiveness::RowsOf(const Step& step, u32 buffer, u32 first, u32 last) {
+    return {step.buffer_start[buffer] + first * step.row_bytes[buffer],
+            step.buffer_start[buffer] + last * step.row_bytes[buffer], step.buffer_layout[buffer]};
+}
+
+bool FrameLiveness::NeededRows(const Step& step, const MemoryRanges& live, u32& first, u32& last) {
+    if (step.shown) {
+        first = step.first_row;
+        last = step.last_row;
+        return true;
+    }
+    first = std::numeric_limits<u32>::max();
+    last = 0;
+    for (u32 buffer = 0; buffer < 2; buffer++) {
+        const MemoryRange hull = live.Hull(step.writes[buffer]);
+        if (hull.Empty()) {
+            continue;
+        }
+        const u32 bytes = step.row_bytes[buffer];
+        first = std::min(first, (hull.start - step.buffer_start[buffer]) / bytes);
+        last = std::max(last, (hull.end - step.buffer_start[buffer] + bytes - 1) / bytes);
+    }
+    if (last <= first) {
+        return false;
+    }
+    first = std::max(Common::AlignDown(first, TILE_ROWS), step.first_row);
+    last = std::min(Common::AlignUp(last, TILE_ROWS), step.last_row);
+    return last > first;
+}
+
+void FrameLiveness::AddReadsFor(const Step& step, u32 first, u32 last, MemoryRanges& live) {
+    for (std::size_t index = 0; index < step.reads.size(); index++) {
+        const MemoryRange& read = step.reads[index];
+        const Link link = index < step.links.size() ? step.links[index] : Link{};
+        switch (link.how) {
+        case Link::How::Rows:
+            live.Add(RowsOf(step, link.buffer, first, last));
+            break;
+        case Link::How::Mapped: {
+            // From the edge of the first row to the edge of the last: what a filter takes
+            // in beyond that is not followed
+            const f32 one_end = link.scale * static_cast<f32>(first) + link.offset;
+            const f32 other_end = link.scale * static_cast<f32>(last) + link.offset;
+            const f32 rows = static_cast<f32>(link.rows);
+            const f32 low = std::clamp(std::min(one_end, other_end) + ROW_SLACK, 0.f, rows);
+            const f32 high = std::clamp(std::max(one_end, other_end) - ROW_SLACK, 0.f, rows);
+            const u32 low_row = Common::AlignDown(static_cast<u32>(std::floor(low)), TILE_ROWS);
+            const u32 high_row =
+                std::min(link.rows, Common::AlignUp(static_cast<u32>(std::ceil(high)), TILE_ROWS));
+            if (high_row > low_row) {
+                live.Add(MemoryRange{read.start + low_row * link.row_bytes,
+                                     std::min(read.end, read.start + high_row * link.row_bytes),
+                                     read.layout});
+            }
+            break;
+        }
+        default:
+            live.Add(read);
+            break;
+        }
+    }
+}
+
+bool FrameLiveness::StaleRows(const Step& step, u32& first, u32& last,
+                              const MemoryRange*& stale_read) const {
+    first = std::numeric_limits<u32>::max();
+    last = 0;
+    for (std::size_t index = 0; index < step.reads.size(); index++) {
+        const MemoryRange& read = step.reads[index];
+        const MemoryRange hull = stale.Hull(read);
+        if (hull.Empty()) {
+            continue;
+        }
+        const Link link = index < step.links.size() ? step.links[index] : Link{};
+        u32 from = step.first_row;
+        u32 to = step.last_row;
+        if (link.how == Link::How::Rows) {
+            const u32 bytes = step.row_bytes[link.buffer];
+            const PAddr start = step.buffer_start[link.buffer];
+            from = Common::AlignDown((hull.start - start) / bytes, TILE_ROWS);
+            to = Common::AlignUp((hull.end - start + bytes - 1) / bytes, TILE_ROWS);
+        } else if (link.how == Link::How::Mapped) {
+            // The rows of the target that take from the stale rows of the texture
+            const f32 texture_from = static_cast<f32>((hull.start - read.start) / link.row_bytes);
+            const f32 texture_to =
+                static_cast<f32>((hull.end - read.start + link.row_bytes - 1) / link.row_bytes);
+            const f32 one_end = (texture_from - link.offset) / link.scale;
+            const f32 other_end = (texture_to - link.offset) / link.scale;
+            const f32 most = static_cast<f32>(step.last_row);
+            const f32 low = std::clamp(std::min(one_end, other_end) + ROW_SLACK, 0.f, most);
+            const f32 high = std::clamp(std::max(one_end, other_end) - ROW_SLACK, 0.f, most);
+            from = Common::AlignDown(static_cast<u32>(std::floor(low)), TILE_ROWS);
+            to = Common::AlignUp(static_cast<u32>(std::ceil(high)), TILE_ROWS);
+        }
+        from = std::max(from, step.first_row);
+        to = std::min(to, step.last_row);
+        if (to <= from) {
+            continue;
+        }
+        first = std::min(first, from);
+        last = std::max(last, to);
+        stale_read = &read;
+    }
+    return last > first;
 }
 
 u64 FrameLiveness::NextOccurrence(u64 base) {
@@ -261,8 +395,31 @@ bool FrameLiveness::MayReplaceTarget(const Pica::RegsInternal& regs) const {
                static_cast<f32>(framebuffer.GetHeight());
 }
 
+bool FrameLiveness::WantsTextureRows(const Pica::RegsInternal& regs) const {
+    using Pica::TexturingRegs;
+    if (!active || regs.pipeline.num_vertices > 6 ||
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyWholeTargetWork)) {
+        return false;
+    }
+    const auto textures = regs.texturing.GetTextures();
+    for (std::size_t unit = 0; unit < textures.size(); unit++) {
+        const auto& texture = textures[unit];
+        if (!texture.enabled || texture.config.lod.max_level != 0 ||
+            (unit == 0 && texture.config.type.Value() != TexturingRegs::TextureConfig::Texture2D)) {
+            continue;
+        }
+        const PAddr address = texture.config.GetPhysicalAddress();
+        const u32 size =
+            texture.config.width * texture.config.height * TextureBitsPerPixel(texture.format) / 8;
+        if (written.Intersects(MemoryRange{address, address + size})) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replaces_target,
-                                    bool may_leave_out) {
+                                    bool may_leave_out, const DrawTextureRows* texture_rows) {
     if (!active) {
         return true;
     }
@@ -270,14 +427,38 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     using Pica::TexturingRegs;
     const auto& framebuffer = regs.framebuffer.framebuffer;
     const auto& merger = regs.framebuffer.output_merger;
-    const u32 pixels = framebuffer.GetWidth() * framebuffer.GetHeight();
+    const u32 width = framebuffer.GetWidth();
+    const u32 height = framebuffer.GetHeight();
     const bool shadow = regs.framebuffer.IsShadowRendering();
     const bool stencil = regs.framebuffer.HasStencil() && merger.stencil_test.enable;
+    const bool by_rows =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyWholeTargetWork) == 0;
 
     Step step;
     step.kind = Kind::Draw;
     // What cannot be left out counts as needed, and with it all that it reads
     step.shown = !may_leave_out;
+
+    // The rows the viewport and the scissor confine the draw to. They are counted from the
+    // bottom, and the bottom row is the last one in memory.
+    step.first_row = 0;
+    step.last_row = height;
+    if (by_rows) {
+        const auto& rasterizer = regs.rasterizer;
+        f32 bottom = static_cast<f32>(rasterizer.viewport_corner.y);
+        f32 top = bottom + Pica::f24::FromRaw(rasterizer.viewport_size_y).ToFloat32() * 2.f;
+        if (rasterizer.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Include) {
+            bottom = std::max(bottom, static_cast<f32>(rasterizer.scissor_test.y1));
+            top = std::min(top, static_cast<f32>(rasterizer.scissor_test.y2) + 1.f);
+        }
+        bottom = std::clamp(std::floor(bottom), 0.f, static_cast<f32>(height));
+        top = std::clamp(std::ceil(top), 0.f, static_cast<f32>(height));
+        if (top > bottom) {
+            step.first_row = Common::AlignDown(height - static_cast<u32>(top), TILE_ROWS);
+            step.last_row =
+                std::min(height, Common::AlignUp(height - static_cast<u32>(bottom), TILE_ROWS));
+        }
+    }
 
     const PAddr colour = framebuffer.GetColorBufferPhysicalAddress();
     const bool writes_colour = colour != 0 && framebuffer.allow_color_write != 0 &&
@@ -286,9 +467,11 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     MemoryRange colour_range;
     if (writes_colour) {
         const u32 bytes_per_pixel = FramebufferRegs::BytesPerColorPixel(framebuffer.color_format);
-        colour_range = {
-            colour, colour + pixels * bytes_per_pixel,
-            MemoryLayout::Make(MemoryLayout::Colour, framebuffer.GetWidth(), bytes_per_pixel * 8)};
+        step.buffer_start[0] = colour;
+        step.row_bytes[0] = width * bytes_per_pixel;
+        step.buffer_layout[0] =
+            MemoryLayout::Make(MemoryLayout::Colour, width, bytes_per_pixel * 8);
+        colour_range = RowsOf(step, 0, step.first_row, step.last_row);
         step.writes[0] = colour_range;
         step.replaces = replaces_target;
         step.renews = replaces_target;
@@ -302,9 +485,10 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     MemoryRange depth_range;
     if (uses_depth) {
         const u32 bytes_per_pixel = FramebufferRegs::BytesPerDepthPixel(framebuffer.depth_format);
-        depth_range = {
-            depth, depth + pixels * bytes_per_pixel,
-            MemoryLayout::Make(MemoryLayout::Depth, framebuffer.GetWidth(), bytes_per_pixel * 8)};
+        step.buffer_start[1] = depth;
+        step.row_bytes[1] = width * bytes_per_pixel;
+        step.buffer_layout[1] = MemoryLayout::Make(MemoryLayout::Depth, width, bytes_per_pixel * 8);
+        depth_range = RowsOf(step, 1, step.first_row, step.last_row);
         if (writes_depth) {
             step.writes[1] = depth_range;
             written.Add(MemoryRange{depth_range.start, depth_range.end});
@@ -315,9 +499,14 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     // was drawn there as a surface with rows of this length: the same memory is another
     // image as anything else, and no game shows that.
     if (writes_colour && !step.replaces) {
-        AddRead(step, colour_range);
+        AddRead(step, colour_range, Link{.how = Link::How::Rows, .buffer = 0});
     }
-    AddRead(step, depth_range);
+    AddRead(step, depth_range, Link{.how = Link::How::Rows, .buffer = 1});
+    if (step.writes[0].Empty() && step.writes[1].Empty()) {
+        // Nothing to go by rows with
+        step.first_row = 0;
+        step.last_row = 0;
+    }
 
     const auto textures = regs.texturing.GetTextures();
     for (std::size_t unit = 0; unit < textures.size(); unit++) {
@@ -347,7 +536,34 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
             }
         } else {
             const PAddr address = texture.config.GetPhysicalAddress();
-            AddRead(step, MemoryRange{address, address + size, layout});
+            // Which rows of the texture a row of the target takes from, where the
+            // coordinates of this unit go with the rows in a straight line. As rows of
+            // memory, which run from the top down in both.
+            Link link;
+            const std::size_t set =
+                unit == 2 && regs.texturing.main_config.texture2_use_coord1 ? 1 : unit;
+            const u32 row_bytes = texture.config.width * bits_per_pixel / 8;
+            if (texture_rows != nullptr && texture_rows->known[set] && step.last_row != 0 &&
+                texture.config.lod.max_level == 0 && row_bytes != 0 &&
+                type == TexturingRegs::TextureConfig::Texture2D) {
+                const f32 rows = static_cast<f32>(texture.config.height);
+                const f32 scale = texture_rows->scale[set] * rows;
+                const f32 offset =
+                    rows - scale * static_cast<f32>(height) - texture_rows->offset[set] * rows;
+                // Not one that repeats or stops at its edge within the draw, and not one
+                // row for all of the target
+                const f32 one_end = scale * static_cast<f32>(step.first_row) + offset;
+                const f32 other_end = scale * static_cast<f32>(step.last_row) + offset;
+                if (std::abs(scale) > 1.f / 64.f && std::min(one_end, other_end) >= -1.f &&
+                    std::max(one_end, other_end) <= rows + 1.f) {
+                    link = Link{.how = Link::How::Mapped,
+                                .scale = scale,
+                                .offset = offset,
+                                .row_bytes = row_bytes,
+                                .rows = texture.config.height};
+                }
+            }
+            AddRead(step, MemoryRange{address, address + size, layout}, link);
         }
     }
 
@@ -358,6 +574,13 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     key = Mix(key, (step.replaces ? 1 : 0) | (may_leave_out ? 0 : 2));
     for (const MemoryRange& read : step.reads) {
         key = Mix(key, read.start);
+    }
+    for (const Link& link : step.links) {
+        if (link.how == Link::How::Mapped) {
+            // The same draw with other texture coordinates takes from other rows
+            key = Mix(key, static_cast<u64>(std::llround(link.scale * 256.f)));
+            key = Mix(key, static_cast<u64>(std::llround(link.offset * 4.f)));
+        }
     }
     step.key = key;
     return Submit(step);
@@ -475,7 +698,28 @@ bool FrameLiveness::Submit(Step& step) {
             "a memory fill", "the game"};
         const auto stale_read = std::ranges::find_if(
             step.reads, [this](const MemoryRange& read) { return stale.Intersects(read); });
-        if (stale_read == step.reads.end()) {
+        u32 first_stale = 0;
+        u32 last_stale = 0;
+        const MemoryRange* stale_for_rows = nullptr;
+        if (step.last_row != 0) {
+            // A draw: only the rows made from stale memory come out stale
+            if (!StaleRows(step, first_stale, last_stale, stale_for_rows)) {
+                if (step.renews) {
+                    stale.Remove(step.writes[0]);
+                }
+            } else if (step.shown) {
+                Mispredicted(names[kind], *stale_for_rows);
+            } else {
+                if (step.renews) {
+                    stale.Remove(step.writes[0]);
+                }
+                for (u32 buffer = 0; buffer < 2; buffer++) {
+                    if (!step.writes[buffer].Empty()) {
+                        stale.Add(RowsOf(step, buffer, first_stale, last_stale));
+                    }
+                }
+            }
+        } else if (stale_read == step.reads.end()) {
             if (step.renews) {
                 stale.Remove(step.writes[0]);
             }
@@ -625,6 +869,20 @@ void FrameLiveness::LookAtLastFrames() {
         const MemoryRanges at_end = live;
         for (std::size_t index = total; index-- > 0;) {
             const Step& step = step_at(index);
+            if (step.last_row != 0) {
+                // A draw: what it reads depends on which of its rows are needed
+                u32 first = 0;
+                u32 last = 0;
+                needed[index] = NeededRows(step, live, first, last);
+                if (!needed[index]) {
+                    continue;
+                }
+                if (step.replaces) {
+                    live.Remove(step.writes[0]);
+                }
+                AddReadsFor(step, first, last, live);
+                continue;
+            }
             const bool is_needed =
                 step.shown || live.Intersects(step.writes[0]) || live.Intersects(step.writes[1]);
             needed[index] = is_needed;

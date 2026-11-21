@@ -2,6 +2,7 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include "common/hitch_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_runtime.h"
 
 #include <algorithm>
@@ -56,6 +57,11 @@ struct RecordParams {
     vk::Image src_image;
     vk::Image dst_image;
 };
+
+// Defined with the blits that wait, see TextureRuntime::BlitTextures
+bool IsOneToOne(const VideoCore::TextureBlit& blit);
+Common::Rectangle<u32> SourceOf(const VideoCore::TextureBlit& blit,
+                                const Common::Rectangle<u32>& rect);
 
 vk::Filter MakeFilter(VideoCore::PixelFormat pixel_format) {
     switch (pixel_format) {
@@ -372,6 +378,7 @@ bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
     const PixelFormat src_format = source.pixel_format;
     const PixelFormat dst_format = dest.pixel_format;
     ASSERT_MSG(src_format != dst_format, "Reinterpretation with the same format is invalid");
+    dest.NoteAllWritten();
 
     if (!source.traits.needs_conversion && !dest.traits.needs_conversion &&
         source.type == dest.type) {
@@ -395,7 +402,46 @@ bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
 }
 
 bool TextureRuntime::ClearTexture(Surface& surface, const VideoCore::TextureClear& clear) {
-    renderpass_cache.EndRendering();
+    if (HasPendingBlits() && clear.texture_level == 0 && clear.texture_layer == 0 &&
+        clear.texture_rect == surface.GetScaledRect()) {
+        DropBlitInto(surface.SerialIfAny());
+    }
+    if (clear.texture_level == 0 && clear.texture_layer == 0) {
+        surface.NoteWritten(clear.texture_rect);
+    } else {
+        surface.NoteAllWritten();
+    }
+    Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::Clear,
+                                     u64{clear.texture_rect.GetWidth()} *
+                                         clear.texture_rect.GetHeight());
+    // A clear that comes up while a draw gets its target ready is held back: the render
+    // pass of the draw can do it as it begins
+    const bool defer = renderpass_cache.DefersClears() && surface.GetSampleCount() == 1 &&
+                       clear.texture_level == 0 && clear.texture_layer == 0;
+    if (!defer) {
+        renderpass_cache.EndRendering();
+    }
+    const auto carry_out_or_defer = [&](std::function<void()>&& carry_out) {
+        if (!defer) {
+            carry_out();
+            return;
+        }
+        renderpass_cache.DeferClear(DeferredClear{
+            .image = surface.Image(),
+            .area{
+                .offset{
+                    .x = static_cast<s32>(clear.texture_rect.left),
+                    .y = static_cast<s32>(clear.texture_rect.bottom),
+                },
+                .extent{
+                    .width = clear.texture_rect.GetWidth(),
+                    .height = clear.texture_rect.GetHeight(),
+                },
+            },
+            .value = MakeClearValue(clear.value),
+            .carry_out = std::move(carry_out),
+        });
+    };
 
     const RecordParams params = {
         .aspect = surface.Aspect(),
@@ -408,63 +454,65 @@ bool TextureRuntime::ClearTexture(Surface& surface, const VideoCore::TextureClea
     // texture at the same time
 
     if (clear.texture_rect == surface.GetScaledRect() && (surface.GetSampleCount() == 1)) {
-        scheduler.Record([params, clear](vk::CommandBuffer cmdbuf) {
-            const vk::ImageSubresourceRange range = {
-                .aspectMask = params.aspect,
-                .baseMipLevel = clear.texture_level,
-                .levelCount = 1,
-                .baseArrayLayer = clear.texture_layer,
-                .layerCount = 1,
-            };
+        carry_out_or_defer([this, params, clear] {
+            scheduler.Record([params, clear](vk::CommandBuffer cmdbuf) {
+                const vk::ImageSubresourceRange range = {
+                    .aspectMask = params.aspect,
+                    .baseMipLevel = clear.texture_level,
+                    .levelCount = 1,
+                    .baseArrayLayer = clear.texture_layer,
+                    .layerCount = 1,
+                };
 
-            const vk::ImageMemoryBarrier pre_barrier = {
-                .srcAccessMask = params.src_access,
-                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .oldLayout = vk::ImageLayout::eGeneral,
-                .newLayout = vk::ImageLayout::eTransferDstOptimal,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = params.src_image,
-                .subresourceRange = range,
-            };
+                const vk::ImageMemoryBarrier pre_barrier = {
+                    .srcAccessMask = params.src_access,
+                    .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                    .oldLayout = vk::ImageLayout::eGeneral,
+                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = params.src_image,
+                    .subresourceRange = range,
+                };
 
-            const vk::ImageMemoryBarrier post_barrier = {
-                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .dstAccessMask = params.src_access,
-                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-                .newLayout = vk::ImageLayout::eGeneral,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = params.src_image,
-                .subresourceRange = range,
-            };
+                const vk::ImageMemoryBarrier post_barrier = {
+                    .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                    .dstAccessMask = params.src_access,
+                    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .newLayout = vk::ImageLayout::eGeneral,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = params.src_image,
+                    .subresourceRange = range,
+                };
 
-            cmdbuf.pipelineBarrier(params.pipeline_flags, vk::PipelineStageFlagBits::eTransfer,
-                                   vk::DependencyFlagBits::eByRegion, {}, {}, pre_barrier);
+                cmdbuf.pipelineBarrier(params.pipeline_flags, vk::PipelineStageFlagBits::eTransfer,
+                                       vk::DependencyFlagBits::eByRegion, {}, {}, pre_barrier);
 
-            const bool is_color =
-                static_cast<bool>(params.aspect & vk::ImageAspectFlagBits::eColor);
-            if (is_color) {
-                cmdbuf.clearColorImage(params.src_image, vk::ImageLayout::eTransferDstOptimal,
-                                       MakeClearColorValue(clear.value.color), range);
-            } else {
-                cmdbuf.clearDepthStencilImage(params.src_image,
-                                              vk::ImageLayout::eTransferDstOptimal,
-                                              MakeClearDepthStencilValue(clear.value), range);
-            }
+                const bool is_color =
+                    static_cast<bool>(params.aspect & vk::ImageAspectFlagBits::eColor);
+                if (is_color) {
+                    cmdbuf.clearColorImage(params.src_image, vk::ImageLayout::eTransferDstOptimal,
+                                           MakeClearColorValue(clear.value.color), range);
+                } else {
+                    cmdbuf.clearDepthStencilImage(params.src_image,
+                                                  vk::ImageLayout::eTransferDstOptimal,
+                                                  MakeClearDepthStencilValue(clear.value), range);
+                }
 
-            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, params.pipeline_flags,
-                                   vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+                cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, params.pipeline_flags,
+                                       vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+            });
         });
         return true;
     }
 
-    ClearTextureWithRenderpass(surface, clear);
+    carry_out_or_defer(ClearWithRenderpass(surface, clear));
     return true;
 }
 
-void TextureRuntime::ClearTextureWithRenderpass(Surface& surface,
-                                                const VideoCore::TextureClear& clear) {
+std::function<void()> TextureRuntime::ClearWithRenderpass(Surface& surface,
+                                                          const VideoCore::TextureClear& clear) {
     const bool is_color = surface.type != VideoCore::SurfaceType::Depth &&
                           surface.type != VideoCore::SurfaceType::DepthStencil;
 
@@ -484,75 +532,123 @@ void TextureRuntime::ClearTextureWithRenderpass(Surface& surface,
     const vk::Framebuffer framebuffer =
         surface.Framebuffer((surface.GetSampleCount() > 1) ? Type::MultiSampled : Type::Current);
 
-    scheduler.Record([params, is_color, clear, render_pass, framebuffer](vk::CommandBuffer cmdbuf) {
-        const vk::AccessFlags access_flag =
-            is_color ? vk::AccessFlagBits::eColorAttachmentRead |
-                           vk::AccessFlagBits::eColorAttachmentWrite
-                     : vk::AccessFlagBits::eDepthStencilAttachmentRead |
-                           vk::AccessFlagBits::eDepthStencilAttachmentWrite;
+    return [this, params, is_color, clear, render_pass, framebuffer] {
+        scheduler.Record(
+            [params, is_color, clear, render_pass, framebuffer](vk::CommandBuffer cmdbuf) {
+                const vk::AccessFlags access_flag =
+                    is_color ? vk::AccessFlagBits::eColorAttachmentRead |
+                                   vk::AccessFlagBits::eColorAttachmentWrite
+                             : vk::AccessFlagBits::eDepthStencilAttachmentRead |
+                                   vk::AccessFlagBits::eDepthStencilAttachmentWrite;
 
-        const vk::PipelineStageFlags pipeline_flags =
-            is_color ? vk::PipelineStageFlagBits::eColorAttachmentOutput
-                     : vk::PipelineStageFlagBits::eEarlyFragmentTests;
+                const vk::PipelineStageFlags pipeline_flags =
+                    is_color ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+                             : vk::PipelineStageFlagBits::eEarlyFragmentTests;
 
-        const vk::ImageMemoryBarrier pre_barrier = {
-            .srcAccessMask = params.src_access,
-            .dstAccessMask = access_flag,
-            .oldLayout = vk::ImageLayout::eGeneral,
-            .newLayout = vk::ImageLayout::eGeneral,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = params.src_image,
-            .subresourceRange =
-                MakeSubresourceRange(params.aspect, clear.texture_level, 1, clear.texture_layer),
-        };
+                const vk::ImageMemoryBarrier pre_barrier = {
+                    .srcAccessMask = params.src_access,
+                    .dstAccessMask = access_flag,
+                    .oldLayout = vk::ImageLayout::eGeneral,
+                    .newLayout = vk::ImageLayout::eGeneral,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = params.src_image,
+                    .subresourceRange = MakeSubresourceRange(params.aspect, clear.texture_level, 1,
+                                                             clear.texture_layer),
+                };
 
-        const vk::ImageMemoryBarrier post_barrier = {
-            .srcAccessMask = access_flag,
-            .dstAccessMask = params.src_access,
-            .oldLayout = vk::ImageLayout::eGeneral,
-            .newLayout = vk::ImageLayout::eGeneral,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = params.src_image,
-            .subresourceRange = MakeSubresourceRange(params.aspect, clear.texture_level),
-        };
+                const vk::ImageMemoryBarrier post_barrier = {
+                    .srcAccessMask = access_flag,
+                    .dstAccessMask = params.src_access,
+                    .oldLayout = vk::ImageLayout::eGeneral,
+                    .newLayout = vk::ImageLayout::eGeneral,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = params.src_image,
+                    .subresourceRange = MakeSubresourceRange(params.aspect, clear.texture_level),
+                };
 
-        const vk::Rect2D render_area = {
-            .offset{
-                .x = static_cast<s32>(clear.texture_rect.left),
-                .y = static_cast<s32>(clear.texture_rect.bottom),
-            },
-            .extent{
-                .width = clear.texture_rect.GetWidth(),
-                .height = clear.texture_rect.GetHeight(),
-            },
-        };
+                const vk::Rect2D render_area = {
+                    .offset{
+                        .x = static_cast<s32>(clear.texture_rect.left),
+                        .y = static_cast<s32>(clear.texture_rect.bottom),
+                    },
+                    .extent{
+                        .width = clear.texture_rect.GetWidth(),
+                        .height = clear.texture_rect.GetHeight(),
+                    },
+                };
 
-        const auto clear_value = MakeClearValue(clear.value);
-        std::array<vk::ClearValue, 2> clear_values = {clear_value, clear_value};
+                const auto clear_value = MakeClearValue(clear.value);
+                std::array<vk::ClearValue, 2> clear_values = {clear_value, clear_value};
 
-        const vk::RenderPassBeginInfo renderpass_begin_info = {
-            .renderPass = render_pass,
-            .framebuffer = framebuffer,
-            .renderArea = render_area,
-            .clearValueCount = static_cast<u32>(clear_values.size()),
-            .pClearValues = clear_values.data(),
-        };
+                const vk::RenderPassBeginInfo renderpass_begin_info = {
+                    .renderPass = render_pass,
+                    .framebuffer = framebuffer,
+                    .renderArea = render_area,
+                    .clearValueCount = static_cast<u32>(clear_values.size()),
+                    .pClearValues = clear_values.data(),
+                };
 
-        cmdbuf.pipelineBarrier(params.pipeline_flags, pipeline_flags,
-                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barrier);
+                cmdbuf.pipelineBarrier(params.pipeline_flags, pipeline_flags,
+                                       vk::DependencyFlagBits::eByRegion, {}, {}, pre_barrier);
 
-        cmdbuf.beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
-        cmdbuf.endRenderPass();
+                cmdbuf.beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
+                cmdbuf.endRenderPass();
 
-        cmdbuf.pipelineBarrier(pipeline_flags, params.pipeline_flags,
-                               vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
-    });
+                cmdbuf.pipelineBarrier(pipeline_flags, params.pipeline_flags,
+                                       vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+            });
+    };
 }
 
 bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
                                   std::span<const VideoCore::TextureCopy> copies) {
+    if (HasPendingBlits() && &source != &dest) {
+        const PendingBlit* into = FindBlitInto(source.SerialIfAny());
+        const bool level_zero = std::ranges::all_of(copies, [](const auto& copy) {
+            return copy.src_level == 0 && copy.dst_level == 0 && copy.src_layer == 0 &&
+                   copy.dst_layer == 0;
+        });
+        if (into && level_zero && IsOneToOne(into->blit) &&
+            into->src_serial != dest.SerialIfAny() && dest.sample_count == 1 &&
+            dest.Aspect() == vk::ImageAspectFlagBits::eColor && dest.traits.blit_support) {
+            // (a copy of it: the list may change below)
+            const PendingBlit from = *into;
+            dest.NoteAllWritten();
+            renderpass_cache.EndRendering();
+            for (const VideoCore::TextureCopy& copy : copies) {
+                PendingBlit piece = from;
+                piece.dst_serial = 0;
+                piece.dst_image = dest.RawImage();
+                piece.dst_access = dest.AccessFlags();
+                piece.stages = from.stages | dest.PipelineStageFlags();
+                const Common::Rectangle<u32> read{
+                    copy.src_offset.x, copy.src_offset.y + copy.extent.height,
+                    copy.src_offset.x + copy.extent.width, copy.src_offset.y};
+                piece.blit = VideoCore::TextureBlit{
+                    .src_level = 0,
+                    .dst_level = 0,
+                    .src_layer = 0,
+                    .dst_layer = 0,
+                    .src_rect = SourceOf(from.blit, read),
+                    .dst_rect = Common::Rectangle<u32>{copy.dst_offset.x,
+                                                       copy.dst_offset.y + copy.extent.height,
+                                                       copy.dst_offset.x + copy.extent.width,
+                                                       copy.dst_offset.y},
+                };
+                CITRA_FRAME_DUMP("  vk copy of {}x{} reads through a blit that waits",
+                                 copy.extent.width, copy.extent.height);
+                RecordPendingBlit(piece);
+            }
+            return true;
+        }
+    }
+    dest.NoteAllWritten();
+    for (const VideoCore::TextureCopy& copy : copies) {
+        Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::Copy,
+                                         u64{copy.extent.width} * copy.extent.height);
+    }
     renderpass_cache.EndRendering();
 
     const RecordParams params = {
@@ -668,38 +764,18 @@ bool TextureRuntime::RelayoutTextures(Surface& source, Surface& dest,
                                       const VideoCore::TextureRelayout& relayout) {
     // The conversion writes the destination as a storage image.
     dest.MakeStorageCapable();
+    dest.NoteAllWritten();
+    Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::Relayout,
+                                     u64{relayout.dst_rect.GetWidth()} *
+                                         relayout.dst_rect.GetHeight());
     return blit_helper.Relayout(source, dest, relayout);
 }
 
-bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
-                                  const VideoCore::TextureBlit& blit) {
-    const bool is_depth_stencil = source.type == VideoCore::SurfaceType::DepthStencil;
-    const auto& depth_traits = instance.GetTraits(source.pixel_format);
-    if (is_depth_stencil && !depth_traits.blit_support) {
-        return blit_helper.BlitDepthStencil(source, dest, blit);
-    }
+namespace {
 
-    renderpass_cache.EndRendering();
-
-    // Must resolve images first
-    // Todo(wunk): Add a "dirty" flag for msaa resolves to avoid redundant image resolves
-    if (source.sample_count > 1) {
-        blit_helper.ResolveTexture(source);
-    }
-    if (dest.sample_count > 1) {
-        blit_helper.ResolveTexture(dest);
-    }
-
-    const RecordParams params = {
-        .aspect = source.Aspect(),
-        .filter = vk::Filter::eNearest,
-        .pipeline_flags = source.PipelineStageFlags() | dest.PipelineStageFlags(),
-        .src_access = source.AccessFlags(),
-        .dst_access = dest.AccessFlags(),
-        .src_image = source.Image(),
-        .dst_image = dest.Image(),
-    };
-
+/// Records a blit between two images that are in the general layout
+void RecordBlit(Scheduler& scheduler, const RecordParams& params,
+                const VideoCore::TextureBlit& blit) {
     scheduler.Record([params, blit](vk::CommandBuffer cmdbuf) {
         const std::array source_offsets = {
             vk::Offset3D{static_cast<s32>(blit.src_rect.left),
@@ -786,11 +862,258 @@ bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, params.pipeline_flags,
                                vk::DependencyFlagBits::eByRegion, {}, {}, write_barriers);
     });
+}
+
+/// Whether a pixel of the blit's destination is a pixel of its source, turned over or not
+bool IsOneToOne(const VideoCore::TextureBlit& blit) {
+    const auto span = [](u32 a, u32 b) { return a > b ? a - b : b - a; };
+    return blit.src_level == 0 && blit.dst_level == 0 && blit.src_layer == 0 &&
+           blit.dst_layer == 0 &&
+           span(blit.src_rect.left, blit.src_rect.right) ==
+               span(blit.dst_rect.left, blit.dst_rect.right) &&
+           span(blit.src_rect.top, blit.src_rect.bottom) ==
+               span(blit.dst_rect.top, blit.dst_rect.bottom);
+}
+
+/// Where in the source of a one-to-one blit a rectangle of its destination comes from. Left
+/// and right, or top and bottom, come out the other way round where the blit turns over.
+Common::Rectangle<u32> SourceOf(const VideoCore::TextureBlit& blit,
+                                const Common::Rectangle<u32>& rect) {
+    const auto map = [](u32 value, u32 dst_from, u32 dst_to, u32 src_from, u32 src_to) {
+        const s64 direction = (dst_to >= dst_from) == (src_to >= src_from) ? 1 : -1;
+        return static_cast<u32>(s64{src_from} + direction * (s64{value} - s64{dst_from}));
+    };
+    const auto& dst = blit.dst_rect;
+    const auto& src = blit.src_rect;
+    return Common::Rectangle<u32>{
+        map(rect.left, dst.left, dst.right, src.left, src.right),
+        map(rect.top, dst.bottom, dst.top, src.bottom, src.top),
+        map(rect.right, dst.left, dst.right, src.left, src.right),
+        map(rect.bottom, dst.bottom, dst.top, src.bottom, src.top),
+    };
+}
+
+u64 PixelsOf(const VideoCore::TextureBlit& blit) {
+    return u64{blit.dst_rect.GetWidth()} * blit.dst_rect.GetHeight();
+}
+
+} // Anonymous namespace
+
+const TextureRuntime::PendingBlit* TextureRuntime::FindBlitInto(u64 serial) const {
+    if (serial == 0) {
+        return nullptr;
+    }
+    for (const PendingBlit& pending : pending_blits) {
+        if (pending.dst_serial == serial) {
+            return &pending;
+        }
+    }
+    return nullptr;
+}
+
+void TextureRuntime::RecordPendingBlit(const PendingBlit& pending) {
+    const RecordParams params = {
+        .aspect = pending.aspect,
+        .filter = vk::Filter::eNearest,
+        .pipeline_flags = pending.stages,
+        .src_access = pending.src_access,
+        .dst_access = pending.dst_access,
+        .src_image = pending.src_image,
+        .dst_image = pending.dst_image,
+    };
+    RecordBlit(scheduler, params, pending.blit);
+    Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::Blit, PixelsOf(pending.blit));
+    NoteLateUse(pending.src_serial);
+}
+
+void TextureRuntime::NoteLateUse(u64 serial) {
+    const u64 tick = GetResourceTick();
+    for (auto& [surface, last] : late_uses) {
+        if (surface == serial) {
+            last = tick;
+            return;
+        }
+    }
+    if (late_uses.size() >= 256) {
+        const u64 free_tick = GetResourceFreeTick();
+        std::erase_if(late_uses, [free_tick](const auto& use) { return free_tick > use.second; });
+    }
+    late_uses.emplace_back(serial, tick);
+}
+
+void TextureRuntime::CarryOutBlitsInto(u64 serial) {
+    for (std::size_t i = 0; i < pending_blits.size(); i++) {
+        if (pending_blits[i].dst_serial != serial) {
+            continue;
+        }
+        // (taken off the list first: what follows may ask about it again)
+        const PendingBlit pending = pending_blits[i];
+        pending_blits.erase(pending_blits.begin() + i);
+        CITRA_FRAME_DUMP("  vk the blit that waited is carried out: its destination is used");
+        renderpass_cache.EndRendering();
+        RecordPendingBlit(pending);
+        return;
+    }
+}
+
+void TextureRuntime::CarryOutBlitsFrom(u64 serial) {
+    for (std::size_t i = 0; i < pending_blits.size();) {
+        if (pending_blits[i].src_serial != serial) {
+            i++;
+            continue;
+        }
+        const PendingBlit pending = pending_blits[i];
+        pending_blits.erase(pending_blits.begin() + i);
+        CITRA_FRAME_DUMP("  vk the blit that waited is carried out: its source changes");
+        renderpass_cache.EndRendering();
+        RecordPendingBlit(pending);
+    }
+}
+
+void TextureRuntime::DropBlitInto(u64 serial) {
+    if (serial == 0) {
+        return;
+    }
+    for (std::size_t i = 0; i < pending_blits.size(); i++) {
+        if (pending_blits[i].dst_serial == serial) {
+            CITRA_FRAME_DUMP("  vk the blit that waited is given up: nothing read what it "
+                             "would have made");
+            Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::Spared,
+                                             PixelsOf(pending_blits[i].blit));
+            pending_blits.erase(pending_blits.begin() + i);
+            return;
+        }
+    }
+}
+
+void TextureRuntime::NoteSurfaceRemoved(Surface& surface) {
+    if (HasPendingBlits()) {
+        DropBlitInto(surface.SerialIfAny());
+    }
+}
+
+bool TextureRuntime::StillNeeded(Surface& surface) {
+    const u64 serial = surface.SerialIfAny();
+    if (serial == 0) {
+        return false;
+    }
+    for (const PendingBlit& pending : pending_blits) {
+        if (pending.src_serial == serial) {
+            return true;
+        }
+    }
+    const u64 free_tick = GetResourceFreeTick();
+    for (std::size_t i = 0; i < late_uses.size(); i++) {
+        if (late_uses[i].first != serial) {
+            continue;
+        }
+        if (free_tick <= late_uses[i].second) {
+            return true;
+        }
+        late_uses.erase(late_uses.begin() + i);
+        return false;
+    }
+    return false;
+}
+
+bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
+                                  const VideoCore::TextureBlit& blit) {
+    const bool is_depth_stencil = source.type == VideoCore::SurfaceType::DepthStencil;
+    const bool whole = blit.dst_level == 0 && blit.dst_layer == 0 &&
+                       std::min(blit.dst_rect.left, blit.dst_rect.right) == 0 &&
+                       std::max(blit.dst_rect.left, blit.dst_rect.right) == dest.GetScaledWidth() &&
+                       std::min(blit.dst_rect.top, blit.dst_rect.bottom) == 0 &&
+                       std::max(blit.dst_rect.top, blit.dst_rect.bottom) == dest.GetScaledHeight();
+    if (whole && HasPendingBlits()) {
+        // What waited to be put there will not be seen
+        DropBlitInto(dest.SerialIfAny());
+    }
+    dest.NoteAllWritten();
+
+    const bool plain =
+        !is_depth_stencil && &source != &dest && source.sample_count == 1 &&
+        dest.sample_count == 1 && blit.src_level == 0 && blit.dst_level == 0 &&
+        blit.src_layer == 0 && blit.dst_layer == 0 &&
+        source.Aspect() == vk::ImageAspectFlagBits::eColor &&
+        dest.Aspect() == vk::ImageAspectFlagBits::eColor &&
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::LegacyTransfers) == 0;
+    if (plain && (whole || HasPendingBlits())) {
+        PendingBlit entry{
+            .dst_serial = dest.Serial(),
+            .src_serial = source.Serial(),
+            .src_image = {},
+            .dst_image = dest.RawImage(),
+            .aspect = source.Aspect(),
+            .stages = source.PipelineStageFlags() | dest.PipelineStageFlags(),
+            .src_access = source.AccessFlags(),
+            .dst_access = dest.AccessFlags(),
+            .blit = blit,
+        };
+        // The source waits for a blit itself: this one reads where that one reads
+        bool through = false;
+        if (const PendingBlit* into = FindBlitInto(source.SerialIfAny())) {
+            if (IsOneToOne(into->blit) && into->src_serial != entry.dst_serial) {
+                entry.src_serial = into->src_serial;
+                entry.src_image = into->src_image;
+                entry.src_access = into->src_access;
+                entry.stages = into->stages | dest.PipelineStageFlags();
+                entry.blit.src_rect = SourceOf(into->blit, blit.src_rect);
+                through = true;
+            } else {
+                CarryOutBlitsInto(source.SerialIfAny());
+            }
+        }
+        if (!through) {
+            entry.src_image = source.RawImage();
+        }
+        if (whole) {
+            CITRA_FRAME_DUMP("  vk blit of {}x{} waits until what it makes is used{}",
+                             blit.dst_rect.GetWidth(), blit.dst_rect.GetHeight(),
+                             through ? " (it reads through another that waits)" : "");
+            pending_blits.push_back(entry);
+            return true;
+        }
+        if (through) {
+            CITRA_FRAME_DUMP("  vk blit reads through one that waits");
+            renderpass_cache.EndRendering();
+            RecordPendingBlit(entry);
+            return true;
+        }
+    }
+    Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::Blit, PixelsOf(blit));
+    const auto& depth_traits = instance.GetTraits(source.pixel_format);
+    if (is_depth_stencil && !depth_traits.blit_support) {
+        return blit_helper.BlitDepthStencil(source, dest, blit);
+    }
+
+    renderpass_cache.EndRendering();
+
+    // Must resolve images first
+    // Todo(wunk): Add a "dirty" flag for msaa resolves to avoid redundant image resolves
+    if (source.sample_count > 1) {
+        blit_helper.ResolveTexture(source);
+    }
+    if (dest.sample_count > 1) {
+        blit_helper.ResolveTexture(dest);
+    }
+
+    const RecordParams params = {
+        .aspect = source.Aspect(),
+        .filter = vk::Filter::eNearest,
+        .pipeline_flags = source.PipelineStageFlags() | dest.PipelineStageFlags(),
+        .src_access = source.AccessFlags(),
+        .dst_access = dest.AccessFlags(),
+        .src_image = source.Image(),
+        .dst_image = dest.Image(),
+    };
+
+    RecordBlit(scheduler, params, blit);
 
     return true;
 }
 
 void TextureRuntime::GenerateMipmaps(Surface& surface) {
+    surface.NoteAllWritten();
     if (VideoCore::IsCustomFormatCompressed(surface.custom_format)) {
         LOG_ERROR(Render_Vulkan, "Generating mipmaps for compressed formats unsupported!");
         return;
@@ -984,6 +1307,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
 
 void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
                      const VideoCore::StagingData& staging) {
+    NoteAllWritten();
     runtime.renderpass_cache.EndRendering();
 
     const RecordParams params = {
@@ -1073,6 +1397,7 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
 }
 
 void Surface::UploadCustom(const VideoCore::Material* material, u32 level) {
+    NoteAllWritten();
     const u32 width = material->width;
     const u32 height = material->height;
     const auto color = material->textures[0];
@@ -1146,9 +1471,11 @@ void Surface::UploadCustom(const VideoCore::Material* material, u32 level) {
 }
 
 void Surface::Download(const VideoCore::BufferTextureCopy& download,
-                       const VideoCore::StagingData& staging) {
+                       const VideoCore::StagingData& staging, bool wait) {
     SCOPE_EXIT({
-        scheduler.Finish();
+        if (wait) {
+            scheduler.Finish();
+        }
         runtime.download_buffer.Commit(staging.size);
     });
 
@@ -1232,6 +1559,7 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
 }
 
 void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
+    NoteAllWritten();
     // Of the kind the surface's images are, see the constructor
     const bool is_mutable =
         has_image_params &&
@@ -1346,6 +1674,7 @@ bool Surface::MakeStorageCapable() {
         return false;
     }
     runtime.renderpass_cache.EndRendering();
+    NoteAllWritten();
 
     image_usage |= vk::ImageUsageFlagBits::eStorage;
     image_flags |= vk::ImageCreateFlagBits::eMutableFormat;
@@ -1466,6 +1795,8 @@ bool Surface::EnsureCopyHandle() {
         copy_handle.Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type, traits.native,
                            vk::SampleCountFlagBits::e1, traits.usage, flags, traits.aspect, false);
     }
+    // Nothing is in it yet
+    copy_differs_all = true;
     return true;
 }
 
@@ -1477,6 +1808,11 @@ bool Surface::CanSwapForOverwrite() const noexcept {
 }
 
 vk::ImageView Surface::SwapForOverwrite(const Common::Rectangle<u32>& rect) noexcept {
+    if (serial.value != 0 && runtime.HasPendingBlits()) [[unlikely]] {
+        // The surface's images change places: the blits that wait hold them by name
+        runtime.CarryOutBlitsFrom(serial.value);
+        runtime.CarryOutBlitsInto(serial.value);
+    }
     const vk::ImageLayout copy_layout =
         EnsureCopyHandle() ? vk::ImageLayout::eUndefined : vk::ImageLayout::eGeneral;
     auto& copy_handle = handles[Type::Copy];
@@ -1510,10 +1846,46 @@ vk::ImageView Surface::SwapForOverwrite(const Common::Rectangle<u32>& rect) noex
             .extent = {x1 - x0, y1 - y0, 1},
         };
     };
-    keep(0, 0, width, bottom);
-    keep(0, top, width, height);
-    keep(0, bottom, left, top);
-    keep(right, bottom, width, top);
+    // Only where the two images may differ: what was written to the first since the two last
+    // changed places (or the second was brought up to date). The rest is the same in both.
+    u32 from_x = 0;
+    u32 from_y = 0;
+    u32 to_x = width;
+    u32 to_y = height;
+    if (!copy_differs_all) {
+        from_x = std::min(differs_x0, width);
+        to_x = std::min(differs_x1, width);
+        from_y = std::min(differs_y0, height);
+        to_y = std::min(differs_y1, height);
+    }
+    keep(from_x, from_y, to_x, std::min(bottom, to_y));
+    keep(from_x, std::max(top, from_y), to_x, to_y);
+    keep(from_x, std::max(bottom, from_y), std::min(left, to_x), std::min(top, to_y));
+    keep(std::max(right, from_x), std::max(bottom, from_y), to_x, std::min(top, to_y));
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    if (VideoCore::FrameStateDump::IsActive()) {
+        u64 copied = 0;
+        for (u32 i = 0; i < num_regions; i++) {
+            copied += u64(regions[i].extent.width) * regions[i].extent.height;
+        }
+        CITRA_FRAME_DUMP("  vk of the {} pixels outside the rectangle {} are copied",
+                         u64(width) * height - u64(right - left) * (top - bottom), copied);
+    }
+#endif
+    {
+        u64 moved = 0;
+        for (u32 i = 0; i < num_regions; i++) {
+            moved += u64{regions[i].extent.width} * regions[i].extent.height;
+        }
+        Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::SecondImage, moved);
+    }
+    // From here on the two differ within the rectangle at the most: the draw fills it in the
+    // one, the other keeps what was there
+    copy_differs_all = false;
+    differs_x0 = left;
+    differs_x1 = right;
+    differs_y0 = bottom;
+    differs_y1 = top;
 
     const RecordParams params = {
         .aspect = Aspect(),
@@ -1586,12 +1958,46 @@ vk::ImageView Surface::SwapForOverwrite(const Common::Rectangle<u32>& rect) noex
 }
 
 vk::ImageView Surface::CopyImageView() noexcept {
+    if (serial.value != 0 && runtime.HasPendingBlits()) [[unlikely]] {
+        runtime.CarryOutBlitsFrom(serial.value);
+        runtime.CarryOutBlitsInto(serial.value);
+    }
     auto& copy_handle = handles[Type::Copy];
     const vk::ImageLayout copy_layout =
         EnsureCopyHandle() ? vk::ImageLayout::eUndefined : vk::ImageLayout::eGeneral;
 
-    CITRA_FRAME_DUMP("  vk full-surface copy {}x{} levels {} @{:08X} (ends the render pass)",
-                     GetScaledWidth(), GetScaledHeight(), levels, addr);
+    // Only where the second image may differ from the first: mostly what one draw wrote
+    // since the last time
+    const bool partial = !copy_differs_all && levels == 1;
+    vk::Offset3D partial_offset{};
+    vk::Extent3D partial_extent{};
+    if (partial) {
+        const u32 x0 = std::min(differs_x0, GetScaledWidth());
+        const u32 x1 = std::min(differs_x1, GetScaledWidth());
+        const u32 y0 = std::min(differs_y0, GetScaledHeight());
+        const u32 y1 = std::min(differs_y1, GetScaledHeight());
+        if (x0 >= x1 || y0 >= y1) {
+            // Nothing was written since: the copy is as the surface is
+            return copy_handle.image_views[ViewType::Sample];
+        }
+        partial_offset = vk::Offset3D{static_cast<s32>(x0), static_cast<s32>(y0), 0};
+        partial_extent = vk::Extent3D{x1 - x0, y1 - y0, 1};
+    }
+    copy_differs_all = false;
+    differs_x0 = 0;
+    differs_x1 = 0;
+    differs_y0 = 0;
+    differs_y1 = 0;
+    Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::SecondImage,
+                                     partial ? u64{partial_extent.width} * partial_extent.height
+                                             : u64{GetScaledWidth()} * GetScaledHeight());
+
+    CITRA_FRAME_DUMP("  vk full-surface copy {}x{} levels {} @{:08X} (ends the render pass){}",
+                     GetScaledWidth(), GetScaledHeight(), levels, addr,
+                     partial
+                         ? fmt::format(", of it only {}x{} at {},{}", partial_extent.width,
+                                       partial_extent.height, partial_offset.x, partial_offset.y)
+                         : std::string{});
     runtime.renderpass_cache.EndRendering();
 
     const RecordParams params = {
@@ -1603,7 +2009,8 @@ vk::ImageView Surface::CopyImageView() noexcept {
     };
 
     scheduler.Record([params, copy_layout, levels = this->levels, width = GetScaledWidth(),
-                      height = GetScaledHeight()](vk::CommandBuffer cmdbuf) {
+                      height = GetScaledHeight(), partial, partial_offset,
+                      partial_extent](vk::CommandBuffer cmdbuf) {
         std::array pre_barriers = {
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
@@ -1669,6 +2076,11 @@ vk::ImageView Surface::CopyImageView() noexcept {
                 .extent = {width >> level, height >> level, 1},
             });
         }
+        if (partial) {
+            image_copies[0].srcOffset = partial_offset;
+            image_copies[0].dstOffset = partial_offset;
+            image_copies[0].extent = partial_extent;
+        }
 
         cmdbuf.pipelineBarrier(params.pipeline_flags, vk::PipelineStageFlagBits::eTransfer,
                                vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
@@ -1685,6 +2097,9 @@ vk::ImageView Surface::CopyImageView() noexcept {
 }
 
 vk::ImageView Surface::ImageView(ViewType view_type, Type type) noexcept {
+    if (serial.value != 0 && runtime.HasPendingBlits()) [[unlikely]] {
+        runtime.CarryOutBlitsInto(serial.value);
+    }
     auto& handle = handles[type == Type::Current ? current : type];
     if (auto image_view = handle.image_views[view_type]) {
         return image_view;
@@ -1725,6 +2140,9 @@ vk::ImageView Surface::ImageView(ViewType view_type, Type type) noexcept {
 }
 
 vk::Framebuffer Surface::Framebuffer(Type type) noexcept {
+    if (serial.value != 0 && runtime.HasPendingBlits()) [[unlikely]] {
+        runtime.CarryOutBlitsInto(serial.value);
+    }
     type = (type == Type::Current) ? current : type;
     auto& handle = handles[type];
     if (handle.framebuffer) {
@@ -1767,6 +2185,9 @@ void Surface::BlitScale(const VideoCore::TextureBlit& blit, bool up_scale) {
 
     const auto src_type = up_scale ? Type::Base : Type::Scaled;
     const auto dst_type = up_scale ? Type::Scaled : Type::Base;
+    if (dst_type == current) {
+        NoteAllWritten();
+    }
 
     scheduler.Record([src_image = Image(src_type), aspect = Aspect(), filter = vk::Filter::eNearest,
                       dst_image = Image(dst_type), blit](vk::CommandBuffer render_cmdbuf) {

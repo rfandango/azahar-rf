@@ -64,6 +64,27 @@ protected:
     /// Retrieve the range and the size of the input vertex
     VertexArrayInfo AnalyzeVertexArray(bool is_indexed, u32 stride_alignment = 1);
 
+    /// What AnalyzeVertexArray gives for a draw whose lowest and highest vertex are known
+    VertexArrayInfo MakeVertexArrayInfo(u32 vertex_min, u32 vertex_max, u32 stride_alignment) const;
+
+    /**
+     * A hash of all the registers that shape a draw, as they are now: two draws with the same
+     * hash are set up the same way (they can still differ in what data only passes through
+     * registers for: uniform values, shader code, tables, the values of the lights).
+     *
+     * The decoder notes every register it writes; this folds the ones written since it was
+     * last asked into the hash, which makes it cost what was written, not the 768 registers.
+     */
+    [[nodiscard]] u64 ShapingHash();
+
+private:
+    void FoldWrittenRegisters();
+
+    u64 shaping_hash{};
+    /// The value of each register that is in shaping_hash
+    std::array<u32, 0x300> hashed_registers{};
+
+protected:
 protected:
     Memory::MemorySystem& memory;
     Pica::PicaCore& pica;

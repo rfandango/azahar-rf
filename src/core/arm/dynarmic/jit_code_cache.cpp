@@ -46,12 +46,17 @@ static_assert(sizeof(RecordHeader) == 16);
 /// Records start at multiples of this
 constexpr std::size_t RECORD_ALIGNMENT = 8;
 
-/// Identifies the build: the code of a block relies on details of the recompiler and of the
-/// state it works on, which are only known to be the same within one build.
-u64 BuildKey() {
-    const std::string build =
-        fmt::format("{}|{}|{}", Common::g_scm_rev, Common::g_build_date, Common::g_build_fullname);
-    return Common::ComputeHash64(build.data(), build.size());
+/// Identifies the recompiler: the code of a block relies on details of the recompiler and of
+/// the state it works on. The build hashes the sources of both and how the recompiler is set
+/// up (CMakeModules/GenerateSCMRev.cmake), so what is kept outlives the builds that leave
+/// them alone. Nothing of the host's processor goes into the code, and the game's own code is
+/// checked block by block where the blocks are taken up again.
+u64 BuildKey(bool host_mmu) {
+    std::string recompiler{Common::g_recompiler_cache_version};
+    if (host_mmu) {
+        recompiler += "|host MMU access";
+    }
+    return Common::ComputeHash64(recompiler.data(), recompiler.size());
 }
 
 std::string CachePath(u64 program_id) {
@@ -61,7 +66,8 @@ std::string CachePath(u64 program_id) {
 
 } // Anonymous namespace
 
-JitCodeCache::JitCodeCache(u64 program_id_) : program_id{program_id_}, path{CachePath(program_id)} {
+JitCodeCache::JitCodeCache(u64 program_id_, bool host_mmu_)
+    : program_id{program_id_}, host_mmu{host_mmu_}, path{CachePath(program_id)} {
     Load();
     last_flush = last_log = std::chrono::steady_clock::now();
 }
@@ -82,9 +88,10 @@ void JitCodeCache::Load() {
     if (file_size < sizeof(header) || file_size - sizeof(header) > MAX_SIZE ||
         file.ReadBytes(&header, sizeof(header)) != sizeof(header) || header.magic != FILE_MAGIC ||
         header.version != FILE_VERSION || header.program_id != program_id ||
-        header.build_key != BuildKey()) {
+        header.build_key != BuildKey(host_mmu)) {
         LOG_INFO(Core_ARM11,
-                 "The recompiled code kept for title {:016X} is from another build, starting over",
+                 "The recompiled code kept for title {:016X} is from another recompiler, starting "
+                 "over",
                  program_id);
         return;
     }
@@ -101,6 +108,13 @@ void JitCodeCache::Load() {
     const bool complete = ParseRecords();
     flushed_size = data.size();
     rewrite_file = !complete;
+    if (complete) {
+        // Opened for adding to it now, while the game is still starting: on the storage of a
+        // phone this can take a tenth of a second, which the first new block of a session
+        // would otherwise wait for in the middle of the game
+        file.Close();
+        append_file = FileUtil::IOFile{path, "ab"};
+    }
 
     LOG_INFO(Core_ARM11, "Kept recompiled code of title {:016X}: {} locations, {} KB{}", program_id,
              entries.size(), data.size() / 1024, complete ? "" : " (the end was cut off)");
@@ -209,16 +223,20 @@ void JitCodeCache::Flush() {
             full = true;
             return;
         }
-        FileUtil::IOFile file{path, "wb"};
+        // The file stays open: what comes later is added through the same handle
+        append_file = FileUtil::IOFile{path, "wb"};
         const FileHeader header{
             .magic = FILE_MAGIC,
             .version = FILE_VERSION,
             .program_id = program_id,
-            .build_key = BuildKey(),
+            .build_key = BuildKey(host_mmu),
         };
-        if (!file.IsOpen() || file.WriteBytes(&header, sizeof(header)) != sizeof(header) ||
-            file.WriteBytes(data.data(), data.size()) != data.size()) {
+        if (!append_file.IsOpen() ||
+            append_file.WriteBytes(&header, sizeof(header)) != sizeof(header) ||
+            append_file.WriteBytes(data.data(), data.size()) != data.size() ||
+            !append_file.Flush()) {
             LOG_ERROR(Core_ARM11, "Could not write {}", path);
+            append_file.Close();
             full = true;
             return;
         }

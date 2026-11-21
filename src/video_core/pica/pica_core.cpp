@@ -2,11 +2,18 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstring>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #include "common/arch.h"
 #include "common/archives.h"
+#include "common/hash.h"
+#include "common/hitch_tracker.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -23,6 +30,112 @@
 #include "video_core/shader/shader.h"
 
 namespace Pica {
+
+namespace {
+
+/// For the hitch summary: how much of a list that a command list calls into is what was at
+/// that address the last time it was called. Emulation thread only.
+void MeasureCalledList(const u8* data, u32 size, PAddr address) {
+    static std::unordered_map<PAddr, std::vector<u32>> last_lists;
+    if (!data || size < 4) {
+        return;
+    }
+    // A game that calls into ever new places is not to fill the memory with them
+    if (last_lists.size() > 4096) {
+        last_lists.clear();
+    }
+    std::vector<u32> list(size / 4);
+    std::memcpy(list.data(), data, list.size() * 4);
+    std::vector<u32>& previous = last_lists[address];
+    const std::size_t common = std::min(list.size(), previous.size());
+    u32 same = 0;
+    for (std::size_t i = 0; i < common; i++) {
+        same += list[i] == previous[i];
+    }
+    Common::Hitches::NoteCalledListWords(static_cast<u32>(list.size()), same,
+                                         list.size() == previous.size() && same == list.size());
+    previous = std::move(list);
+}
+
+/// For the hitch summary: whether a draw finds the registers as they were the last time a draw
+/// was issued from the same place of the same command list, and if not, where they differ.
+/// Left out of the comparison are the registers that data only passes through on its way
+/// elsewhere (uniform values, shader code, lookup tables, fixed attributes), the ones that say
+/// where the command list is, and the two a draw is started with. Emulation thread only.
+void MeasureDrawSite(PAddr list, u32 index, const std::array<u32, 0x300>& now) {
+    using Common::Hitches::DrawSite;
+    static std::unordered_map<u64, std::array<u32, 0x300>> last_registers;
+    static const std::array<bool, 0x300> passes_through = [] {
+        std::array<bool, 0x300> flags{};
+        const auto mark = [&flags](u32 first, u32 last) {
+            for (u32 id = first; id <= last; id++) {
+                flags[id] = true;
+            }
+        };
+        mark(0x000, 0x03F); // Interrupts and the end of a list
+        mark(0x0AF, 0x0B7); // Procedural texture tables
+        mark(0x0E6, 0x0EF); // Fog table
+        mark(0x1C5, 0x1CF); // Lighting tables
+        mark(0x22E, 0x22F); // The two a draw is started with
+        mark(0x232, 0x235); // Fixed attribute
+        mark(0x238, 0x23D); // Where the command list is
+        mark(0x25F, 0x25F); // Primitive restart
+        mark(0x290, 0x298); // Geometry shader uniforms
+        mark(0x29B, 0x2A3); // Geometry shader code
+        mark(0x2A5, 0x2AD); // Geometry shader operand descriptors
+        mark(0x2C0, 0x2C8); // Vertex shader uniforms
+        mark(0x2CB, 0x2D3); // Vertex shader code
+        mark(0x2D5, 0x2DD); // Vertex shader operand descriptors
+        return flags;
+    }();
+
+    if (last_registers.size() > 20000) {
+        last_registers.clear();
+    }
+    Common::Hitches::NoteDrawSite(DrawSite::Draws);
+    const auto [it, fresh] = last_registers.try_emplace((static_cast<u64>(list) << 32) | index);
+    if (fresh) {
+        Common::Hitches::NoteDrawSite(DrawSite::Fresh);
+    } else {
+        const std::array<u32, 0x300>& before = it->second;
+        std::array<bool, 0x300 / 0x40> differs{};
+        bool any = false;
+        for (u32 id = 0; id < 0x300; id++) {
+            if (now[id] != before[id] && !passes_through[id]) {
+                differs[id / 0x40] = true;
+                any = true;
+            }
+        }
+        if (!any) {
+            Common::Hitches::NoteDrawSite(DrawSite::Same);
+        } else {
+            if (differs[1]) {
+                Common::Hitches::NoteDrawSite(DrawSite::Rasterizer);
+            }
+            if (differs[2] || differs[3]) {
+                Common::Hitches::NoteDrawSite(DrawSite::Texturing);
+            }
+            if (differs[4]) {
+                Common::Hitches::NoteDrawSite(DrawSite::Framebuffer);
+            }
+            if (differs[5] || differs[6] || differs[7]) {
+                Common::Hitches::NoteDrawSite(DrawSite::Lighting);
+            }
+            if (differs[8] || differs[9]) {
+                Common::Hitches::NoteDrawSite(DrawSite::Geometry);
+            }
+            if (differs[10]) {
+                Common::Hitches::NoteDrawSite(DrawSite::GeometryShader);
+            }
+            if (differs[11]) {
+                Common::Hitches::NoteDrawSite(DrawSite::VertexShader);
+            }
+        }
+    }
+    it->second = now;
+}
+
+} // Anonymous namespace
 
 MICROPROFILE_DEFINE(GPU_Drawing, "GPU", "Drawing", MP_RGB(50, 50, 240));
 
@@ -268,7 +381,8 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         return;
     }
 
-    const u8* head = memory.GetPhysicalPointer(list);
+    const u8* head =
+        list_copy ? std::exchange(list_copy, nullptr) : memory.GetPhysicalPointer(list);
     cmd_list.Reset(list, head, size);
 
     bool stop_requested = false;
@@ -320,8 +434,17 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
                     for (u32 i = 0; i < run; ++i) {
                         const u32 id = ids[i];
                         const u32 write_mask = ExpandBitsToBytes[masks[i]];
-                        regs.internal.reg_array[id] =
-                            (regs.internal.reg_array[id] & ~write_mask) | (values[i] & write_mask);
+                        const u32 old_value = regs.internal.reg_array[id];
+                        const u32 new_value = (old_value & ~write_mask) | (values[i] & write_mask);
+                        // Games set their materials anew before every draw, mostly to what
+                        // they are: that is not a change
+                        if (new_value == old_value) {
+                            continue;
+                        }
+                        if (sw_batch_open && id < FIRST_VERTEX_REG) [[unlikely]] {
+                            FlushSoftwareBatch();
+                        }
+                        regs.internal.reg_array[id] = new_value;
                         dirty_regs.Set(id);
                     }
                     cmd_list.current_index = index;
@@ -374,6 +497,450 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
             }
         }
     }
+    FlushSoftwareBatch();
+}
+
+void PicaCore::NoteTargetCommand() {
+    TwinPass& twin = twin_pass;
+    if (twin.phase == TwinPass::Phase::Copied || twin.phase == TwinPass::Phase::Second) {
+        // Not the pattern: nothing but draws lies between the copy and the blending
+        if (twin.frames_alike >= TwinPass::FRAMES_ALIKE) {
+            LOG_INFO(HW_GPU,
+                     "The scene drawn twice at {:08X} is no longer: a fill or a transfer "
+                     "came within its second pass ({} draws of it were left out)",
+                     twin.target, twin.left_out_now);
+        }
+        twin.frames_alike = 0;
+    }
+    twin.phase = TwinPass::Phase::Idle;
+    twin.run_target = 0;
+    twin.run_draws = 0;
+}
+
+template <typename Func>
+void PicaCore::ForTwinRegisters(bool clears, Func&& func) const {
+    const auto& texturing = regs.internal.texturing;
+    // What the fragments go by. Culling, viewport, depth range and scissor, and the output
+    // map as far as it is used
+    func(0x040, 0x050);
+    func(0x050, 0x050 + std::min<u32>(regs.internal.rasterizer.vs_output_total, 7));
+    func(0x057, 0x070);
+    // The texture units that are on (what an idle one holds was left there by earlier draws
+    // and differs between the two passes), and the combiner
+    func(0x080, 0x081);
+    if (texturing.main_config.texture0_enable) {
+        func(0x081, 0x08F);
+    }
+    if (texturing.main_config.texture1_enable) {
+        func(0x091, 0x097);
+    }
+    if (texturing.main_config.texture2_enable) {
+        func(0x099, 0x09F);
+    }
+    if (texturing.main_config.texture3_enable) {
+        func(0x0A8, 0x0AE);
+    }
+    func(0x0C0, 0x100);
+    // Blending, the tests and the masks; the target
+    func(0x100, 0x108);
+    func(0x116, 0x11F);
+    if (clears) {
+        // A clear done with a quad: which program of the vertex shader's memory it runs does
+        // not matter, and what else that memory holds changes between the two
+        return;
+    }
+    // The lights; where the vertices and indices are and how many; the stages after the
+    // vertex shader; the vertex shader's configuration
+    if (!regs.internal.lighting.disable) {
+        func(0x140, 0x1C5);
+    }
+    func(0x200, 0x22B);
+    func(0x242, 0x243);
+    func(0x244, 0x245);
+    func(0x24A, 0x24B);
+    func(0x251, 0x254);
+    func(0x25E, 0x25F);
+    func(0x2B0, 0x2BE);
+    if (regs.internal.pipeline.use_gs != PipelineRegs::UseGS::No) {
+        func(0x280, 0x28E);
+    }
+}
+
+u64 PicaCore::TwinState(bool clears) {
+    const auto& array = regs.internal.reg_array;
+    u64 state = clears ? 1 : 2;
+    ForTwinRegisters(clears, [&](u32 from, u32 to) {
+        state = Common::HashCombine(state,
+                                    Common::ComputeHash64(&array[from], (to - from) * sizeof(u32)));
+    });
+    if (clears) {
+        return state;
+    }
+    state = Common::HashCombine(state, vs_setup.GetProgramCodeHash());
+    state = Common::HashCombine(state, vs_setup.GetSwizzleDataHash());
+    if (regs.internal.pipeline.use_gs != PipelineRegs::UseGS::No) {
+        state = Common::HashCombine(state, gs_setup.GetProgramCodeHash());
+    }
+    return state;
+}
+
+const PicaCore::UniformSet& PicaCore::FloatUniformsRead() {
+    const u32 main = regs.internal.vs.main_offset;
+    const u64 key = Common::HashCombine(vs_setup.GetProgramCodeHash(), u64{main});
+    for (const auto& [known, set] : uniforms_read) {
+        if (known == key) {
+            return set;
+        }
+    }
+    const auto& code = vs_setup.GetProgramCode();
+    UniformSet set{};
+    std::vector<bool> seen(code.size());
+    // Stretches of the program still to go through: from, up to
+    std::vector<std::pair<u32, u32>> stretches{{main, static_cast<u32>(code.size())}};
+    while (!stretches.empty()) {
+        auto [at, end] = stretches.back();
+        stretches.pop_back();
+        for (; at < end && at < code.size(); at++) {
+            const u32 word = code[at];
+            const u32 opcode = word >> 26;
+            if (opcode == 0x22) {
+                // END
+                break;
+            }
+            if (seen[at]) {
+                continue;
+            }
+            seen[at] = true;
+            // The operand that can be a float uniform, and whether it is indexed
+            u32 reg = 0;
+            u32 indexed = 0;
+            if (opcode >= 0x38) {
+                // MAD
+                reg = (word >> 10) & 0x7F;
+                indexed = (word >> 22) & 3;
+            } else if (opcode >= 0x30) {
+                // MADI
+                reg = (word >> 5) & 0x7F;
+                indexed = (word >> 22) & 3;
+            } else if (opcode >= 0x20 && opcode <= 0x2D) {
+                // Flow: what a call or a jump leads to is gone through as well. What an IF or
+                // a LOOP covers follows it and is gone through anyway.
+                const u32 dest = (word >> 10) & 0xFFF;
+                const u32 count = word & 0xFF;
+                if (opcode >= 0x24 && opcode <= 0x26) {
+                    stretches.emplace_back(dest, dest + count);
+                } else if (opcode == 0x2C || opcode == 0x2D) {
+                    stretches.emplace_back(dest, static_cast<u32>(code.size()));
+                }
+                continue;
+            } else if (opcode >= 0x18 && opcode <= 0x1B) {
+                // The instructions with the operands the other way round
+                reg = (word >> 7) & 0x7F;
+                indexed = (word >> 19) & 3;
+            } else {
+                reg = (word >> 12) & 0x7F;
+                indexed = (word >> 19) & 3;
+            }
+            // An indexed read picks from a table (the bones of a skinned model). How far into
+            // it is not known here, and what lies beyond a model's own bones is what other
+            // models left there: tables are not compared.
+            if (reg < 0x20 || indexed != 0) {
+                continue;
+            }
+            const u32 i = reg - 0x20;
+            set[i / 64] |= u64{1} << (i % 64);
+        }
+    }
+    if (uniforms_read.size() >= 256) {
+        uniforms_read.clear();
+    }
+    return uniforms_read.emplace_back(key, set).second;
+}
+
+bool PicaCore::IsTwinOf(const TwinPass::Draw& first, bool clears, u64 state) {
+    if (first.clear != clears || first.state != state) {
+        return false;
+    }
+    if (clears) {
+        return true;
+    }
+    const auto& now = vs_setup.uniforms.f;
+    if (std::memcmp(now.data(), first.uniforms.data(), sizeof(first.uniforms)) == 0) {
+        return true;
+    }
+    // Only those the program reads: the others hold what earlier draws left there
+    const UniformSet& read = FloatUniformsRead();
+    u32 differing = 0;
+    for (u32 i = 0; i < now.size(); i++) {
+        if ((read[i / 64] >> (i % 64) & 1) == 0 ||
+            std::memcmp(&now[i], &first.uniforms[i], sizeof(now[i])) == 0) {
+            continue;
+        }
+        if (++differing > TwinPass::MAX_DIFFERING) {
+            return false;
+        }
+        // Against the size of what is around it: the rows of the matrix it is one of
+        float scale = 1e-4f;
+        for (u32 j = i >= 3 ? i - 3 : 0; j < std::min<u32>(i + 4, 96); j++) {
+            const auto& row = first.uniforms[j];
+            scale = std::max({scale, std::abs(row.x.ToFloat32()), std::abs(row.y.ToFloat32()),
+                              std::abs(row.z.ToFloat32()), std::abs(row.w.ToFloat32())});
+        }
+        const float shift =
+            std::max({std::abs(now[i].x.ToFloat32() - first.uniforms[i].x.ToFloat32()),
+                      std::abs(now[i].y.ToFloat32() - first.uniforms[i].y.ToFloat32()),
+                      std::abs(now[i].z.ToFloat32() - first.uniforms[i].z.ToFloat32()),
+                      std::abs(now[i].w.ToFloat32() - first.uniforms[i].w.ToFloat32())}) /
+            scale;
+        // (also false for a value that is not a number)
+        if (!(shift <= TwinPass::MAX_SHIFT)) {
+            return false;
+        }
+        twin_pass.largest_shift = std::max(twin_pass.largest_shift, shift);
+    }
+    twin_pass.most_differing = std::max(twin_pass.most_differing, differing);
+    return true;
+}
+
+void PicaCore::ExplainNoTwin(bool clears) {
+    TwinPass& twin = twin_pass;
+    if (twin.explained >= 12) {
+        return;
+    }
+    twin.explained++;
+    std::string why;
+    if (twin.at >= twin.first.size()) {
+        why = fmt::format("the first pass has only {} draws on record", twin.first.size());
+    } else {
+        const TwinPass::Draw& first = twin.first[twin.at];
+        if (first.clear != clears) {
+            why = fmt::format("it {} all of its viewport, its counterpart {}",
+                              clears ? "overwrites" : "does not overwrite",
+                              first.clear ? "does" : "does not");
+        } else if (first.state != TwinState(clears)) {
+            why = "registers differ:";
+            u32 listed = 0;
+            if (twin.at < twin.first_regs.size()) {
+                const auto& before = twin.first_regs[twin.at];
+                const auto& now = regs.internal.reg_array;
+                ForTwinRegisters(clears, [&](u32 from, u32 to) {
+                    for (u32 i = from; i < to && listed < 24; i++) {
+                        if (before[i] != now[i]) {
+                            why += fmt::format(" {:03X}: {:08X}->{:08X}", i, before[i], now[i]);
+                            listed++;
+                        }
+                    }
+                });
+            }
+            if (listed == 0) {
+                why += " none of those that are compared now, so the vertex shader's program "
+                       "or which registers are in use";
+            }
+        } else {
+            const auto& now = vs_setup.uniforms.f;
+            const UniformSet& read = FloatUniformsRead();
+            u32 differing = 0;
+            float largest = 0.f;
+            std::string which;
+            for (u32 i = 0; i < now.size(); i++) {
+                if ((read[i / 64] >> (i % 64) & 1) == 0 ||
+                    std::memcmp(&now[i], &first.uniforms[i], sizeof(now[i])) == 0) {
+                    continue;
+                }
+                differing++;
+                float scale = 1e-4f;
+                for (u32 j = i >= 3 ? i - 3 : 0; j < std::min<u32>(i + 4, 96); j++) {
+                    const auto& row = first.uniforms[j];
+                    scale =
+                        std::max({scale, std::abs(row.x.ToFloat32()), std::abs(row.y.ToFloat32()),
+                                  std::abs(row.z.ToFloat32()), std::abs(row.w.ToFloat32())});
+                }
+                const float shift =
+                    std::max({std::abs(now[i].x.ToFloat32() - first.uniforms[i].x.ToFloat32()),
+                              std::abs(now[i].y.ToFloat32() - first.uniforms[i].y.ToFloat32()),
+                              std::abs(now[i].z.ToFloat32() - first.uniforms[i].z.ToFloat32()),
+                              std::abs(now[i].w.ToFloat32() - first.uniforms[i].w.ToFloat32())}) /
+                    scale;
+                largest = std::max(largest, shift);
+                if (differing <= 6) {
+                    which += fmt::format(
+                        " c{} ({:.4f} {:.4f} {:.4f} {:.4f} -> {:.4f} {:.4f} {:.4f} {:.4f})", i,
+                        first.uniforms[i].x.ToFloat32(), first.uniforms[i].y.ToFloat32(),
+                        first.uniforms[i].z.ToFloat32(), first.uniforms[i].w.ToFloat32(),
+                        now[i].x.ToFloat32(), now[i].y.ToFloat32(), now[i].z.ToFloat32(),
+                        now[i].w.ToFloat32());
+                }
+            }
+            why = fmt::format("of the {} float uniforms its shader reads {} differ, by {:.4f} "
+                              "of what is around them at the most:{}",
+                              std::popcount(read[0]) + std::popcount(read[1]), differing, largest,
+                              which);
+        }
+    }
+    LOG_INFO(HW_GPU, "Second pass at {:08X}: draw {} of {} ({} vertices) is no twin: {}",
+             twin.target, twin.at, twin.first_draws, regs.internal.pipeline.num_vertices, why);
+}
+
+bool PicaCore::IsLeftOutTwin(bool clears) {
+    using Phase = TwinPass::Phase;
+    using BlendFactor = FramebufferRegs::BlendFactor;
+    TwinPass& twin = twin_pass;
+    const PAddr color = regs.internal.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
+    const auto& pipeline = regs.internal.pipeline;
+    const auto& texturing = regs.internal.texturing;
+    const auto& merger = regs.internal.framebuffer.output_merger;
+    // A quad that samples one texture: what copies an image, or blends one over another
+    const bool quad = pipeline.num_vertices == 4 && pipeline.use_gs == PipelineRegs::UseGS::No;
+    const PAddr sampled =
+        quad && texturing.main_config.texture0_enable ? texturing.texture0.GetPhysicalAddress() : 0;
+    const bool replaces =
+        !merger.alphablend_enable || (merger.alpha_blending.factor_source_rgb == BlendFactor::One &&
+                                      merger.alpha_blending.factor_dest_rgb == BlendFactor::Zero);
+
+    if (twin.phase == Phase::Copied) {
+        if (color == twin.target) {
+            twin.phase = Phase::Second;
+            twin.at = 0;
+            twin.left_out_now = 0;
+            twin.twins = twin.compared;
+            twin.leaving_out = twin.compared && twin.frames_alike >= TwinPass::FRAMES_ALIKE &&
+                               Settings::values.resolution_factor.GetValue() != 1 &&
+                               (Common::TraceMarkers::Experiments3() &
+                                Common::TraceMarkers::KeepSecondScenePass) == 0;
+        } else {
+            twin.phase = Phase::Idle;
+        }
+    }
+
+    if (twin.phase == Phase::Second) {
+        if (color == twin.target && quad && sampled == twin.keep && sampled != 0 && !replaces) {
+            // The quad that blends the first image over the second
+            const bool whole = twin.at == twin.first_draws;
+            const u32 apart = twin.at > twin.first_draws ? twin.at - twin.first_draws
+                                                         : twin.first_draws - twin.at;
+            if (apart <= twin.first_draws / 8) {
+                // The bare pattern: worth comparing draw by draw from the next frame on
+                if (twin.watched_target != twin.target) {
+                    LOG_INFO(HW_GPU,
+                             "A scene that may be drawn twice: runs of {} and {} draws to {:08X} "
+                             "with a copy to {:08X} between them and a blend of it after",
+                             twin.first_draws, twin.at, twin.target, twin.keep);
+                }
+                twin.watched_target = twin.target;
+            }
+            if (twin.compared) {
+                const bool alike = twin.twins && whole;
+                if (alike && ++twin.frames_alike == TwinPass::FRAMES_ALIKE) {
+                    LOG_INFO(HW_GPU,
+                             "The game draws its scene twice at {:08X} and blends the two images "
+                             "(kept at {:08X}): {} draws each, every one of the second pass like "
+                             "the one at its place in the first but for {} float uniforms at "
+                             "the most, off by {:.4f} of what is around them at the most. The "
+                             "second pass is left out from here on where the resolution is "
+                             "above the console's.",
+                             twin.target, twin.keep, twin.first_draws, twin.most_differing,
+                             twin.largest_shift);
+                } else if (!alike) {
+                    if (twin.frames_alike >= TwinPass::FRAMES_ALIKE) {
+                        LOG_INFO(HW_GPU,
+                                 "The scene drawn twice at {:08X}: the second pass was not like "
+                                 "the first this time ({} draws against {}, {} left out)",
+                                 twin.target, twin.at, twin.first_draws, twin.left_out_now);
+                    }
+                    twin.frames_alike = 0;
+                }
+                twin.frames_alike = std::min(twin.frames_alike, 1u << 20);
+            }
+            const bool leave_out = twin.leaving_out && whole && twin.left_out_now == twin.at;
+            twin.phase = Phase::Idle;
+            twin.run_target = color;
+            twin.run_draws = 1;
+            if (leave_out) {
+                twin.left_out.fetch_add(1, std::memory_order_relaxed);
+            }
+            return leave_out;
+        }
+        if (color == twin.target) {
+            // A draw of the second pass
+            bool is_twin = false;
+            if (twin.twins && twin.at < twin.first.size()) {
+                is_twin = IsTwinOf(twin.first[twin.at], clears, TwinState(clears));
+            }
+            if (!is_twin) {
+                if (twin.twins && (Common::TraceMarkers::Experiments3() &
+                                   Common::TraceMarkers::ExplainScenePasses) != 0) {
+                    ExplainNoTwin(clears);
+                }
+                twin.twins = false;
+                twin.leaving_out = false;
+            }
+            twin.at++;
+            if (is_twin && twin.leaving_out) {
+                twin.left_out_now++;
+                twin.left_out.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            return false;
+        }
+        // The second run ended without the blending: not the pattern
+        if (twin.frames_alike >= TwinPass::FRAMES_ALIKE) {
+            LOG_INFO(HW_GPU,
+                     "The scene drawn twice at {:08X} is no longer: its second pass "
+                     "ended without the blending ({} draws of it were left out)",
+                     twin.target, twin.left_out_now);
+        }
+        twin.frames_alike = 0;
+        twin.phase = Phase::Idle;
+        twin.run_target = 0;
+    }
+
+    if (color != twin.run_target) {
+        if (twin.phase == Phase::First && quad && sampled == twin.run_target && sampled != 0 &&
+            replaces && twin.run_draws >= TwinPass::MIN_DRAWS) {
+            // The quad that copies what the run drew to somewhere else
+            twin.target = twin.run_target;
+            twin.keep = color;
+            twin.first_draws = twin.run_draws;
+            twin.compared = twin.first.size() == twin.run_draws;
+            twin.phase = Phase::Copied;
+            twin.run_target = color;
+            twin.run_draws = 1;
+            return false;
+        }
+        twin.phase = Phase::First;
+        twin.run_target = color;
+        twin.run_draws = 0;
+        twin.first.clear();
+        twin.first_regs.clear();
+    }
+    if (twin.phase == Phase::First) {
+        if (color == twin.watched_target && twin.first.size() == twin.run_draws &&
+            twin.run_draws < TwinPass::MAX_DRAWS) {
+            TwinPass::Draw& draw = twin.first.emplace_back();
+            draw.state = TwinState(clears);
+            draw.clear = clears;
+            if (!clears) {
+                std::memcpy(draw.uniforms.data(), vs_setup.uniforms.f.data(),
+                            sizeof(draw.uniforms));
+            }
+            if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) !=
+                0) {
+                twin.first_regs.push_back(regs.internal.reg_array);
+            }
+        }
+        twin.run_draws++;
+    }
+    return false;
+}
+
+void PicaCore::FlushSoftwareBatch() {
+    if (!sw_batch_open) {
+        return;
+    }
+    sw_batch_open = false;
+    sw_batch_draws = 0;
+    rasterizer->DrawTriangles();
+    rasterizer->NoteDrawOverwrites(false, false);
 }
 
 static bool any_byte_match(u32 a, u32 b) {
@@ -625,7 +1192,12 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
         const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
         const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
         const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
-        const u8* head = memory.GetPhysicalPointer(addr);
+        const u8* head = memory.GpuRead(addr, size);
+        memory.NoteGpuReference(addr, size, Memory::GpuReference::CalledList);
+        if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureCommandLists) != 0)
+            [[unlikely]] {
+            MeasureCalledList(head, size, addr);
+        }
         cmd_list.Reset(addr, head, size);
         break;
     }
@@ -871,6 +1443,9 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
         return;
     }
 
+    if (sw_batch_open && id < FIRST_VERTEX_REG) [[unlikely]] {
+        FlushSoftwareBatch();
+    }
     delay_generator.AddCommands(count);
     const u32 write_mask = ExpandBitsToBytes[mask];
     // Only write the last value to the register array.
@@ -929,11 +1504,20 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
             // Verified in MSVC that vectorization is happening.
             u32* __restrict batch_dst = dst + offset;
             const u32* __restrict batch_src = values + offset;
+            // Only if any of them changes (see the single writes above)
+            u32 difference = 0;
             for (u32 i = 0; i < batch_count; ++i) {
-                batch_dst[i] = (batch_dst[i] & ~write_mask) | (batch_src[i] & write_mask);
+                difference |= (batch_dst[i] ^ batch_src[i]) & write_mask;
             }
-
-            dirty_regs.SetRange(reg, batch_count);
+            if (difference != 0) {
+                if (sw_batch_open && reg < FIRST_VERTEX_REG) [[unlikely]] {
+                    FlushSoftwareBatch();
+                }
+                for (u32 i = 0; i < batch_count; ++i) {
+                    batch_dst[i] = (batch_dst[i] & ~write_mask) | (batch_src[i] & write_mask);
+                }
+                dirty_regs.SetRange(reg, batch_count);
+            }
             offset += batch_count;
         }
         // Whatever register stopped the batch (if we didn't reach the end)
@@ -961,7 +1545,16 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     // TODO: Figure out how register masking acts on e.g. vs.uniform_setup.set_value
     const u32 old_value = regs.internal.reg_array[id];
     const u32 write_mask = ExpandBitsToBytes[mask];
-    regs.internal.reg_array[id] = (old_value & ~write_mask) | (value & write_mask);
+    const u32 new_value = (old_value & ~write_mask) | (value & write_mask);
+    const bool special = reg_impl_flags_lut[id].NeedsSpecialHandling();
+    if (!special && new_value == old_value && !debug_context) [[likely]] {
+        // A plain register set to what it is: nothing changes
+        return;
+    }
+    if (sw_batch_open && id < FIRST_VERTEX_REG) [[unlikely]] {
+        FlushSoftwareBatch();
+    }
+    regs.internal.reg_array[id] = new_value;
 
     if (debug_context) [[unlikely]] {
         // Track register write.
@@ -970,7 +1563,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
         debug_context->OnEvent(DebugContext::Event::PicaCommandLoaded, &id);
     }
 
-    if (reg_impl_flags_lut[id].NeedsSpecialHandling()) {
+    if (special) {
         HandleSpecialReg(id, value, stop_requested);
     }
 
@@ -1050,6 +1643,8 @@ void PicaCore::DrawImmediate() {
     if (draw_filter) {
         draw_filter->ShouldAllowDraw(regs.internal, false, false);
     }
+    sw_batch_open = false;
+    sw_batch_draws = 0;
     rasterizer->DrawTriangles();
     immediate.current_attribute = 0;
 
@@ -1136,6 +1731,10 @@ Overwrites MayOverwriteArea(const RegsInternal& regs) {
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
     CITRA_TRACE_SCOPE_DETAIL("PICA::DrawArrays");
+    if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureCommandLists) != 0)
+        [[unlikely]] {
+        MeasureDrawSite(cmd_list.addr, cmd_list.current_index, regs.internal.reg_array);
+    }
 
     // Whether the triangles of a draw cover the viewport is of use twice over: a draw that
     // replaces all its target holds ends the life of what was drawn there before, and one that
@@ -1148,9 +1747,26 @@ void PicaCore::DrawArrays(bool is_indexed) {
         covers_viewport = CoversViewport(is_indexed, &covers_exactly);
     }
 
+    // A draw that only repeats one already made, a part of a pixel apart, is left out
+    if (IsLeftOutTwin(covers_viewport && may_overwrite.color)) {
+        CITRA_FRAME_DUMP("draw left out: the twin of a draw of the scene's first pass");
+        return;
+    }
+    // The quad that keeps the first image of a scene drawn twice is always drawn. While the
+    // second pass and the blending are left out nothing reads that image, and it would be
+    // taken for work nobody sees; the frame in which the second pass is not like the first
+    // after all blends it in, and must not get an old one.
+    const bool keeps_first_image =
+        twin_pass.phase == TwinPass::Phase::Copied && twin_pass.target == twin_pass.watched_target;
+
     // A draw whose result nobody will see is left out. The registers were written as usual.
     if (draw_filter) {
-        if (!draw_filter->ShouldAllowDraw(regs.internal, may_replace_target && covers_viewport)) {
+        VideoCore::DrawTextureRows texture_rows;
+        const bool rows_known = draw_filter->WantsTextureRows(regs.internal) &&
+                                TextureRowsOfDraw(is_indexed, texture_rows);
+        if (!draw_filter->ShouldAllowDraw(regs.internal, may_replace_target && covers_viewport,
+                                          !keeps_first_image,
+                                          rows_known ? &texture_rows : nullptr)) {
             CITRA_FRAME_DUMP("draw left out: nobody sees its result");
             return;
         }
@@ -1210,12 +1826,19 @@ void PicaCore::DrawArrays(bool is_indexed) {
         VideoCore::FrameStateDump::Draw(regs.internal, accelerate_draw, is_indexed,
                                         vs_setup.GetProgramCodeHash());
         DumpSmallDraw(is_indexed);
+        DumpGeometryProgram();
     }
 #endif
 
     // A pixel of the target is several of the host's, which are all overwritten only by
     // triangles that reach the edges of the viewport, not just the middle of its last pixels
     const bool overwrites = covers_viewport && covers_exactly;
+    const bool tells_overwrite = overwrites && (may_overwrite.color || may_overwrite.depth);
+    // Draws shaded on the CPU that are waiting to be drawn together go first, before a draw
+    // that is not added to them: one the host shades, or one the rasterizer is told about
+    if (sw_batch_open && (accelerate_draw || tells_overwrite)) {
+        FlushSoftwareBatch();
+    }
     rasterizer->NoteDrawOverwrites(overwrites && may_overwrite.color,
                                    overwrites && may_overwrite.depth);
 
@@ -1236,9 +1859,21 @@ void PicaCore::DrawArrays(bool is_indexed) {
         LoadVertices(is_indexed);
     }
 
-    // Draw emitted triangles.
-    rasterizer->DrawTriangles();
-    rasterizer->NoteDrawOverwrites(false, false);
+    // The triangles are with the rasterizer. Draws like this one come in runs (sprites, a
+    // quad each): they are drawn together, see FlushSoftwareBatch, unless this one has to be
+    // seen on its own.
+    bool on_its_own = tells_overwrite || debug_context || ++sw_batch_draws >= MAX_BATCHED_DRAWS;
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    on_its_own |= VideoCore::FrameStateDump::IsActive();
+#endif
+    if (on_its_own) {
+        sw_batch_open = false;
+        sw_batch_draws = 0;
+        rasterizer->DrawTriangles();
+        rasterizer->NoteDrawOverwrites(false, false);
+    } else {
+        sw_batch_open = true;
+    }
 
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
@@ -1263,7 +1898,8 @@ float PicaCore::SmallDrawViewportShare(bool is_indexed) {
 
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
     const auto& index_info = pipeline.index_array;
-    const u8* index_address_8 = memory.GetPhysicalPointer(base_address + index_info.offset);
+    const u8* index_address_8 = memory.GpuRead(
+        base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
     if (is_indexed && index_address_8 == nullptr) {
         return 1.f;
     }
@@ -1324,7 +1960,8 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
 
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
     const auto& index_info = pipeline.index_array;
-    const u8* index_address_8 = memory.GetPhysicalPointer(base_address + index_info.offset);
+    const u8* index_address_8 = memory.GpuRead(
+        base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
     if (is_indexed && index_address_8 == nullptr) {
         return false;
     }
@@ -1446,7 +2083,176 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
     return true;
 }
 
+bool PicaCore::TextureRowsOfDraw(bool is_indexed, VideoCore::DrawTextureRows& rows) {
+    const auto& pipeline = regs.internal.pipeline;
+    const u32 count = pipeline.num_vertices;
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || !primitive_assembler.IsEmpty() || count < 3 ||
+        count > 6) {
+        return false;
+    }
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const u8* index_address_8 = memory.GpuRead(
+        base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
+    if (is_indexed && index_address_8 == nullptr) {
+        return false;
+    }
+    const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+    const bool index_u16 = index_info.format != 0;
+
+    const VertexLoader loader(memory, pipeline);
+    ShaderUnit shader_unit;
+    ShaderEngine& engine = EngineForFewVertices();
+
+    const auto& rasterizer = regs.internal.rasterizer;
+    const f32 height = f24::FromRaw(rasterizer.viewport_size_y).ToFloat32() * 2.f;
+    // The row each vertex ends up in and its three texture coordinates along the rows
+    std::array<f32, 6> row{};
+    std::array<std::array<f32, 3>, 6> coordinate{};
+    f32 first_w = 0.f;
+    u32 lowest = 0;
+    u32 highest = 0;
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        shader_unit.LoadInput(regs.internal.vs, input);
+        engine.Run(vs_setup, shader_unit);
+        AttributeBuffer output;
+        shader_unit.WriteOutput(regs.internal.vs, output);
+        const OutputVertex shaded{rasterizer, output};
+
+        // With all vertices at one distance, what goes in a straight line with the rows at
+        // the vertices does so at every pixel between them
+        const f32 w = shaded.pos.w.ToFloat32();
+        if (!(w > 0.f)) {
+            return false;
+        }
+        if (index == 0) {
+            first_w = w;
+        } else if (std::abs(w - first_w) > 1e-5f * first_w) {
+            return false;
+        }
+        row[index] = (shaded.pos.y.ToFloat32() / w + 1.f) * height / 2.f +
+                     static_cast<f32>(rasterizer.viewport_corner.y);
+        if (!std::isfinite(row[index])) {
+            return false;
+        }
+        coordinate[index] = {shaded.tc0.y.ToFloat32(), shaded.tc1.y.ToFloat32(),
+                             shaded.tc2.y.ToFloat32()};
+        if (row[index] < row[lowest]) {
+            lowest = index;
+        }
+        if (row[index] > row[highest]) {
+            highest = index;
+        }
+    }
+    const f32 span = row[highest] - row[lowest];
+    if (!(span >= 1.f)) {
+        return false;
+    }
+
+    // The line through the lowest and the highest vertex has to pass through all the
+    // others, to within a small part of a texel of the largest texture there is
+    constexpr f32 TOLERANCE = 1.f / 16384.f;
+    bool any = false;
+    for (u32 set = 0; set < 3; ++set) {
+        const f32 scale = (coordinate[highest][set] - coordinate[lowest][set]) / span;
+        const f32 offset = coordinate[lowest][set] - scale * row[lowest];
+        bool on_the_line = std::isfinite(scale) && std::isfinite(offset);
+        for (u32 index = 0; index < count && on_the_line; ++index) {
+            on_the_line =
+                std::abs(scale * row[index] + offset - coordinate[index][set]) <= TOLERANCE;
+        }
+        rows.known[set] = on_the_line;
+        rows.scale[set] = scale;
+        rows.offset[set] = offset;
+        any = any || on_the_line;
+    }
+    return any;
+}
+
 #ifdef CITRA_ENABLE_TRACE_MARKERS
+void PicaCore::DumpGeometryProgram() {
+    const auto& pipeline = regs.internal.pipeline;
+    if (pipeline.use_gs != PipelineRegs::UseGS::Yes) {
+        return;
+    }
+    const auto& gs = regs.internal.gs;
+    const auto& vs = regs.internal.vs;
+    // Once for each program as it is configured
+    static std::array<u64, 16> listed{};
+    static u32 next_listed = 0;
+    u64 key = gs_setup.GetProgramCodeHash() ^ (gs_setup.GetSwizzleDataHash() * 3);
+    key ^= u64{gs.main_offset} << 48 ^ u64 { gs.input_buffer_config } << 16 ^ gs.output_mask;
+    key ^= u64{pipeline.gs_config.mode.Value() == PipelineRegs::GSMode::Point ? 1u : 2u} << 40;
+    key ^= u64{pipeline.vs_outmap_total_minus_1_a} << 44;
+    if (std::ranges::find(listed, key) != listed.end()) {
+        return;
+    }
+    listed[next_listed++ % listed.size()] = key;
+
+    std::string inputs;
+    for (u32 attr = 0; attr <= gs.max_input_attribute_index; attr++) {
+        inputs += fmt::format("{}v{}", attr == 0 ? "" : ",", gs.GetRegisterForAttribute(attr));
+    }
+    std::string vs_inputs;
+    for (u32 attr = 0; attr <= vs.max_input_attribute_index; attr++) {
+        vs_inputs += fmt::format("{}v{}", attr == 0 ? "" : ",", vs.GetRegisterForAttribute(attr));
+    }
+    std::string ints;
+    for (const auto& values : gs.int_uniforms) {
+        ints += fmt::format(" ({},{},{})", values.x.Value(), values.y.Value(), values.z.Value());
+    }
+    CITRA_FRAME_DUMP(
+        "  gs program {:016X} swizzle {:016X} main={} mode={} vs_outputs={} vs_output_mask={:04X} "
+        "gs_inputs={} [{}] gs_output_mask={:04X} exclusive={} variable={} fixed_vertices={} "
+        "stride={} start={} main_vertices={} input_to_uniform={} bools={:04X} ints={} | vs "
+        "{:016X} main={} inputs [{}] | outmap total {}",
+        gs_setup.GetProgramCodeHash(), gs_setup.GetSwizzleDataHash(), gs.main_offset.Value(),
+        static_cast<u32>(pipeline.gs_config.mode.Value()),
+        pipeline.vs_outmap_total_minus_1_a.Value() + 1, vs.output_mask.Value(),
+        gs.max_input_attribute_index.Value() + 1, inputs, gs.output_mask.Value(),
+        pipeline.gs_unit_exclusive_configuration.Value(), pipeline.variable_primitive.Value(),
+        pipeline.gs_config.fixed_vertex_num_minus_1.Value() + 1,
+        pipeline.gs_config.stride_minus_1.Value() + 1, pipeline.gs_config.start_index.Value(),
+        pipeline.variable_vertex_main_num_minus_1 + 1, gs.input_to_uniform.Value(),
+        gs.bool_uniforms.Value(), ints, vs_setup.GetProgramCodeHash(), vs.main_offset.Value(),
+        vs_inputs, regs.internal.rasterizer.vs_output_total.Value());
+    for (u32 i = 0; i < regs.internal.rasterizer.vs_output_total && i < 7; i++) {
+        const auto& map = regs.internal.rasterizer.vs_output_attributes[i];
+        CITRA_FRAME_DUMP("  gs outmap {}: {} {} {} {}", i, static_cast<u32>(map.map_x.Value()),
+                         static_cast<u32>(map.map_y.Value()), static_cast<u32>(map.map_z.Value()),
+                         static_cast<u32>(map.map_w.Value()));
+    }
+    const auto words = [](std::string_view name, std::span<const u32> data) {
+        std::size_t last = data.size();
+        while (last > 0 && data[last - 1] == 0) {
+            last--;
+        }
+        for (std::size_t at = 0; at < last; at += 8) {
+            std::string line;
+            for (std::size_t i = at; i < std::min(at + 8, last); i++) {
+                line += fmt::format(" {:08X}", data[i]);
+            }
+            CITRA_FRAME_DUMP("  gs {} {:04X}:{}", name, at, line);
+        }
+    };
+    words("code", gs_setup.GetProgramCode());
+    words("operands", gs_setup.GetSwizzleData());
+    // The float uniforms it has now, which tell what its constants are
+    for (u32 i = 0; i < 96; i++) {
+        const auto& value = gs_setup.uniforms.f[i];
+        if (value.x.ToFloat32() != 0.f || value.y.ToFloat32() != 0.f ||
+            value.z.ToFloat32() != 0.f || value.w.ToFloat32() != 0.f) {
+            CITRA_FRAME_DUMP("  gs c{}: {} {} {} {}", i, value.x.ToFloat32(), value.y.ToFloat32(),
+                             value.z.ToFloat32(), value.w.ToFloat32());
+        }
+    }
+}
+
 void PicaCore::DumpSmallDraw(bool is_indexed) {
     const auto& pipeline = regs.internal.pipeline;
     const u32 count = pipeline.num_vertices;
@@ -1455,7 +2261,8 @@ void PicaCore::DumpSmallDraw(bool is_indexed) {
     }
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
     const auto& index_info = pipeline.index_array;
-    const u8* index_address_8 = memory.GetPhysicalPointer(base_address + index_info.offset);
+    const u8* index_address_8 = memory.GpuRead(
+        base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
     if (is_indexed && index_address_8 == nullptr) {
         return;
     }
@@ -1508,7 +2315,8 @@ void PicaCore::LoadVertices(bool is_indexed) {
 
     // Locate index buffer.
     const auto& index_info = pipeline.index_array;
-    const u8* index_address_8 = memory.GetPhysicalPointer(base_address + index_info.offset);
+    const u8* index_address_8 = memory.GpuRead(
+        base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
     if (index_address_8 == nullptr) {
         // Mario & Luigi: Superstar Saga sets an invalid base address
         // for the vertex attributes. Return early if that is the case.
@@ -1516,6 +2324,33 @@ void PicaCore::LoadVertices(bool is_indexed) {
     }
     const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
     const bool index_u16 = index_info.format != 0;
+
+    // What is read here is read when the list is decoded, which may be after the game was
+    // told it is done
+    if (pipeline.num_vertices != 0) {
+        u32 lowest = pipeline.vertex_offset;
+        u32 highest = pipeline.vertex_offset + pipeline.num_vertices - 1;
+        if (is_indexed) {
+            memory.NoteGpuReference(base_address + index_info.offset,
+                                    pipeline.num_vertices * (index_u16 ? 2 : 1),
+                                    Memory::GpuReference::IndexData);
+            lowest = 0xFFFF;
+            highest = 0;
+            for (u32 index = 0; index < pipeline.num_vertices; ++index) {
+                const u32 vertex = index_u16 ? index_address_16[index] : index_address_8[index];
+                lowest = std::min(lowest, vertex);
+                highest = std::max(highest, vertex);
+            }
+        }
+        for (const auto& attribute_loader : pipeline.vertex_attributes.attribute_loaders) {
+            if (attribute_loader.component_count != 0 && attribute_loader.byte_count != 0) {
+                memory.NoteGpuReference(base_address + attribute_loader.data_offset +
+                                            lowest * attribute_loader.byte_count,
+                                        (highest - lowest + 1) * attribute_loader.byte_count,
+                                        Memory::GpuReference::VertexData);
+            }
+        }
+    }
 
     // Simple circular-replacement vertex cache
     const std::size_t VERTEX_CACHE_SIZE = 64;

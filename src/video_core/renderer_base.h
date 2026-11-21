@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <optional>
 #include "common/common_types.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/rasterizer_interface.h"
@@ -64,7 +67,8 @@ public:
     // if second == true then it is the second screen
     virtual void NotifySurfaceChanged(bool second) {}
 
-    /// Returns the resolution scale factor relative to the native 3DS screen resolution
+    /// Returns the resolution scale factor relative to the native 3DS screen resolution: the
+    /// one asked for, or a lower one while the GPU cannot keep up with it, see GovernResolution
     u32 GetResolutionScaleFactor();
 
     /// Returns the MSAA sample count
@@ -75,6 +79,21 @@ public:
 
     /// Ends the current frame
     void EndFrame();
+
+    /// Whether ComposeFrame and EndEmulatedFrame together can stand in for SwapBuffers, for an
+    /// emulated GPU that composes on another thread than the one the emulation runs on
+    virtual bool ComposesApart() const {
+        return false;
+    }
+
+    /// The part of SwapBuffers that is the GPU's: composes and presents the image and ends
+    /// the frame for the host's GPU. On the thread that uses the rasterizer. `vblank` is
+    /// GetCurrentFrame() as it was at the VBlank the image is of.
+    virtual void ComposeFrame(u64 vblank) {}
+
+    /// The rest of it: ends the frame for the emulation (speed limit, statistics, input). On
+    /// the emulation thread.
+    void EndEmulatedFrame();
 
     f32 GetCurrentFPS() const {
         return current_fps;
@@ -114,6 +133,9 @@ public:
                            const Layout::FramebufferLayout& layout);
 
 protected:
+    /// The part of EndFrame that is the GPU's, see ComposeFrame
+    void EndGpuFrame();
+
     /// Waits until the GPU is at most one game frame behind the emulation.
     /// Called on VBlanks where the guest application submits a frame.
     virtual void LimitFramesAheadOfGpu() {}
@@ -122,6 +144,12 @@ protected:
     /// keeps the emulation from getting frames ahead of the GPU
     virtual bool AlwaysLimitsFramesAheadOfGpu() const {
         return false;
+    }
+
+    /// The time the host's GPU worked on what was sent to it since this was last called, for
+    /// a renderer that can tell and if `wanted`. Called once per VBlank.
+    virtual std::optional<std::chrono::nanoseconds> TakeGpuTime(bool wanted) {
+        return std::nullopt;
     }
 
     /// Whether the image composed at this VBlank can differ from the one composed last. To be
@@ -138,7 +166,35 @@ protected:
     u64 current_frame = 0;  /// Current frame, should be set by the renderer
 
 private:
+    /// The resolution scale factor the settings ask for
+    u32 AskedResolutionScaleFactor();
+
+    void EndFrameParts(bool emulation, bool gpu);
+
+    /// Once per VBlank: follows how busy the host's GPU is and, with the dynamic resolution
+    /// setting, lowers the resolution scale while the GPU holds the emulation back and raises
+    /// it again when there is room.
+    void GovernResolution();
+
     u64 limited_game_frames = 0; /// Guest frame count at the last LimitFramesAheadOfGpu call
+
+    std::atomic<u32> scale_reduction{0}; /// Steps the resolution scale is lowered by
+    // The stretch of VBlanks the GPU's load is being added up over
+    bool load_window_open = false;
+    std::chrono::steady_clock::time_point load_window_start{};
+    u32 load_window_vblanks = 0;
+    std::chrono::nanoseconds load_window_busy{};      /// The GPU at work
+    std::chrono::nanoseconds load_window_waited{};    /// The emulation waiting for it
+    std::chrono::microseconds load_window_work{};     /// The host at work on the emulation
+    std::chrono::microseconds load_window_emulated{}; /// Emulated time
+    // Stretches in a row, see GovernResolution
+    u32 overloaded_windows = 0;
+    u32 roomy_windows = 0;
+    u32 calm_windows = 0;
+    u32 settling_windows = 0;
+    u32 windows_since_raise = 0;
+    bool raise_unproven = false;
+    u32 raise_patience = 0;
 
     u32 screen_revision = 1;    /// Counts the changes NotifyScreenChanged was told about
     u32 presented_revision = 0; /// Its value at the last VBlank

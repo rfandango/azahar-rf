@@ -15,5 +15,6 @@ extern const char g_build_fullname[];
 extern const char g_build_version[];
 extern const char g_build_variant[];
 extern const char g_shader_cache_version[];
+extern const char g_recompiler_cache_version[];
 
 } // namespace Common

@@ -4,8 +4,13 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include "common/alignment.h"
@@ -24,6 +29,61 @@ enum class StateFlags {
 DECLARE_ENUM_FLAG_OPERATORS(StateFlags)
 
 class Instance;
+
+/// Measures how long the GPU works on what is sent to it. A timestamp is written at the start
+/// and at the end of every submission, and once the GPU is done with them the stretches
+/// between the two are added up, each from where the one before ended. The timestamps are
+/// only compared within a submission and with the one before: the counter behind them need
+/// not keep running while the GPU has nothing to do.
+class GpuTimeMeter {
+public:
+    explicit GpuTimeMeter(const Instance& instance);
+    ~GpuTimeMeter();
+
+    /// Whether the device can write timestamps at all
+    [[nodiscard]] bool IsAvailable() const noexcept {
+        return static_cast<bool>(pool);
+    }
+
+    /// Measures the submissions begun from now on, or stops doing so. Any thread.
+    void SetEnabled(bool enabled_) noexcept {
+        enabled.store(enabled_, std::memory_order_relaxed);
+    }
+
+    /// At the start of a command buffer, on the thread that records it.
+    void Begin(vk::CommandBuffer cmdbuf);
+
+    /// At the end of that command buffer, which is submitted as `tick`.
+    void End(vk::CommandBuffer cmdbuf, u64 tick);
+
+    /// The time the GPU worked on the submissions up to `finished_tick` that were not taken
+    /// in yet. The GPU must be done with them. One thread at a time.
+    [[nodiscard]] std::chrono::nanoseconds Collect(u64 finished_tick);
+
+private:
+    /// Submissions that can be under way at a time. One that finds no room is not measured.
+    static constexpr u32 SLOTS = 128;
+
+    struct Pending {
+        u32 slot;
+        u64 tick;
+    };
+
+    const Instance& instance;
+    vk::UniqueQueryPool pool;
+    double tick_ns{};
+    u64 valid_mask{};
+    std::atomic_bool enabled{false};
+    // Of the recording thread
+    u32 next_slot{};
+    u32 open_slot{};
+    bool slot_open{};
+    // Submissions recorded and not collected yet, oldest first
+    std::mutex mutex;
+    std::deque<Pending> pending;
+    // Of the collecting thread: where the last submission ended, in the GPU's ticks
+    u64 last_end{};
+};
 
 /// The scheduler abstracts command buffer and fence management with an interface that's able to do
 /// OpenGL-like operations on Vulkan command buffers.
@@ -50,6 +110,11 @@ public:
     /// it is done and notes how long that took in the dump.
     void TimeGpuWork(const std::string& what);
 #endif
+
+    /// The time the GPU worked on what was sent to it since this was last called, as far as
+    /// it is done with it. Nothing if the device cannot tell or `wanted` is false, which also
+    /// stops the measuring. To be called regularly, by one thread.
+    [[nodiscard]] std::optional<std::chrono::nanoseconds> TakeGpuTime(bool wanted);
 
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
@@ -204,6 +269,7 @@ private:
 private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     CommandPool command_pool;
+    GpuTimeMeter gpu_time;
     std::unique_ptr<CommandChunk> chunk;
     std::queue<std::unique_ptr<CommandChunk>> work_queue;
     std::vector<std::unique_ptr<CommandChunk>> chunk_reserve;

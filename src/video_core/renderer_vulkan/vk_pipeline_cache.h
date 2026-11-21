@@ -93,6 +93,24 @@ public:
     /// Binds a passthrough geometry shader
     void UseTrivialGeometryShader();
 
+    /// The shader a stage is set to, as one of the Use... calls left it
+    struct ChosenShader {
+        Shader* shader{};
+        u64 hash{};
+    };
+    [[nodiscard]] ChosenShader ChosenFor(Pica::Shader::Generator::ProgramType type) const {
+        return {current_shaders[type], shader_hashes[type]};
+    }
+    /// Sets a stage to what ChosenFor gave earlier, without the looking up. Only while the
+    /// shaders are still those of the same title (DiskCacheIdentity).
+    void RestoreShader(Pica::Shader::Generator::ProgramType type, const ChosenShader& chosen) {
+        current_shaders[type] = chosen.shader;
+        shader_hashes[type] = chosen.hash;
+    }
+    [[nodiscard]] const void* DiskCacheIdentity() const {
+        return curr_disk_cache.get();
+    }
+
     /// Binds a fragment shader generated from PICA state
     /// depth_from_viewport: the caller maps depth through the viewport depth range, so the
     /// shader must not write depth (see Pica::Shader::GetViewportDepthRange).
@@ -184,6 +202,9 @@ private:
     vk::UniquePipelineCache driver_pipeline_cache;
     /// Held while the driver's cache is replaced or written out
     std::mutex driver_cache_mutex;
+    /// The size of the driver's cache as the file holds it: what was loaded from it or last
+    /// written to it (under the mutex). A cache of that size is not written again.
+    std::size_t driver_cache_stored_size{};
     /// Pipelines requested since the driver's cache was last stored, and when the first came
     u32 unsaved_pipelines{};
     std::chrono::steady_clock::time_point first_unsaved_pipeline{};
@@ -197,6 +218,9 @@ private:
     Common::ThreadWorker pipeline_optimizer;
     PipelineInfo current_info{};
     GraphicsPipeline* current_pipeline{};
+    /// The cache current_pipeline is from: it is only good for another draw while that is
+    /// still the one in use
+    const ShaderDiskCache* current_pipeline_cache{};
     std::array<DescriptorHeap, NumDescriptorHeaps> descriptor_heaps;
     std::array<vk::DescriptorSet, NumRasterizerSets> bound_descriptor_sets{};
     std::array<u32, NumDynamicOffsets> offsets{};

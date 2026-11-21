@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdio>
 #include <memory>
 #include <boost/serialization/shared_ptr.hpp>
 #include <boost/serialization/split_member.hpp>
@@ -84,6 +85,13 @@ public:
      * @param length The length (in bytes) of the range to invalidate.
      */
     virtual void InvalidateCacheRange(u32 start_address, std::size_t length) = 0;
+
+    /**
+     * For profiling: writes a line for each block of recompiled code, with the number of this
+     * core, the address and the size of the block's host code and its location (the address
+     * in the game in the low 32 bits), all in hexadecimal. Nothing without a recompiler.
+     */
+    virtual void DumpBlockLocations([[maybe_unused]] std::FILE* out) const {}
 
     /// Clears the exclusive monitor's state.
     virtual void ClearExclusiveState() = 0;

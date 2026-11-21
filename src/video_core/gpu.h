@@ -67,6 +67,59 @@ public:
     /// Executes the provided GSP command.
     Result Execute(const Service::GSP::Command& command);
 
+    /**
+     * Has the command executed: on the thread that decodes commands if there is one (lists,
+     * fills and transfers; the game goes on meanwhile and the result is success), at once
+     * otherwise. The interrupt that tells the game a command is done is raised on the
+     * emulation thread, when the command is done: see DeliverInterrupts. Emulation thread.
+     */
+    Result Submit(const Service::GSP::Command& command);
+
+    /// What the emulation thread waits for the decoding thread for, see WaitIdle
+    enum class WaitReason : u32 {
+        Other,
+        Command,      ///< A command that is not handed over is to be executed
+        Register,     ///< A register of the emulated GPU is read or written
+        BufferSwap,   ///< The game says which of its buffers is to be shown
+        VBlank,       ///< A frame is shown
+        MemoryAccess, ///< The game reads or writes memory the rasterizer keeps
+        MapPages,     ///< The game's memory is mapped anew
+        NothingToRun, ///< No thread of the game has anything to do
+        // A memory access, by what the game touches (Memory::MemorySystem::Impl::AccessKind)
+        ReadGpuNewer,         ///< A read of what a surface holds newer than memory
+        ReadGpuWritten,       ///< A read of a page that what is still to be decoded may write
+        ReadWatched,          ///< A read of a page a draw reads in place
+        WriteSurface,         ///< A write into what a surface covers
+        WriteWatched,         ///< A write to a page a draw reads in place
+        WriteVertexData,      ///< A write to vertex data the decoder read before
+        WriteIndexData,       ///< To index data
+        WriteTexture,         ///< To a texture it loaded
+        WriteCalledList,      ///< To a command list called from others
+        WriteOtherReference,  ///< To something else it read
+        WriteBesideReference, ///< To a page it reads from, but not to what it read of it
+        WriteGpuWritten,      ///< To a page that what is still to be decoded may write
+        Count,
+    };
+
+    /// Returns when nothing that was handed to Submit is left to do. Everything the
+    /// emulation thread does with the emulated GPU's state goes through this first, so that
+    /// only one thread at a time is at it. Does nothing on the decoding thread itself.
+    void WaitIdle(WaitReason reason = WaitReason::Other);
+
+    /// Raises the interrupts of the commands that are done since this was last called.
+    /// Emulation thread only.
+    void DeliverInterrupts();
+
+    /// Whether commands handed to Submit are still on their way
+    [[nodiscard]] bool HasPendingWork() const;
+
+    /// Counts an access for the decoder's line in the log that did not have to wait
+    void NoteAccess(WaitReason reason);
+
+    /// Whether the game is told a command is done when it hands it over (design B): then no
+    /// thread of the game waits for the decoder, and emulated time may run on while it works
+    [[nodiscard]] bool CompletesEarly() const;
+
     /// Updates GPU display framebuffer configuration using the specified parameters.
     void SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
 
@@ -120,6 +173,17 @@ public:
     void ReleaseRenderer();
 
 private:
+    void DecoderLoop();
+    void StopDecoder();
+    void ReportDecoderWaits();
+    /// Whether commands go to the decoder's thread now: not while a movie is recorded or
+    /// played back
+    [[nodiscard]] bool UsesDecoder() const;
+    /// Waits for the image of the VBlank before to have been composed
+    void WaitForPresent();
+    /// The buffer of the top screen a transfer or copy fills, or 0: for the pacing rule
+    PAddr PaceTargetOf(const Service::GSP::Command& command);
+
     void SubmitCmdList(u32 index);
 
     // Interrupt index must be 0 or 1 to signal the relative PSC interrupt.
@@ -149,6 +213,9 @@ private:
         PAddr held{};
         u64 held_delay{};
         bool reported{};
+        /// Bytes a row of the top screen's buffers, where the game is told "done" at
+        /// hand-over: then all of this is the emulation thread's, see GPU::Submit
+        u32 stride{};
     };
     RenderPace render_pace;
 

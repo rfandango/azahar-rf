@@ -2,6 +2,7 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include "common/trace_markers.h"
 #include "video_core/shader/generator/glsl_fs_shader_gen.h"
 
 namespace Pica::Shader::Generator::GLSL {
@@ -63,6 +64,7 @@ struct LightSrc {
     vec3 diffuse;
     vec3 ambient;
     vec3 position;
+    float position_length;
     vec3 spot_direction;
     float dist_atten_bias;
     float dist_atten_scale;
@@ -653,13 +655,22 @@ void FragmentModule::WriteLighting() {
         const std::string light_src = fmt::format("light_src[{}]", light_config.num.Value());
 
         // Compute light vector (directional or positional)
-        if (light_config.directional) {
+        const bool legacy_shaders =
+            (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyStageRounding) != 0;
+        if (light_config.directional && !legacy_shaders) {
+            // The direction to a directional light and its distance are the same for every
+            // fragment, and come worked out
             out += fmt::format("light_vector = {}.position;\n", light_src);
+            out += fmt::format("light_distance = {}.position_length;\n", light_src);
         } else {
-            out += fmt::format("light_vector = {}.position + view;\n", light_src);
+            if (light_config.directional) {
+                out += fmt::format("light_vector = {}.position;\n", light_src);
+            } else {
+                out += fmt::format("light_vector = {}.position + view;\n", light_src);
+            }
+            out += "light_distance = length(light_vector);\n";
+            out += "light_vector = normalize(light_vector);\n";
         }
-        out += fmt::format("light_distance = length(light_vector);\n", light_src);
-        out += fmt::format("light_vector = normalize(light_vector);\n", light_src);
 
         out += fmt::format("spot_dir = {}.spot_direction;\n", light_src);
         out += "half_vector = normalize(view) + light_vector;\n";

@@ -4,6 +4,10 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <utility>
+#include <vector>
 #include "common/common_types.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
@@ -22,6 +26,7 @@ class MemorySystem;
 
 namespace VideoCore {
 class FrameLiveness;
+struct DrawTextureRows;
 class RasterizerInterface;
 } // namespace VideoCore
 
@@ -121,6 +126,20 @@ public:
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
+    /// Where the command being worked on is: the address of its list and the position in it.
+    /// The same from one frame to the next for a draw of a list that is sent or called again
+    /// from where it was, which most are.
+    /// Has the next ProcessCmdList read the list from these bytes, a copy made when the list
+    /// was handed over, instead of from the emulated memory, which the game may have
+    /// written since. Lists called from it are read where they are.
+    void UseCommandListCopy(const u8* copy) {
+        list_copy = copy;
+    }
+
+    [[nodiscard]] u64 CommandSite() const {
+        return (static_cast<u64>(cmd_list.addr) << 32) | cmd_list.current_index;
+    }
+
     /// The share of the viewport that the box around the vertices of the draw about to be
     /// carried out takes up, for a draw of two triangles at the most, whose vertices are
     /// shaded here to find out. One, all of it, where that cannot be told.
@@ -147,6 +166,100 @@ private:
 
     void DrawArrays(bool is_indexed);
 
+    /// Draws shaded on the CPU that follow each other (sprites, a quad each) are drawn by the
+    /// host together: their triangles stay with the rasterizer until something the drawing
+    /// itself goes by is about to change. That is any register below the vertex pipeline's
+    /// (targets, textures, blending, lighting; the pipeline's, the vertex shader's and the
+    /// geometry shader's only decide what the triangles are), a draw that is not added to
+    /// them, or the end of the list.
+    void FlushSoftwareBatch();
+    static constexpr u32 FIRST_VERTEX_REG = 0x200;
+    static constexpr u32 MAX_BATCHED_DRAWS = 128;
+    bool sw_batch_open{};
+    u32 sw_batch_draws{};
+
+    /// Some games smooth edges by drawing their scene twice into the same target, a part of
+    /// a pixel apart, and blending the two images (the "MT Framework" games do while the 3D
+    /// effect is off; in Monster Hunter 4 Ultimate it is a quarter of a frame's GPU time).
+    /// Above the console's resolution the host's pixels are smaller than that shift, and the
+    /// second image only costs. So this pattern is watched for: a run of draws to a target, a
+    /// quad that copies the target elsewhere, a second run to the target, and a quad that
+    /// blends the copy over it. Where it is seen the draws of the second run are compared
+    /// with those of the first, place by place. A twin goes by the same registers, the same
+    /// vertex shader and the same float uniforms but for a slight difference in a few of
+    /// them (the shifted projection). After some frames in which every draw of the second
+    /// run was a twin, twins are left out as they come, and if all of them were, the blending
+    /// as well: the target then holds the first image, which is what blending two images
+    /// that are all but the same comes to. A draw that is no twin is drawn, and all after it.
+    struct TwinPass {
+        enum class Phase : u8 {
+            Idle,
+            /// A run of draws to one target is under way
+            First,
+            /// The quad that copies the target elsewhere came after it
+            Copied,
+            /// The second run to the target is under way
+            Second,
+        };
+        struct Draw {
+            u64 state;
+            bool clear;
+            std::array<Common::Vec4<f24>, 96> uniforms;
+        };
+        static constexpr u32 MIN_DRAWS = 4;
+        static constexpr u32 MAX_DRAWS = 1024;
+        static constexpr u32 FRAMES_ALIKE = 4;
+        static constexpr u32 MAX_DIFFERING = 12;
+        /// How far a float uniform may be off, as a share of the largest value in the
+        /// registers around it (the rows of its matrix)
+        static constexpr float MAX_SHIFT = 0.02f;
+
+        Phase phase{};
+        /// The colour buffer of the run of draws under way, and how many it has
+        PAddr run_target{};
+        u32 run_draws{};
+        /// Of the two passes; where the first image is kept; the draws of the first pass
+        PAddr target{};
+        PAddr keep{};
+        u32 first_draws{};
+        /// The place in the second pass
+        u32 at{};
+        /// The target the bare pattern was seen at: runs to it are recorded
+        PAddr watched_target{};
+        /// The first pass of this frame was recorded; every draw of the second so far was a
+        /// twin; twins are left out as they come; how many were
+        bool compared{};
+        bool twins{};
+        bool leaving_out{};
+        u32 left_out_now{};
+        /// Frames in a row in which the whole second pass was twins
+        u32 frames_alike{};
+        std::vector<Draw> first;
+        /// With ExplainScenePasses: the registers of each of them, and lines written so far
+        std::vector<std::array<u32, 0x300>> first_regs;
+        u32 explained{};
+        /// For the log: the most float uniforms that differed, and by how much
+        u32 most_differing{};
+        float largest_shift{};
+        std::atomic<u64> left_out{};
+    } twin_pass;
+
+    /// Whether the draw that is about to be made is left out, see TwinPass. Called for every
+    /// draw, with whether it overwrites all of its viewport (a clear done with a quad).
+    bool IsLeftOutTwin(bool clears);
+    bool IsTwinOf(const TwinPass::Draw& first, bool clears, u64 state);
+    u64 TwinState(bool clears);
+    /// Calls back with each stretch of registers [from, to) that a draw goes by as the
+    /// registers are now
+    template <typename Func>
+    void ForTwinRegisters(bool clears, Func&& func) const;
+    void ExplainNoTwin(bool clears);
+    /// The float uniforms the vertex shader's program can read from its entry point, a bit
+    /// for each (96 of them). Worked out once for each program.
+    using UniformSet = std::array<u64, 2>;
+    const UniformSet& FloatUniformsRead();
+    std::vector<std::pair<u64, UniformSet>> uniforms_read;
+
     void LoadVertices(bool is_indexed);
 
     /// Sets up and returns the engine to shade a few vertices of the vertex shader in use
@@ -158,13 +271,30 @@ private:
     /// Only looks at draws of two triangles, whose vertices are shaded here to find out.
     bool CoversViewport(bool is_indexed, bool* exactly = nullptr);
 
+    /// How the texture coordinates of the draw about to be carried out go with the rows of
+    /// its target, for each set of coordinates where that is a straight line. Only looks at
+    /// draws of two triangles at the most, whose vertices are shaded here to find out.
+    /// False if it is none.
+    bool TextureRowsOfDraw(bool is_indexed, VideoCore::DrawTextureRows& rows);
+
 #ifdef CITRA_ENABLE_TRACE_MARKERS
     /// Frame dumps: where the vertices of a draw of two triangles at the most end up in the
     /// target, and which texture coordinates they have
     void DumpSmallDraw(bool is_indexed);
+    /// Frame dumps: the geometry shader program of a draw that has one, with its
+    /// configuration, once for each
+    void DumpGeometryProgram();
 #endif
 
 public:
+    /// A fill, a transfer or a copy is carried out: what runs of draws were under way are over
+    /// (see TwinPass)
+    void NoteTargetCommand();
+    /// Draws left out as twins since this was last asked
+    u64 TakeLeftOutTwins() {
+        return twin_pass.left_out.exchange(0, std::memory_order_relaxed);
+    }
+
     union Regs {
         static constexpr std::size_t NUM_REGS = 0x732;
 
@@ -438,6 +568,7 @@ private:
     GeometryPipeline geometry_pipeline;
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
+    const u8* list_copy{};
     VideoCore::FrameLiveness* draw_filter{};
     std::unique_ptr<ShaderEngine> shader_engine;
     /// Shades a few vertices while `shader_engine` does not have their shader ready

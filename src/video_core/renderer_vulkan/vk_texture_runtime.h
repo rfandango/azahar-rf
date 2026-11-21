@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <functional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -198,9 +200,38 @@ public:
         return true;
     }
 
+    /// A blit that fills all of a surface is not recorded at once. Games move an image
+    /// through several buffers before it is shown (Luigi's Mansion: Dark Moon five times a
+    /// frame, each the size of half its picture), and most of what that makes is read only
+    /// by the next copy, and only in part, or not at all. The blit waits: it is carried out
+    /// when its destination's image is used or its source's image is about to change, and
+    /// given up when the destination is overwritten whole or taken out of use first. A copy
+    /// or blit that reads a destination that waits reads the source of the waiting blit.
+    bool HasPendingBlits() const noexcept {
+        return !pending_blits.empty();
+    }
+    /// The image of the surface with this number is about to be used: what waits to be put
+    /// there is put there
+    void CarryOutBlitsInto(u64 serial);
+    /// The image of the surface with this number is about to change: what waits to be read
+    /// from it is carried out
+    void CarryOutBlitsFrom(u64 serial);
+    /// All of the surface with this number is about to be overwritten, or it is gone
+    void DropBlitInto(u64 serial);
+    /// The cache took the surface out of use: nothing reads it any more
+    void NoteSurfaceRemoved(Surface& surface);
+    /// Whether the images of a surface the cache is done with are still read: by a blit that
+    /// waits, or by one the GPU may not have finished
+    bool StillNeeded(Surface& surface);
+    u64 NewSurfaceSerial() noexcept {
+        return ++last_surface_serial;
+    }
+
 private:
     /// Clears a partial texture rect using a clear rectangle
-    void ClearTextureWithRenderpass(Surface& surface, const VideoCore::TextureClear& clear);
+    /// What records the clear of a part of a surface, with a render pass of its own
+    std::function<void()> ClearWithRenderpass(Surface& surface,
+                                              const VideoCore::TextureClear& clear);
 
 private:
     const Instance& instance;
@@ -220,6 +251,27 @@ private:
         bool operator==(const StorageUse&) const = default;
     };
     std::vector<StorageUse> storage_uses;
+    /// The blits that wait, see HasPendingBlits. Surfaces are told apart by a number of
+    /// their own (the cache moves them about); the images are those the surfaces were in
+    /// when the blit was asked for, which is why every change of them carries it out first.
+    struct PendingBlit {
+        u64 dst_serial;
+        u64 src_serial;
+        vk::Image src_image;
+        vk::Image dst_image;
+        vk::ImageAspectFlags aspect;
+        vk::PipelineStageFlags stages;
+        vk::AccessFlags src_access;
+        vk::AccessFlags dst_access;
+        VideoCore::TextureBlit blit;
+    };
+    std::vector<PendingBlit> pending_blits;
+    /// Surfaces a blit read from late, and the tick it was recorded in
+    std::vector<std::pair<u64, u64>> late_uses;
+    u64 last_surface_serial{};
+    const PendingBlit* FindBlitInto(u64 serial) const;
+    void RecordPendingBlit(const PendingBlit& pending);
+    void NoteLateUse(u64 serial);
 };
 
 class Surface : public VideoCore::SurfaceBase {
@@ -243,7 +295,28 @@ public:
 
     /// Returns the image at index, otherwise the base image
     vk::Image Image(Type type = Type::Current) const noexcept {
+        if (serial.value != 0 && runtime.HasPendingBlits()) [[unlikely]] {
+            runtime.CarryOutBlitsInto(serial.value);
+        }
         return handles[type == Type::Current ? current : type].image;
+    }
+
+    /// The image the surface is in, without carrying out a blit that waits to be put there
+    vk::Image RawImage() const noexcept {
+        return handles[current].image;
+    }
+
+    /// A number of the surface's own, for what the runtime keeps about it (the cache moves
+    /// surfaces about). Given out when first asked for.
+    u64 Serial() noexcept {
+        if (serial.value == 0) {
+            serial.value = runtime.NewSurfaceSerial();
+        }
+        return serial.value;
+    }
+    /// That number, or zero if the surface was never asked for it
+    u64 SerialIfAny() const noexcept {
+        return serial.value;
     }
 
     /// Returns the image view at index, otherwise the base view
@@ -280,6 +353,44 @@ public:
     /// rectangle is left for the draw to fill. Returns the view to sample, of the image the
     /// surface was in.
     vk::ImageView SwapForOverwrite(const Common::Rectangle<u32>& rect) noexcept;
+
+    /// The surface's second image (see SwapForOverwrite and CopyImageView) is brought up to
+    /// date only where it may differ from the image the surface is in. For that, everything
+    /// that writes to that image has to say so: within which rectangle (in pixels of the
+    /// image), or, where that is not known, all of it.
+    void NoteWritten(const Common::Rectangle<u32>& rect) noexcept {
+        if (serial.value != 0 && runtime.HasPendingBlits()) [[unlikely]] {
+            // What waits to be read from the image is read before it changes; what waits
+            // to be put there goes there first, the write covers only a part
+            runtime.CarryOutBlitsFrom(serial.value);
+            runtime.CarryOutBlitsInto(serial.value);
+        }
+        if (copy_differs_all) {
+            return;
+        }
+        const u32 x0 = std::min(rect.left, rect.right);
+        const u32 x1 = std::max(rect.left, rect.right);
+        const u32 y0 = std::min(rect.bottom, rect.top);
+        const u32 y1 = std::max(rect.bottom, rect.top);
+        if (differs_x0 >= differs_x1 || differs_y0 >= differs_y1) {
+            differs_x0 = x0;
+            differs_x1 = x1;
+            differs_y0 = y0;
+            differs_y1 = y1;
+        } else {
+            differs_x0 = std::min(differs_x0, x0);
+            differs_x1 = std::max(differs_x1, x1);
+            differs_y0 = std::min(differs_y0, y0);
+            differs_y1 = std::max(differs_y1, y1);
+        }
+    }
+    void NoteAllWritten() noexcept {
+        if (serial.value != 0 && runtime.HasPendingBlits()) [[unlikely]] {
+            runtime.CarryOutBlitsFrom(serial.value);
+            runtime.CarryOutBlitsInto(serial.value);
+        }
+        copy_differs_all = true;
+    }
 
     /// Returns the framebuffer view of the surface image
     vk::ImageView FramebufferView() noexcept {
@@ -323,9 +434,11 @@ public:
     /// Uploads the custom material to the surface allocation.
     void UploadCustom(const VideoCore::Material* material, u32 level);
 
-    /// Downloads pixel data to staging from a rectangle region of the surface texture
+    /// Downloads pixel data to staging from a rectangle region of the surface texture.
+    /// Without `wait` the copy is only recorded: the data is there once the GPU has got past
+    /// the tick it was recorded under.
     void Download(const VideoCore::BufferTextureCopy& download,
-                  const VideoCore::StagingData& staging);
+                  const VideoCore::StagingData& staging, bool wait = true);
 
     /// Scales up the surface to match the new resolution scale and sample-count.
     void ScaleUp(u32 new_scale, u8 new_sample_count);
@@ -368,6 +481,26 @@ public:
     vk::ImageCreateFlags image_flags{};
     bool image_format_list{};
     bool has_image_params{};
+    /// Where the second image may differ from the one the surface is in: all of it (also
+    /// while there is no second image), or within a rectangle, which is empty while
+    /// differs_x0 >= differs_x1. See NoteWritten.
+    bool copy_differs_all{true};
+    /// See Serial. Not taken along by a copy of the object that is left behind when the
+    /// cache moves the surface.
+    struct MovedSerial {
+        u64 value{};
+        MovedSerial() = default;
+        MovedSerial(MovedSerial&& other) noexcept : value{std::exchange(other.value, 0)} {}
+        MovedSerial& operator=(MovedSerial&& other) noexcept {
+            value = std::exchange(other.value, 0);
+            return *this;
+        }
+    };
+    MovedSerial serial;
+    u32 differs_x0{};
+    u32 differs_y0{};
+    u32 differs_x1{};
+    u32 differs_y1{};
 };
 
 class Framebuffer : public VideoCore::FramebufferParams {
@@ -429,6 +562,11 @@ public:
 
     [[nodiscard]] std::array<vk::ImageAspectFlags, 4> Aspects() const noexcept {
         return aspects;
+    }
+
+    /// The size its attachments have in common
+    [[nodiscard]] vk::Extent2D Extent() const noexcept {
+        return {width, height};
     }
 
     [[nodiscard]] vk::RenderPass RenderPass() const noexcept {

@@ -106,6 +106,11 @@ RasterizerCache<T>::~RasterizerCache() {
 
 template <class T>
 void RasterizerCache<T>::TickFrame() {
+    // What was looked up holds for a frame at the most: a texture whose replacement was
+    // still being loaded is looked at again
+    surface_set_epoch++;
+    late_frame++;
+    ServeLateReadbacks();
     custom_tex_manager.TickFrame();
     RunGarbageCollector();
 
@@ -141,7 +146,8 @@ void RasterizerCache<T>::RunGarbageCollector() {
         // Tick-values less than or equal to the current resource-tick are possibly still in-use.
         // Tick-values larger than the current resource-tick are not being utilized anymore and can
         // be safely deleted.
-        if (resource_free_tick <= resource_last_used_tick) {
+        if (resource_free_tick <= resource_last_used_tick ||
+            runtime.StillNeeded(slot_surfaces[surface_id])) {
             // Resource is still in-use, skip deletion
             it++;
             continue;
@@ -627,7 +633,41 @@ typename T::Surface& RasterizerCache<T>::GetTextureSurface(
     const Pica::TexturingRegs::FullTextureConfig& config) {
     const auto info = Pica::Texture::TextureInfo::FromPicaRegister(config.config, config.format);
     const u32 max_level = MipLevels(info.width, info.height, config.config.lod.max_level) - 1;
+
+    // The same texture asked for again with the cache as it was: what was found then
+    const bool remember =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyTextureLookup) == 0;
+    TextureLookup& known =
+        texture_lookups[((info.physical_address >> 6) ^ (info.physical_address >> 15) ^ info.width ^
+                         (max_level << 3)) %
+                        texture_lookups.size()];
+    if (remember && known.surface_id && known.address == info.physical_address &&
+        known.width == info.width && known.height == info.height &&
+        known.format == static_cast<u32>(info.format) && known.max_level == max_level &&
+        known.shadow_source == info.is_shadow_source && known.set_epoch == surface_set_epoch &&
+        known.validity_epoch == SurfaceBase::validity_epoch) {
+        return slot_surfaces[known.surface_id];
+    }
+
     const SurfaceId surface_id = GetTextureSurface(info, max_level);
+    // Not a surface made for this one use (a size that is no multiple of eight), nor none
+    const u32 min_width = info.width >> max_level;
+    const u32 min_height = info.height >> max_level;
+    if (remember && surface_id != NULL_SURFACE_ID && min_width % 8 == 0 && min_height % 8 == 0) {
+        known = TextureLookup{
+            .address = info.physical_address,
+            .width = info.width,
+            .height = info.height,
+            .format = static_cast<u32>(info.format),
+            .max_level = max_level,
+            .shadow_source = info.is_shadow_source,
+            .set_epoch = surface_set_epoch,
+            .validity_epoch = SurfaceBase::validity_epoch,
+            .surface_id = surface_id,
+        };
+    } else {
+        known.surface_id = {};
+    }
     return slot_surfaces[surface_id];
 }
 
@@ -796,6 +836,52 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         static_cast<u32>(std::clamp(viewport_rect.bottom, 0, framebuffer_height)),
     };
 
+    // The target of the draw before, asked for again with the cache as it was: what was
+    // found then is what would be found now
+    const bool shadow_rendering = regs.framebuffer.IsShadowRendering();
+    const LastTarget asked = {
+        .valid = true,
+        .color_addr = config.GetColorBufferPhysicalAddress(),
+        .depth_addr = config.GetDepthBufferPhysicalAddress(),
+        .color_format = static_cast<u32>(config.color_format.Value()),
+        .depth_format = static_cast<u32>(config.depth_format.Value()),
+        .width = static_cast<u32>(framebuffer_width),
+        .height = static_cast<u32>(framebuffer_height),
+        .viewport = viewport_rect,
+        .using_color = using_color_fb,
+        .using_depth = using_depth_fb,
+        .shadow_rendering = shadow_rendering,
+        .res_scale = resolution_scale_factor,
+        .sample_count = sample_count,
+        .validity_epoch = SurfaceBase::validity_epoch,
+    };
+    if (last_target.valid && last_target.color_addr == asked.color_addr &&
+        last_target.depth_addr == asked.depth_addr &&
+        last_target.color_format == asked.color_format &&
+        last_target.depth_format == asked.depth_format && last_target.width == asked.width &&
+        last_target.height == asked.height && last_target.viewport.left == asked.viewport.left &&
+        last_target.viewport.top == asked.viewport.top &&
+        last_target.viewport.right == asked.viewport.right &&
+        last_target.viewport.bottom == asked.viewport.bottom &&
+        last_target.using_color == asked.using_color &&
+        last_target.using_depth == asked.using_depth &&
+        last_target.shadow_rendering == asked.shadow_rendering &&
+        last_target.res_scale == asked.res_scale &&
+        last_target.sample_count == asked.sample_count &&
+        last_target.validity_epoch == asked.validity_epoch &&
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyTargetLookup) == 0) {
+        const FramebufferParams found = {
+            .color_id = last_target.color_id,
+            .depth_id = last_target.depth_id,
+            .color_level = last_target.color_level,
+            .depth_level = last_target.depth_level,
+            .shadow_rendering = shadow_rendering,
+        };
+        return FramebufferHelper<T>{this, RefreshFramebuffer(found), config.IsFlipped(),
+                                    regs.rasterizer, last_target.fb_rect};
+    }
+    last_target.valid = false;
+
     SurfaceParams color_params;
     color_params.is_tiled = true;
     color_params.res_scale = resolution_scale_factor;
@@ -899,6 +985,16 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         .shadow_rendering = regs.framebuffer.IsShadowRendering(),
     };
 
+    // For the next draw that asks for the same. The cache as it is now, after what the
+    // looking up itself made and validated, is what has to stand still until then.
+    last_target = asked;
+    last_target.validity_epoch = SurfaceBase::validity_epoch;
+    last_target.color_id = color_id;
+    last_target.depth_id = depth_id;
+    last_target.color_level = color_level;
+    last_target.depth_level = depth_level;
+    last_target.fb_rect = fb_rect;
+
     return FramebufferHelper<T>{this, RefreshFramebuffer(fb_params),
                                 regs.framebuffer.framebuffer.IsFlipped(), regs.rasterizer, fb_rect};
 }
@@ -944,6 +1040,8 @@ void RasterizerCache<T>::NoteDisplayTransferSource(const SurfaceParams& src_para
         // Games have a handful of render targets at most. Should one keep making up new ones,
         // forget the oldest.
         static constexpr std::size_t MAX_DOWNSCALED_TARGETS = 8;
+        last_target.valid = false;
+        surface_set_epoch++;
         if (downscaled_targets.size() == MAX_DOWNSCALED_TARGETS) {
             downscaled_targets.erase(downscaled_targets.begin());
         }
@@ -954,7 +1052,13 @@ void RasterizerCache<T>::NoteDisplayTransferSource(const SurfaceParams& src_para
             .pixel_format = src_params.pixel_format,
         });
     }
-    (half_y ? target->shrunk_xy : target->shrunk_x) = true;
+    bool& shrunk = half_y ? target->shrunk_xy : target->shrunk_x;
+    if (!shrunk) {
+        // Which surface a target is looked up as goes by this
+        shrunk = true;
+        last_target.valid = false;
+        surface_set_epoch++;
+    }
 }
 
 template <class T>
@@ -963,7 +1067,11 @@ void RasterizerCache<T>::NoteFullSizeUse(const SurfaceParams& params) {
         return;
     }
     if (DownscaledTarget* target = FindDownscaledTarget(params)) {
-        target->used_at_full_size = true;
+        if (!target->used_at_full_size) {
+            target->used_at_full_size = true;
+            last_target.valid = false;
+            surface_set_epoch++;
+        }
     }
 }
 
@@ -1324,8 +1432,13 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
     if (!source_ptr) [[unlikely]] {
         return;
     }
+    // Read when the command is decoded, which may be after the game was told it is done
+    memory.NoteGpuReference(load_info.addr, load_info.end - load_info.addr,
+                            Memory::GpuReference::Texture);
 
-    const auto upload_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
+    const std::span<u8> upload_data{
+        const_cast<u8*>(memory.GpuRead(load_info.addr, load_info.end - load_info.addr)),
+        load_info.end - load_info.addr};
     DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
                   runtime.NeedsConversion(surface));
 
@@ -1373,8 +1486,12 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
     if (!source_ptr) [[unlikely]] {
         return false;
     }
+    memory.NoteGpuReference(load_info.addr, load_info.end - load_info.addr,
+                            Memory::GpuReference::Texture);
 
-    const auto upload_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
+    const std::span<u8> upload_data{
+        const_cast<u8*>(memory.GpuRead(load_info.addr, load_info.end - load_info.addr)),
+        load_info.end - load_info.addr};
     const u64 hash = ComputeHash(load_info, upload_data);
 
     const u32 level = surface.LevelOf(load_info.addr);
@@ -1712,6 +1829,11 @@ void RasterizerCache<T>::ClearAll(bool flush) {
     }
 
     // Remove the whole cache without really looking at it.
+    last_target.valid = false;
+    surface_set_epoch++;
+    memory.RasterizerClearSurfaceCells();
+    readable_pages.clear();
+    readable_count = 0;
     cached_pages -= flush_interval;
     dirty_regions.clear();
     page_table.clear();
@@ -1749,6 +1871,10 @@ void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surfa
                                interval.lower(), interval.upper()};
 
         SCOPE_EXIT({ flushed_intervals += interval; });
+        // The emulated memory is about to change under whoever reads it in place
+        if (on_guest_write) {
+            on_guest_write(interval.lower(), interval.upper() - interval.lower());
+        }
         if (surface.type == SurfaceType::Fill) {
             DownloadFillSurface(surface, interval);
             continue;
@@ -1788,7 +1914,12 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
         ASSERT(region_owner.type != SurfaceType::Texture);
         ASSERT(addr >= region_owner.addr && addr + size <= region_owner.end);
         ASSERT(region_owner.width == region_owner.stride);
-        region_owner.MarkValid(invalid_interval);
+        // A draw into what the draw before drew into finds it valid already
+        if (region_owner.IsRegionValid(invalid_interval)) {
+            region_owner.modification_tick++;
+        } else {
+            region_owner.MarkValid(invalid_interval);
+        }
     }
 
     boost::container::small_vector<SurfaceId, 4> remove_surfaces;
@@ -1804,6 +1935,10 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
             return;
         }
         const auto interval = surface.GetInterval() & invalid_interval;
+        if (boost::icl::contains(surface.invalid_regions, interval)) {
+            // As it was: invalid there already, and not gone, so not invalid throughout
+            return;
+        }
         surface.MarkInvalid(interval);
         if (!surface.IsFullyInvalid()) {
             return;
@@ -1812,6 +1947,8 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
     });
 
     if (region_owner_id) {
+        DropReadable(addr, size);
+        memory.NoteGpuWritten(addr, size);
         dirty_regions.set({invalid_interval, region_owner_id});
     } else {
         dirty_regions.erase(invalid_interval);
@@ -1830,26 +1967,59 @@ void RasterizerCache<T>::InvalidateRows(PAddr addr, u32 row_size, u32 row_stride
     }
 
     const u32 size = (rows - 1) * row_stride + row_size;
-    SurfaceRegions written;
-    for (u32 row = 0; row < rows; row++) {
-        const PAddr row_addr = addr + row * row_stride;
-        const SurfaceInterval interval(row_addr, row_addr + row_size);
-        written += interval;
-        dirty_regions.set({interval, region_owner_id});
-    }
-
+    DropReadable(addr, size);
+    memory.NoteGpuWritten(addr, size);
     Surface& region_owner = slot_surfaces[region_owner_id];
     ASSERT(region_owner.type != SurfaceType::Texture);
     ASSERT(addr >= region_owner.addr && addr + size <= region_owner.end);
     ASSERT(region_owner.width == region_owner.stride);
-    region_owner.MarkValid(written);
+
+    // A copy like this comes every frame, to the same rows, and finds most of what it has to
+    // note noted already. So each row is looked at where it stands and only changed where it
+    // is not as it has to be: every interval that goes into one of these sets is memory
+    // taken from the heap, and with the rows of a whole texture gathered in a set first, cut
+    // to each surface and added to its own, this was most of what such a copy cost
+    // (measured in Luigi's Mansion: 7.8% of the emulation thread).
+    const auto row_interval = [&](u32 row) {
+        const PAddr row_addr = addr + row * row_stride;
+        return SurfaceInterval(row_addr, row_addr + row_size);
+    };
+
+    for (u32 row = 0; row < rows; row++) {
+        const SurfaceInterval interval = row_interval(row);
+        const auto owned = dirty_regions.find(interval);
+        if (owned == dirty_regions.end() || owned->second != region_owner_id ||
+            !boost::icl::contains(owned->first, interval)) {
+            dirty_regions.set({interval, region_owner_id});
+        }
+        if (!region_owner.IsRegionValid(interval)) {
+            region_owner.invalid_regions.erase(interval);
+            SurfaceBase::validity_epoch++;
+        }
+    }
+    // What the rows hold is new in any case
+    region_owner.modification_tick++;
 
     boost::container::small_vector<SurfaceId, 4> remove_surfaces;
     ForEachSurfaceInRegion(addr, size, [&](SurfaceId surface_id, Surface& surface) {
         if (surface_id == region_owner_id) {
             return;
         }
-        surface.MarkInvalid(written & surface.GetInterval());
+        const SurfaceInterval whole = surface.GetInterval();
+        bool changed = false;
+        for (u32 row = 0; row < rows; row++) {
+            const SurfaceInterval part = row_interval(row) & whole;
+            if (boost::icl::is_empty(part) || boost::icl::contains(surface.invalid_regions, part)) {
+                continue;
+            }
+            surface.invalid_regions.insert(part);
+            SurfaceBase::validity_epoch++;
+            changed = true;
+        }
+        if (!changed) {
+            return;
+        }
+        surface.modification_tick++;
         if (surface.IsFullyInvalid()) {
             remove_surfaces.push_back(surface_id);
         }
@@ -1863,6 +2033,8 @@ void RasterizerCache<T>::InvalidateRows(PAddr addr, u32 row_size, u32 row_stride
 template <class T>
 SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
                                             const SurfaceFlagBits& initial_flags) {
+    last_target.valid = false;
+    surface_set_epoch++;
     const SurfaceId surface_id = [&] {
         const u64 resource_free_tick = runtime.GetResourceFreeTick();
         // Try to find a matching texture in the deletion queue
@@ -1900,21 +2072,29 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
 
 template <class T>
 void RasterizerCache<T>::RegisterSurface(SurfaceId surface_id) {
+    last_target.valid = false;
+    surface_set_epoch++;
     Surface& surface = slot_surfaces[surface_id];
     ASSERT_MSG(False(surface.flags & SurfaceFlagBits::Registered),
                "Trying to register an already registered surface");
 
     surface.flags |= SurfaceFlagBits::Registered;
     UpdatePagesCachedCount(surface.addr, surface.size, 1);
+    memory.RasterizerSetSurfaceCells(surface.addr, surface.size, true);
     ForEachPage(surface.addr, surface.size,
                 [this, surface_id](u64 page) { page_table[page].push_back(surface_id); });
 }
 
 template <class T>
 void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
+    last_target.valid = false;
+    surface_set_epoch++;
     Surface& surface = slot_surfaces[surface_id];
     ASSERT_MSG(True(surface.flags & SurfaceFlagBits::Registered),
                "Trying to unregister an already unregistered surface");
+    if (surface.type != SurfaceType::Fill) {
+        runtime.NoteSurfaceRemoved(surface);
+    }
 
     surface.flags &= ~SurfaceFlagBits::Registered;
     UpdatePagesCachedCount(surface.addr, surface.size, -1);
@@ -1932,6 +2112,13 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
             return;
         }
         surfaces.erase(vector_it);
+    });
+
+    // What it covered is free for the game to write without a word, but for what the
+    // surfaces that are left still cover of it
+    memory.RasterizerSetSurfaceCells(surface.addr, surface.size, false);
+    ForEachSurfaceInRegion(surface.addr, surface.size, [this](SurfaceId, Surface& other) {
+        memory.RasterizerSetSurfaceCells(other.addr, other.size, true);
     });
 
     if (surface.type != SurfaceType::Fill) {
@@ -1953,6 +2140,155 @@ void RasterizerCache<T>::UnregisterAll() {
     }
     runtime.Finish();
     RunGarbageCollector();
+}
+
+template <class T>
+void RasterizerCache<T>::NoteReadbackForGame(PAddr addr, u32 size) {
+    /// Pixels of a target that may be given late, and frames in a row it has to be read in
+    static constexpr u32 LATE_PIXELS = 256;
+    static constexpr u32 LATE_STREAK = 8;
+    static constexpr u64 LATE_FRAME_GAP = 4;
+    if (size == 0 || dirty_regions.empty() ||
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacySmallReadbacks) != 0) {
+        return;
+    }
+    const SurfaceInterval interval(addr, addr + size);
+    for (const auto& [region, surface_id] : RangeFromInterval(dirty_regions, interval)) {
+        const Surface& surface = slot_surfaces[surface_id];
+        if (surface.type != SurfaceType::Color || surface.levels != 1 ||
+            surface.width * surface.height > LATE_PIXELS) {
+            continue;
+        }
+        auto entry = std::ranges::find_if(late_readbacks, [&](const LateReadback& candidate) {
+            return candidate.addr == surface.addr && candidate.size == surface.size;
+        });
+        if (entry == late_readbacks.end()) {
+            if (late_readbacks.size() >= 16) {
+                continue;
+            }
+            late_readbacks.push_back({.addr = surface.addr, .size = surface.size});
+            entry = late_readbacks.end() - 1;
+        }
+        if (late_frame != entry->last_read_frame) {
+            entry->streak =
+                late_frame - entry->last_read_frame <= LATE_FRAME_GAP ? entry->streak + 1 : 1;
+            entry->last_read_frame = late_frame;
+        }
+        if (entry->streak < LATE_STREAK) {
+            continue;
+        }
+        if (!entry->late) {
+            entry->late = true;
+            LOG_INFO(HW_GPU,
+                     "The game reads a {}x{} image back every frame (at {:08X}): it gets it a "
+                     "frame late from here on, without the wait for the GPU",
+                     surface.width, surface.height, surface.addr);
+        }
+        // This read still waits, and leaves memory as the surface is; the next ones do not
+        memory.ExemptReads(surface.addr, surface.size);
+    }
+}
+
+template <class T>
+void RasterizerCache<T>::ServeLateReadbacks() {
+    for (LateReadback& entry : late_readbacks) {
+        if (!entry.late) {
+            continue;
+        }
+        if (entry.pending && runtime.GetResourceFreeTick() >= entry.pending_tick) {
+            std::vector<u8> bytes(entry.info.end - entry.info.addr);
+            EncodeTexture(entry.info, entry.info.addr, entry.info.end, entry.staging.mapped, bytes,
+                          entry.convert);
+            memory.PostLateWrite(entry.info.addr, std::move(bytes));
+            entry.pending = false;
+        }
+        if (entry.pending) {
+            continue;
+        }
+        // What the host GPU holds newer of it now, if anything
+        const SurfaceInterval whole(entry.addr, entry.addr + entry.size);
+        for (const auto& [region, surface_id] : RangeFromInterval(dirty_regions, whole)) {
+            Surface& surface = slot_surfaces[surface_id];
+            if (surface.addr != entry.addr || surface.size != entry.size ||
+                surface.type != SurfaceType::Color || !surface.IsRegionValid(whole)) {
+                continue;
+            }
+            const SurfaceParams info = surface.FromInterval(whole);
+            const auto staging = runtime.FindStaging(
+                info.width * info.height * surface.GetInternalBytesPerPixel(), false);
+            const BufferTextureCopy download = {
+                .buffer_offset = staging.offset,
+                .buffer_size = staging.size,
+                .texture_rect = surface.GetSubRect(info),
+                .texture_level = surface.LevelOf(entry.addr),
+            };
+            entry.pending_tick = runtime.GetResourceTick();
+            surface.Download(download, staging, false);
+            entry.staging = staging;
+            entry.info = info;
+            entry.convert = runtime.NeedsConversion(surface);
+            entry.pending = true;
+            // On its way to the GPU now, not with the next frame's work
+            runtime.Finish();
+            break;
+        }
+    }
+}
+
+template <class T>
+void RasterizerCache<T>::NoteCpuRead(PAddr addr, u32 size) {
+    if (size == 0) {
+        return;
+    }
+    const u32 first = addr >> Memory::CITRA_PAGE_BITS;
+    const u32 last = (addr + size - 1) >> Memory::CITRA_PAGE_BITS;
+    for (u32 page = first; page <= last; page++) {
+        const std::size_t word = page / 64;
+        const u64 bit = u64{1} << (page % 64);
+        if (word < readable_pages.size() && (readable_pages[word] & bit) != 0) {
+            continue;
+        }
+        // A page a surface has marked, with nothing on it that the host GPU has newer
+        const PAddr start = page << Memory::CITRA_PAGE_BITS;
+        if (cached_pages.find(page) == cached_pages.end() ||
+            HoldsNewer(start, Memory::CITRA_PAGE_SIZE)) {
+            continue;
+        }
+        if (word >= readable_pages.size()) {
+            readable_pages.resize(word + 1);
+        }
+        readable_pages[word] |= bit;
+        ++readable_count;
+        memory.RasterizerMarkRegionReadable(start, Memory::CITRA_PAGE_SIZE, true);
+    }
+}
+
+template <class T>
+void RasterizerCache<T>::DropReadable(PAddr addr, u32 size, bool tell_memory) {
+    if (readable_count == 0 || size == 0) {
+        return;
+    }
+    const u64 first = addr >> Memory::CITRA_PAGE_BITS;
+    const u64 last = std::min<u64>((static_cast<u64>(addr) + size - 1) >> Memory::CITRA_PAGE_BITS,
+                                   readable_pages.size() * 64 - 1);
+    for (u64 page = first; page <= last; page++) {
+        const std::size_t word = page / 64;
+        if (readable_pages[word] == 0) {
+            // Nothing in these 64 pages
+            page = (word + 1) * 64 - 1;
+            continue;
+        }
+        const u64 bit = u64{1} << (page % 64);
+        if ((readable_pages[word] & bit) == 0) {
+            continue;
+        }
+        readable_pages[word] &= ~bit;
+        --readable_count;
+        if (tell_memory) {
+            memory.RasterizerMarkRegionReadable(static_cast<PAddr>(page << Memory::CITRA_PAGE_BITS),
+                                                Memory::CITRA_PAGE_SIZE, false);
+        }
+    }
 }
 
 template <class T>
@@ -1980,6 +2316,7 @@ void RasterizerCache<T>::UpdatePagesCachedCount(PAddr addr, u32 size, int delta)
         if (delta > 0 && count == delta) {
             memory.RasterizerMarkRegionCached(interval_start_addr, interval_size, true);
         } else if (delta < 0 && count == -delta) {
+            DropReadable(interval_start_addr, interval_size, false);
             memory.RasterizerMarkRegionCached(interval_start_addr, interval_size, false);
         } else {
             ASSERT(count >= 0);

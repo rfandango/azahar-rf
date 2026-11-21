@@ -5,12 +5,14 @@
 #pragma once
 
 #include <boost/icl/interval_set.hpp>
+#include "video_core/rasterizer_cache/node_pool.h"
 #include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/rasterizer_cache/utils.h"
 
 namespace VideoCore {
 
-using SurfaceRegions = boost::icl::interval_set<PAddr, std::less, SurfaceInterval>;
+using SurfaceRegions =
+    boost::icl::interval_set<PAddr, std::less, SurfaceInterval, NodePoolAllocator>;
 
 struct Material;
 
@@ -67,22 +69,31 @@ public:
     void MarkValid(SurfaceInterval interval) {
         invalid_regions.erase(interval);
         modification_tick++;
+        validity_epoch++;
     }
 
     void MarkInvalid(SurfaceInterval interval) {
         invalid_regions.insert(interval);
         modification_tick++;
+        validity_epoch++;
     }
 
     void MarkValid(const SurfaceRegions& regions) {
         invalid_regions -= regions;
         modification_tick++;
+        validity_epoch++;
     }
 
     void MarkInvalid(const SurfaceRegions& regions) {
         invalid_regions += regions;
         modification_tick++;
+        validity_epoch++;
     }
+
+    /// Counts every change of what is valid of any surface. What was found out about surfaces
+    /// holds for as long as it stands still (and no surface comes or goes). Whoever changes
+    /// invalid_regions by hand counts it up as well.
+    static inline u64 validity_epoch = 0;
 
     bool IsFullyInvalid() const {
         auto interval = GetInterval();

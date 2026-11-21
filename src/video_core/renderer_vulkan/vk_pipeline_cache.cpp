@@ -2,6 +2,7 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <cstring>
 #include <boost/container/static_vector.hpp>
 
 #ifdef __ANDROID__
@@ -326,6 +327,8 @@ void PipelineCache::LoadDriverPipelineDiskCache(
     cache_info.initialDataSize = cache_file_size;
     cache_info.pInitialData = cache_data.data();
     load_cache(true);
+    std::scoped_lock lock{driver_cache_mutex};
+    driver_cache_stored_size = cache_file_size;
 }
 
 void PipelineCache::SaveDriverPipelineDiskCache() {
@@ -345,6 +348,18 @@ void PipelineCache::SaveDriverPipelineDiskCache() {
     const auto cache_file_path =
         fmt::format("{}{:016X}-{:X}{:X}.bin", cache_dir, program_id, vendor_id, device_id);
 
+    // Megabytes to shared storage, which now and then takes many seconds: not when the file
+    // holds it already. This is come by at every load of a save state and every exit, and
+    // the cache grows with every pipeline that is new to it.
+    const vk::Device device = instance.GetDevice();
+    const auto cache_data = device.getPipelineCacheData(*driver_pipeline_cache);
+    if (cache_data.size() == driver_cache_stored_size) {
+        LOG_INFO(Render_Vulkan, "The driver's pipeline cache is as stored ({} KB): not written",
+                 cache_data.size() / 1024);
+        return;
+    }
+    const auto write_start = std::chrono::steady_clock::now();
+
     // Written next to the file and moved into place, so that being killed while writing does
     // not leave half a cache behind
     const std::string temp_file_path = cache_file_path + ".tmp";
@@ -355,8 +370,6 @@ void PipelineCache::SaveDriverPipelineDiskCache() {
             return;
         }
 
-        const vk::Device device = instance.GetDevice();
-        const auto cache_data = device.getPipelineCacheData(*driver_pipeline_cache);
         if (cache_file.WriteBytes(cache_data.data(), cache_data.size()) != cache_data.size()) {
             LOG_ERROR(Render_Vulkan, "Error during pipeline cache write");
             return;
@@ -365,7 +378,15 @@ void PipelineCache::SaveDriverPipelineDiskCache() {
     FileUtil::Delete(cache_file_path);
     if (!FileUtil::Rename(temp_file_path, cache_file_path)) {
         LOG_ERROR(Render_Vulkan, "Unable to move the pipeline cache into place");
+        return;
     }
+    LOG_INFO(Render_Vulkan,
+             "The driver's pipeline cache written: {} KB (the file held {} KB) in {} ms",
+             cache_data.size() / 1024, driver_cache_stored_size / 1024,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - write_start)
+                 .count());
+    driver_cache_stored_size = cache_data.size();
 }
 
 void PipelineCache::NoteNewPipeline() {
@@ -483,7 +504,16 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, u32 vertic
         info.state.shader_ids[i] = shader_hashes[i];
     }
 
-    GraphicsPipeline* const pipeline = curr_disk_cache->GetPipeline(info);
+    // Most draws ask for the pipeline of the draw before them. Its state is at hand, and
+    // comparing with it is less than hashing all of this one's and looking that up. Only a
+    // pipeline that is built: one that is not has to be asked for, to get on with it.
+    const bool same_as_before =
+        current_pipeline != nullptr && current_pipeline_cache == curr_disk_cache.get() &&
+        current_pipeline->IsDone() &&
+        std::memcmp(&info.state, &current_info.state, sizeof(info.state)) == 0 &&
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyPipelineLookup) == 0;
+    GraphicsPipeline* const pipeline =
+        same_as_before ? current_pipeline : curr_disk_cache->GetPipeline(info);
     SaveDriverPipelineDiskCacheWhenDue();
     if (!pipeline->IsDone() && !pipeline->TryBuild(wait_built)) {
         return false;
@@ -618,6 +648,7 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, u32 vertic
 
     current_info = info;
     current_pipeline = pipeline;
+    current_pipeline_cache = curr_disk_cache.get();
     scheduler.MarkStateNonDirty(StateFlags::Pipeline | StateFlags::DescriptorSets);
 
     return true;

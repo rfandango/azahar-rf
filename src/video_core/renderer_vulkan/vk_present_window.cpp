@@ -292,6 +292,7 @@ Frame* PresentWindow::GetRenderFrame() {
 }
 
 void PresentWindow::UpdateDisplay() {
+    pre_rotation.store(swapchain.GetPreRotation(), std::memory_order_relaxed);
     if (!is_main_window) {
         return;
     }
@@ -331,6 +332,8 @@ void PresentWindow::Present(Frame* frame, u64 vblank) {
                 .speed = status.speed,
                 .lead_ms = status.lead_ms,
                 .target_ms = status.target_ms,
+                .work_ms = status.work_ms,
+                .ready_ms = status.ready_ms,
                 .slips = status.slips,
                 .misses = status.misses,
             });
@@ -349,6 +352,10 @@ void PresentWindow::Present(Frame* frame, u64 vblank) {
         present_queue.push(frame);
         frame_cv.notify_one();
     });
+    // On to the render thread now. Left in the batch that is being recorded, the frame would
+    // be passed on only when the next frame's drawing sends that batch: 5 to 15 ms of delay
+    // on the way to the screen for nothing.
+    scheduler.DispatchWork();
 }
 
 void PresentWindow::WaitPresent() {
@@ -581,7 +588,11 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
             UNREACHABLE();
         }
 
-        Common::Hitches::NotePresentQueued(frame->present_id, frame->game_frame, frame->submitted);
+        Common::Hitches::NotePresentQueued(frame->present_id, frame->game_frame, frame->submitted,
+                                           frame->desired_time);
+        if (is_main_window) {
+            pacer.NoteQueued(frame->present_id, std::chrono::steady_clock::now());
+        }
         if (own_queue) {
             submit_lock.unlock();
             // Another window may be presenting on that queue
@@ -596,7 +607,8 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         // Asking the display can take a while: not something to hold up submissions for
         std::scoped_lock surface_lock{recreate_surface_mutex};
         for (const vk::PastPresentationTimingGOOGLE& timing : swapchain.TakePresentTimings()) {
-            pacer.NoteDisplayed(timing.presentID, timing.actualPresentTime);
+            pacer.NoteDisplayed(timing.presentID, timing.actualPresentTime,
+                                static_cast<s64>(timing.presentMargin));
             Common::Hitches::NotePresentShown(timing.presentID, timing.actualPresentTime,
                                               timing.presentMargin);
         }

@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <algorithm>
 #include <boost/container/small_vector.hpp>
 #include "common/trace_markers.h"
 #include "video_core/shader/generator/pica_fs_config.h"
@@ -37,9 +38,13 @@ FragmentModule::~FragmentModule() = default;
 void FragmentModule::Generate() {
     AddLabel(OpLabel());
 
+    legacy_rounding =
+        (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyStageRounding) != 0;
     rounded_primary_color = Byteround(OpLoad(vec_ids.Get(4), primary_color_id), 4);
-    primary_fragment_color = ConstF32(0.f, 0.f, 0.f, 0.f);
-    secondary_fragment_color = ConstF32(0.f, 0.f, 0.f, 0.f);
+    // Without lighting both of its colours stay this zero, which the combiner stages that
+    // take them then know
+    primary_fragment_color = Note(ConstF32(0.f, 0.f, 0.f, 0.f), KnownZero | KnownRounded);
+    secondary_fragment_color = primary_fragment_color;
 
     // Do not do any sort of processing if it's obvious we're not going to pass the alpha test
     if (config.framebuffer.alpha_test_func == Pica::FramebufferRegs::CompareFunc::Never) {
@@ -63,9 +68,12 @@ void FragmentModule::Generate() {
     // Write shader bytecode to emulate all enabled PICA lights
     WriteLighting();
 
-    combiner_buffer = ConstF32(0.f, 0.f, 0.f, 0.f);
-    next_combiner_buffer = GetShaderDataMember(vec_ids.Get(4), ConstS32(26));
-    combiner_output = ConstF32(0.f, 0.f, 0.f, 0.f);
+    // Zero is a rounded value, and so are the two colours the game sets, the buffer's first
+    // one here and the constant of each stage: they are handed over as the floats the
+    // rounding gives for their bytes (the byte times 1/255, not the byte divided by 255).
+    combiner_buffer = Note(ConstF32(0.f, 0.f, 0.f, 0.f), KnownZero | KnownRounded);
+    next_combiner_buffer = Note(GetShaderDataMember(vec_ids.Get(4), ConstS32(26)), KnownRounded);
+    combiner_output = combiner_buffer;
 
     // Write shader bytecode to emulate PICA TEV stages
     for (u32 index = 0; index < config.texture.tev_stages.size(); ++index) {
@@ -441,8 +449,10 @@ void FragmentModule::WriteLighting() {
     for (u32 light_index = 0; light_index < lighting.src_num; ++light_index) {
         const auto& light_config = lighting.lights[light_index];
 
+        // The members of a light: four colours, the position and its length, the spot
+        // direction, bias and scale of the distance attenuation
         const auto GetLightMember = [&](s32 member) -> Id {
-            const Id member_type = member < 6 ? vec_ids.Get(3) : f32_id;
+            const Id member_type = member < 5 || member == 6 ? vec_ids.Get(3) : f32_id;
             const Id light_num{
                 ConstS32(static_cast<s32>(lighting.lights[light_index].num.Value()))};
             return GetShaderDataMember(member_type, ConstS32(24), light_num, ConstS32(member));
@@ -450,16 +460,20 @@ void FragmentModule::WriteLighting() {
 
         // Compute light vector (directional or positional)
         const Id light_position{GetLightMember(4)};
-        if (light_config.directional) {
+        if (light_config.directional && !legacy_rounding) {
+            // The direction to a directional light and its distance are the same for every
+            // fragment. They come worked out, where the shader would have taken a length
+            // and a normalization for each fragment and held the results in registers.
             light_vector = light_position;
+            light_distance = GetLightMember(5);
         } else {
-            light_vector = OpFAdd(vec_ids.Get(3), light_position, view);
+            light_vector = light_config.directional ? light_position
+                                                    : OpFAdd(vec_ids.Get(3), light_position, view);
+            light_distance = OpLength(f32_id, light_vector);
+            light_vector = OpNormalize(vec_ids.Get(3), light_vector);
         }
 
-        light_distance = OpLength(f32_id, light_vector);
-        light_vector = OpNormalize(vec_ids.Get(3), light_vector);
-
-        spot_dir = GetLightMember(5);
+        spot_dir = GetLightMember(6);
         half_vector = OpFAdd(vec_ids.Get(3), OpNormalize(vec_ids.Get(3), view), light_vector);
 
         // Compute dot product of light_vector and normal, adjust if lighting is one-sided or
@@ -487,8 +501,8 @@ void FragmentModule::WriteLighting() {
         // If enabled, compute distance attenuation value
         Id dist_atten{ConstF32(1.f)};
         if (light_used && light_config.dist_atten_enable) {
-            const Id dist_atten_scale{GetLightMember(7)};
-            const Id dist_atten_bias{GetLightMember(6)};
+            const Id dist_atten_scale{GetLightMember(8)};
+            const Id dist_atten_bias{GetLightMember(7)};
             const Id index{OpFma(f32_id, dist_atten_scale, light_distance, dist_atten_bias)};
             const Id clamped_index{OpFClamp(f32_id, index, ConstF32(0.f), ConstF32(1.f))};
             const Id sampler{ConstS32(
@@ -713,7 +727,7 @@ void FragmentModule::WriteTevStage(s32 index) {
 
         if (stage.color_op == TevStageConfig::Operation::Dot3_RGBA) {
             // result of Dot3_RGBA operation is also placed to the alpha component
-            alpha_output = OpCompositeExtract(f32_id, color_output, 0);
+            alpha_output = Snapped(OpCompositeExtract(f32_id, color_output, 0));
         } else {
             alpha_results_1 =
                 AppendAlphaModifier(stage.alpha_modifier1, stage.alpha_source1, index);
@@ -725,6 +739,8 @@ void FragmentModule::WriteTevStage(s32 index) {
             alpha_output = Byteround(AppendAlphaCombiner(stage.alpha_op));
         }
 
+        // The multipliers are 1, 2 and 4: a rounded value times one of them, clamped, is the
+        // rounded value of the product, so what a stage puts out is always rounded
         color_output = OpVectorTimesScalar(
             vec_ids.Get(3), color_output, ConstF32(static_cast<float>(stage.GetColorMultiplier())));
         color_output = OpFClamp(vec_ids.Get(3), color_output, ConstF32(0.f, 0.f, 0.f),
@@ -732,18 +748,23 @@ void FragmentModule::WriteTevStage(s32 index) {
         alpha_output =
             OpFMul(f32_id, alpha_output, ConstF32(static_cast<float>(stage.GetAlphaMultiplier())));
         alpha_output = OpFClamp(f32_id, alpha_output, ConstF32(0.f), ConstF32(1.f));
-        combiner_output = OpCompositeConstruct(vec_ids.Get(4), color_output, alpha_output);
+        combiner_output = Snapped(OpCompositeConstruct(vec_ids.Get(4), color_output, alpha_output));
     }
 
     combiner_buffer = next_combiner_buffer;
+    const auto into_buffer = [this](Id first, Id second, Id shuffled) {
+        return IsSnapped(first) && IsSnapped(second) ? Snapped(shuffled) : shuffled;
+    };
     if (config.TevStageUpdatesCombinerBufferColor(index)) {
-        next_combiner_buffer =
-            OpVectorShuffle(vec_ids.Get(4), combiner_output, next_combiner_buffer, 0, 1, 2, 7);
+        next_combiner_buffer = into_buffer(
+            combiner_output, next_combiner_buffer,
+            OpVectorShuffle(vec_ids.Get(4), combiner_output, next_combiner_buffer, 0, 1, 2, 7));
     }
 
     if (config.TevStageUpdatesCombinerBufferAlpha(index)) {
-        next_combiner_buffer =
-            OpVectorShuffle(vec_ids.Get(4), next_combiner_buffer, combiner_output, 0, 1, 2, 7);
+        next_combiner_buffer = into_buffer(
+            next_combiner_buffer, combiner_output,
+            OpVectorShuffle(vec_ids.Get(4), next_combiner_buffer, combiner_output, 0, 1, 2, 7));
     }
 }
 
@@ -827,10 +848,23 @@ Id FragmentModule::SampleShadow() {
                           OpISub(i32_id, OpConvertFToS(i32_id, abs_min_w), shadow_texture_bias))};
     const Id z{OpBitcast(u32_id, z_i32)};
 
+    // The size of the texture and one divided by it are the same for every fragment and
+    // come as a uniform: asking the texture is a wait for the texture unit, and dividing by
+    // the answer a reciprocal, for each fragment
     const Id sampled_image{OpLoad(TypeSampledImage(image2d_u32_id), tex0_id)};
-    const Id shadow_texture{OpImage(image2d_u32_id, sampled_image)};
-    const Id px_size{OpImageQuerySizeLod(ivec_ids.Get(2), shadow_texture, ConstS32(0))};
-    const Id px_size_f{OpConvertSToF(vec_ids.Get(2), px_size)};
+    Id px_size{};
+    Id px_size_f{};
+    Id px_size_reciprocal{};
+    if (legacy_rounding) {
+        const Id shadow_texture{OpImage(image2d_u32_id, sampled_image)};
+        px_size = OpImageQuerySizeLod(ivec_ids.Get(2), shadow_texture, ConstS32(0));
+        px_size_f = OpConvertSToF(vec_ids.Get(2), px_size);
+    } else {
+        const Id size{GetShaderDataMember(vec_ids.Get(4), ConstS32(30), ConstU32(0u))};
+        px_size_f = OpVectorShuffle(vec_ids.Get(2), size, size, 0, 1);
+        px_size_reciprocal = OpVectorShuffle(vec_ids.Get(2), size, size, 2, 3);
+        px_size = OpConvertFToS(ivec_ids.Get(2), px_size_f);
+    }
     const Id coord{OpFma(vec_ids.Get(2), px_size_f, texcoord0, ConstF32(-0.5f, -0.5f))};
     const Id coord_floor{OpFloor(vec_ids.Get(2), coord)};
     const Id f{OpFSub(vec_ids.Get(2), coord, coord_floor)};
@@ -840,8 +874,9 @@ Id FragmentModule::SampleShadow() {
     // shadows does this. They are fetched with one gather instead of one by one: a quarter of
     // the texture lookups. Gathering at the corner the four share returns exactly them, as
     // that corner is half a texel away from where any other four begin.
-    const Id corner{
-        OpFDiv(vec_ids.Get(2), OpFAdd(vec_ids.Get(2), coord_floor, ConstF32(1.f, 1.f)), px_size_f)};
+    const Id corner_texel{OpFAdd(vec_ids.Get(2), coord_floor, ConstF32(1.f, 1.f))};
+    const Id corner{legacy_rounding ? OpFDiv(vec_ids.Get(2), corner_texel, px_size_f)
+                                    : OpFMul(vec_ids.Get(2), corner_texel, px_size_reciprocal)};
     const Id texels{OpImageGather(uvec_ids.Get(4), sampled_image, corner, ConstS32(0))};
 
     // A texel outside the texture counts as lit. The gather returns what the wrap mode makes
@@ -1213,15 +1248,41 @@ Id FragmentModule::ProcTexSampler() {
 }
 
 Id FragmentModule::Byteround(Id variable_id, u32 size) {
+    if (!legacy_rounding && IsSnapped(variable_id)) {
+        return variable_id;
+    }
     if (size > 1) {
         const Id scaled_vec_id{
             OpVectorTimesScalar(vec_ids.Get(size), variable_id, ConstF32(255.f))};
         const Id rounded_id{OpRound(vec_ids.Get(size), scaled_vec_id)};
-        return OpVectorTimesScalar(vec_ids.Get(size), rounded_id, ConstF32(1.f / 255.f));
+        return Snapped(OpVectorTimesScalar(vec_ids.Get(size), rounded_id, ConstF32(1.f / 255.f)));
     } else {
         const Id rounded_id{OpRound(f32_id, OpFMul(f32_id, variable_id, ConstF32(255.f)))};
-        return OpFMul(f32_id, rounded_id, ConstF32(1.f / 255.f));
+        return Snapped(OpFMul(f32_id, rounded_id, ConstF32(1.f / 255.f)));
     }
+}
+
+Id FragmentModule::Note(Id id, u8 known) {
+    if (legacy_rounding || known == 0) {
+        return id;
+    }
+    for (auto& [value, flags] : known_values) {
+        if (value == id.value) {
+            flags |= known;
+            return id;
+        }
+    }
+    known_values.emplace_back(id.value, known);
+    return id;
+}
+
+u8 FragmentModule::KnownOf(Id id) const {
+    for (const auto& [value, flags] : known_values) {
+        if (value == id.value) {
+            return flags;
+        }
+    }
+    return 0;
 }
 
 Id FragmentModule::ProcTexLookupLUT(Id offset, Id coord) {
@@ -1378,7 +1439,9 @@ Id FragmentModule::GetSource(TevStageConfig::Source source, s32 index) {
     case Source::PreviousBuffer:
         return combiner_buffer;
     case Source::Constant:
-        return GetShaderDataMember(vec_ids.Get(4), ConstS32(25), ConstS32(index));
+        // Set as the float that rounding to 1/255 gives for each of its bytes
+        return Note(GetShaderDataMember(vec_ids.Get(4), ConstS32(25), ConstS32(index)),
+                    KnownRounded);
     case Source::Previous:
         return combiner_output;
     default:
@@ -1395,32 +1458,45 @@ Id FragmentModule::AppendColorModifier(TevStageConfig::ColorModifier modifier,
     const bool force_source3 = index == 0 && source == Source::Previous;
     const Id source_color{GetSource(force_source3 ? stage.color_source3.Value() : source, index)};
     const Id one_vec{ConstF32(1.f, 1.f, 1.f)};
+    const Id zero_vec{ConstF32(0.f, 0.f, 0.f)};
+    // What is known of a value holds for the components picked from it
+    const u8 known = KnownOf(source_color);
 
     const auto shuffle = [&](s32 r, s32 g, s32 b) -> Id {
-        return OpVectorShuffle(vec_ids.Get(3), source_color, source_color, r, g, b);
+        return Note(OpVectorShuffle(vec_ids.Get(3), source_color, source_color, r, g, b), known);
+    };
+    // One minus zero and one minus one take no instruction, and are known in turn
+    const auto one_minus = [&](Id picked) -> Id {
+        if (known & KnownZero) {
+            return Note(one_vec, KnownOne | KnownRounded);
+        }
+        if (known & KnownOne) {
+            return Note(zero_vec, KnownZero | KnownRounded);
+        }
+        return OpFSub(vec_ids.Get(3), one_vec, picked);
     };
 
     switch (modifier) {
     case ColorModifier::SourceColor:
         return shuffle(0, 1, 2);
     case ColorModifier::OneMinusSourceColor:
-        return OpFSub(vec_ids.Get(3), one_vec, shuffle(0, 1, 2));
+        return one_minus(shuffle(0, 1, 2));
     case ColorModifier::SourceRed:
         return shuffle(0, 0, 0);
     case ColorModifier::OneMinusSourceRed:
-        return OpFSub(vec_ids.Get(3), one_vec, shuffle(0, 0, 0));
+        return one_minus(shuffle(0, 0, 0));
     case ColorModifier::SourceGreen:
         return shuffle(1, 1, 1);
     case ColorModifier::OneMinusSourceGreen:
-        return OpFSub(vec_ids.Get(3), one_vec, shuffle(1, 1, 1));
+        return one_minus(shuffle(1, 1, 1));
     case ColorModifier::SourceBlue:
         return shuffle(2, 2, 2);
     case ColorModifier::OneMinusSourceBlue:
-        return OpFSub(vec_ids.Get(3), one_vec, shuffle(2, 2, 2));
+        return one_minus(shuffle(2, 2, 2));
     case ColorModifier::SourceAlpha:
         return shuffle(3, 3, 3);
     case ColorModifier::OneMinusSourceAlpha:
-        return OpFSub(vec_ids.Get(3), one_vec, shuffle(3, 3, 3));
+        return one_minus(shuffle(3, 3, 3));
     default:
         LOG_CRITICAL(Render, "Unknown color modifier op {}", modifier);
         return one_vec;
@@ -1435,26 +1511,38 @@ Id FragmentModule::AppendAlphaModifier(TevStageConfig::AlphaModifier modifier,
     const bool force_source3 = index == 0 && source == Source::Previous;
     const Id source_alpha{GetSource(force_source3 ? stage.alpha_source3.Value() : source, index)};
     const Id one_f32{ConstF32(1.f)};
+    const u8 known = KnownOf(source_alpha);
 
-    const auto component = [&](s32 c) -> Id { return OpCompositeExtract(f32_id, source_alpha, c); };
+    const auto component = [&](s32 c) -> Id {
+        return Note(OpCompositeExtract(f32_id, source_alpha, c), known);
+    };
+    const auto one_minus = [&](Id picked) -> Id {
+        if (known & KnownZero) {
+            return Note(one_f32, KnownOne | KnownRounded);
+        }
+        if (known & KnownOne) {
+            return Note(ConstF32(0.f), KnownZero | KnownRounded);
+        }
+        return OpFSub(f32_id, one_f32, picked);
+    };
 
     switch (modifier) {
     case AlphaModifier::SourceAlpha:
         return component(3);
     case AlphaModifier::OneMinusSourceAlpha:
-        return OpFSub(f32_id, one_f32, component(3));
+        return one_minus(component(3));
     case AlphaModifier::SourceRed:
         return component(0);
     case AlphaModifier::OneMinusSourceRed:
-        return OpFSub(f32_id, one_f32, component(0));
+        return one_minus(component(0));
     case AlphaModifier::SourceGreen:
         return component(1);
     case AlphaModifier::OneMinusSourceGreen:
-        return OpFSub(f32_id, one_f32, component(1));
+        return one_minus(component(1));
     case AlphaModifier::SourceBlue:
         return component(2);
     case AlphaModifier::OneMinusSourceBlue:
-        return OpFSub(f32_id, one_f32, component(2));
+        return one_minus(component(2));
     default:
         LOG_CRITICAL(Render, "Unknown alpha modifier op {}", modifier);
         return one_f32;
@@ -1468,33 +1556,80 @@ Id FragmentModule::AppendColorCombiner(Pica::TexturingRegs::TevStageConfig::Oper
     const Id zero_vec{ConstF32(0.f, 0.f, 0.f)};
     Id color{};
 
+    // Where an input is known to be zero or one, the operation may come down to passing
+    // another input on as it is: games blend by the colour of lighting that is off, add a
+    // highlight that is not there. What is passed on needs no arithmetic and, if it was
+    // rounded, no rounding after it. These are exact: x * 1, x + 0 and a blend by a factor
+    // of 0 or 1 give x itself.
+    const u8 known_1 = KnownOf(color_results_1);
+    const u8 known_2 = KnownOf(color_results_2);
+    const u8 known_3 = KnownOf(color_results_3);
+    bool passed_on = false;
+    const auto pass_on = [&](Id input) {
+        color = input;
+        passed_on = true;
+    };
+    const auto zero = [&] { return Note(zero_vec, KnownZero | KnownRounded); };
+
     switch (operation) {
     case Operation::Replace:
-        color = color_results_1;
+        pass_on(color_results_1);
         break;
     case Operation::Modulate:
-        color = OpFMul(vec_ids.Get(3), color_results_1, color_results_2);
+        if ((known_1 | known_2) & KnownZero) {
+            pass_on(zero());
+        } else if (known_2 & KnownOne) {
+            pass_on(color_results_1);
+        } else if (known_1 & KnownOne) {
+            pass_on(color_results_2);
+        } else {
+            color = OpFMul(vec_ids.Get(3), color_results_1, color_results_2);
+        }
         break;
     case Operation::Add:
-        color = OpFAdd(vec_ids.Get(3), color_results_1, color_results_2);
+        if (known_2 & KnownZero) {
+            pass_on(color_results_1);
+        } else if (known_1 & KnownZero) {
+            pass_on(color_results_2);
+        } else {
+            color = OpFAdd(vec_ids.Get(3), color_results_1, color_results_2);
+        }
         break;
     case Operation::AddSigned:
         color = OpFSub(vec_ids.Get(3), OpFAdd(vec_ids.Get(3), color_results_1, color_results_2),
                        half_vec);
         break;
     case Operation::Lerp:
-        color = OpFMix(vec_ids.Get(3), color_results_2, color_results_1, color_results_3);
+        if (known_3 & KnownZero) {
+            pass_on(color_results_2);
+        } else if (known_3 & KnownOne) {
+            pass_on(color_results_1);
+        } else {
+            color = OpFMix(vec_ids.Get(3), color_results_2, color_results_1, color_results_3);
+        }
         break;
     case Operation::Subtract:
-        color = OpFSub(vec_ids.Get(3), color_results_1, color_results_2);
+        if (known_2 & KnownZero) {
+            pass_on(color_results_1);
+        } else {
+            color = OpFSub(vec_ids.Get(3), color_results_1, color_results_2);
+        }
         break;
     case Operation::MultiplyThenAdd:
-        color = OpFma(vec_ids.Get(3), color_results_1, color_results_2, color_results_3);
+        if ((known_1 | known_2) & KnownZero) {
+            pass_on(color_results_3);
+        } else {
+            color = OpFma(vec_ids.Get(3), color_results_1, color_results_2, color_results_3);
+        }
         break;
     case Operation::AddThenMultiply:
-        color = OpFMin(vec_ids.Get(3), OpFAdd(vec_ids.Get(3), color_results_1, color_results_2),
-                       one_vec);
-        color = OpFMul(vec_ids.Get(3), color, color_results_3);
+        if (known_3 & KnownZero) {
+            pass_on(zero());
+        } else {
+            color = OpFMin(vec_ids.Get(3), OpFAdd(vec_ids.Get(3), color_results_1, color_results_2),
+                           one_vec);
+            color = OpFMul(vec_ids.Get(3), color, color_results_3);
+        }
         break;
     case Operation::Dot3_RGB:
     case Operation::Dot3_RGBA:
@@ -1509,39 +1644,83 @@ Id FragmentModule::AppendColorCombiner(Pica::TexturingRegs::TevStageConfig::Oper
         break;
     }
 
-    // Clamp result to 0.0, 1.0
-    return OpFClamp(vec_ids.Get(3), color, zero_vec, one_vec);
+    // Clamp result to 0.0, 1.0, which leaves what is known of a value passed on as it is
+    const Id clamped{OpFClamp(vec_ids.Get(3), color, zero_vec, one_vec)};
+    return passed_on ? Note(clamped, KnownOf(color)) : clamped;
 }
 
 Id FragmentModule::AppendAlphaCombiner(TevStageConfig::Operation operation) {
     using Operation = TevStageConfig::Operation;
     Id color{};
 
+    // As for the colour: an operation that comes down to one of its inputs passes it on
+    const u8 known_1 = KnownOf(alpha_results_1);
+    const u8 known_2 = KnownOf(alpha_results_2);
+    const u8 known_3 = KnownOf(alpha_results_3);
+    bool passed_on = false;
+    const auto pass_on = [&](Id input) {
+        color = input;
+        passed_on = true;
+    };
+    const auto zero = [&] { return Note(ConstF32(0.f), KnownZero | KnownRounded); };
+
     switch (operation) {
     case Operation::Replace:
-        color = alpha_results_1;
+        pass_on(alpha_results_1);
         break;
     case Operation::Modulate:
-        color = OpFMul(f32_id, alpha_results_1, alpha_results_2);
+        if ((known_1 | known_2) & KnownZero) {
+            pass_on(zero());
+        } else if (known_2 & KnownOne) {
+            pass_on(alpha_results_1);
+        } else if (known_1 & KnownOne) {
+            pass_on(alpha_results_2);
+        } else {
+            color = OpFMul(f32_id, alpha_results_1, alpha_results_2);
+        }
         break;
     case Operation::Add:
-        color = OpFAdd(f32_id, alpha_results_1, alpha_results_2);
+        if (known_2 & KnownZero) {
+            pass_on(alpha_results_1);
+        } else if (known_1 & KnownZero) {
+            pass_on(alpha_results_2);
+        } else {
+            color = OpFAdd(f32_id, alpha_results_1, alpha_results_2);
+        }
         break;
     case Operation::AddSigned:
         color = OpFSub(f32_id, OpFAdd(f32_id, alpha_results_1, alpha_results_2), ConstF32(0.5f));
         break;
     case Operation::Lerp:
-        color = OpFMix(f32_id, alpha_results_2, alpha_results_1, alpha_results_3);
+        if (known_3 & KnownZero) {
+            pass_on(alpha_results_2);
+        } else if (known_3 & KnownOne) {
+            pass_on(alpha_results_1);
+        } else {
+            color = OpFMix(f32_id, alpha_results_2, alpha_results_1, alpha_results_3);
+        }
         break;
     case Operation::Subtract:
-        color = OpFSub(f32_id, alpha_results_1, alpha_results_2);
+        if (known_2 & KnownZero) {
+            pass_on(alpha_results_1);
+        } else {
+            color = OpFSub(f32_id, alpha_results_1, alpha_results_2);
+        }
         break;
     case Operation::MultiplyThenAdd:
-        color = OpFma(f32_id, alpha_results_1, alpha_results_2, alpha_results_3);
+        if ((known_1 | known_2) & KnownZero) {
+            pass_on(alpha_results_3);
+        } else {
+            color = OpFma(f32_id, alpha_results_1, alpha_results_2, alpha_results_3);
+        }
         break;
     case Operation::AddThenMultiply:
-        color = OpFMin(f32_id, OpFAdd(f32_id, alpha_results_1, alpha_results_2), ConstF32(1.f));
-        color = OpFMul(f32_id, color, alpha_results_3);
+        if (known_3 & KnownZero) {
+            pass_on(zero());
+        } else {
+            color = OpFMin(f32_id, OpFAdd(f32_id, alpha_results_1, alpha_results_2), ConstF32(1.f));
+            color = OpFMul(f32_id, color, alpha_results_3);
+        }
         break;
     default:
         color = ConstF32(0.f);
@@ -1549,7 +1728,8 @@ Id FragmentModule::AppendAlphaCombiner(TevStageConfig::Operation operation) {
         break;
     }
 
-    return OpFClamp(f32_id, color, ConstF32(0.f), ConstF32(1.f));
+    const Id clamped{OpFClamp(f32_id, color, ConstF32(0.f), ConstF32(1.f))};
+    return passed_on ? Note(clamped, KnownOf(color)) : clamped;
 }
 
 void FragmentModule::DefineArithmeticTypes() {
@@ -1601,8 +1781,8 @@ void FragmentModule::DefineEntryPoint() {
 
 void FragmentModule::DefineUniformStructs() {
     const Id light_src_struct_id{TypeStruct(vec_ids.Get(3), vec_ids.Get(3), vec_ids.Get(3),
-                                            vec_ids.Get(3), vec_ids.Get(3), vec_ids.Get(3), f32_id,
-                                            f32_id)};
+                                            vec_ids.Get(3), vec_ids.Get(3), f32_id, vec_ids.Get(3),
+                                            f32_id, f32_id)};
 
     const Id light_src_array_id{TypeArray(light_src_struct_id, ConstU32(NUM_LIGHTS))};
     const Id lighting_lut_array_id{TypeArray(ivec_ids.Get(4), ConstU32(NUM_LIGHTING_SAMPLERS / 4))};
@@ -1616,7 +1796,7 @@ void FragmentModule::DefineUniformStructs() {
         light_src_array_id, const_color_array_id, vec_ids.Get(4), vec_ids.Get(3),
         border_color_array_id, vec_ids.Get(4), border_color_array_id)};
 
-    constexpr std::array light_src_offsets{0u, 16u, 32u, 48u, 64u, 80u, 92u, 96u};
+    constexpr std::array light_src_offsets{0u, 16u, 32u, 48u, 64u, 76u, 80u, 92u, 96u};
     // The last member is tex_size, an array of the shape of the border colours
     constexpr std::array shader_data_offsets{0u,   4u,    8u,    12u,   16u,   20u,   24u,  28u,
                                              32u,  36u,   40u,   44u,   48u,   52u,   56u,  60u,

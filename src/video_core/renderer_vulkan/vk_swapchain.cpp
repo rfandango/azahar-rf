@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <utility>
 #include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
@@ -292,11 +293,36 @@ void Swapchain::SetSurfaceProperties() {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }
 
-    // Prefer identity transform if possible
+    // Where the panel lies turned, the images are made the way it lies and what is drawn
+    // into them is turned instead (see GetPreRotation). Otherwise upright if possible.
     transform = vk::SurfaceTransformFlagBitsKHR::eIdentity;
-    if (!(capabilities.supportedTransforms & transform)) {
+    pre_rotation = 0;
+    const bool turn_here =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::LegacyDisplayRotation) == 0;
+    if (turn_here && capabilities.currentTransform == vk::SurfaceTransformFlagBitsKHR::eRotate90) {
+        pre_rotation = 90;
+    } else if (turn_here &&
+               capabilities.currentTransform == vk::SurfaceTransformFlagBitsKHR::eRotate180) {
+        pre_rotation = 180;
+    } else if (turn_here &&
+               capabilities.currentTransform == vk::SurfaceTransformFlagBitsKHR::eRotate270) {
+        pre_rotation = 270;
+    }
+    if (pre_rotation != 0) {
+        transform = capabilities.currentTransform;
+        if (pre_rotation != 180) {
+            // The surface's size is given as it is seen, the images are as the panel lies
+            std::swap(extent.width, extent.height);
+        }
+    } else if (!(capabilities.supportedTransforms & transform)) {
         transform = capabilities.currentTransform;
     }
+    LOG_INFO(Render_Vulkan,
+             "Swapchain: the surface is {}x{} and its transform {}; images of {}x{}, what is "
+             "drawn into them turned by {} degrees",
+             capabilities.currentExtent.width, capabilities.currentExtent.height,
+             vk::to_string(capabilities.currentTransform), extent.width, extent.height,
+             pre_rotation);
 
     // Opaque is not supported everywhere.
     composite_alpha = vk::CompositeAlphaFlagBitsKHR::eOpaque;

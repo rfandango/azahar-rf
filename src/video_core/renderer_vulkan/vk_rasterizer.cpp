@@ -3,6 +3,7 @@
 // Refer to the LICENSE.txt file included.
 
 #include "common/alignment.h"
+#include "common/hitch_tracker.h"
 #include "common/literals.h"
 #include "common/logging/log.h"
 #include "common/math_util.h"
@@ -49,8 +50,21 @@ struct DrawParams {
     s32 vertex_offset;
     u32 binding_count;
     std::array<u32, 16> bindings;
+    u16 in_guest_memory; ///< See RasterizerVulkan::bindings_in_guest_memory
     bool is_indexed;
 };
+
+/// How many states of draws are kept (RasterizerVulkan::DrawSite), each in the one slot its
+/// hash comes to
+constexpr u32 DRAW_SITE_BITS = 12;
+
+/// The emulated memory for the host GPU to use where it is, if that is asked for
+[[nodiscard]] std::span<u8> PoolForGpu(Memory::MemorySystem& memory) {
+    if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyVertexCopies) != 0) {
+        return {};
+    }
+    return memory.GetHostPool();
+}
 
 [[nodiscard]] u64 TextureBufferSize(const Instance& instance) {
     // Use the smallest texel size from the texel views
@@ -79,9 +93,22 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
                      TextureBufferSize(instance)},
       texture_lf_buffer{instance, scheduler, vk::BufferUsageFlagBits::eUniformTexelBuffer,
                         TextureBufferSize(instance)},
+      guest_memory{instance, PoolForGpu(memory)},
+      in_place_data{
+          [this](PAddr addr, u32 size, bool watch) {
+              this->memory.RasterizerMarkRegionWatched(addr, size, watch);
+          },
+          (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureVertexData) != 0},
+      watch_data{(Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureVertexData) !=
+                 0},
       async_shaders{Settings::values.async_shader_compilation.GetValue()} {
 
     vertex_buffers.fill(stream_buffer.Handle());
+    // What the cache writes back into the emulated memory may be vertex or index data that a
+    // draw still on its way through the GPU reads there: a game can bring such data to where
+    // it draws from with a GPU copy, which lands in a surface first
+    res_cache.SetGuestWriteCallback(
+        [this](PAddr addr, u32 size) { WaitForDataInPlace(addr, size); });
 
     // Query uniform buffer alignment.
     uniform_buffer_alignment = instance.UniformMinAlignment();
@@ -114,7 +141,12 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
         .range = VK_WHOLE_SIZE,
     });
 
-    scheduler.RegisterOnSubmit([&renderpass_cache] { renderpass_cache.EndRendering(); });
+    scheduler.RegisterOnSubmit([this, &renderpass_cache] {
+        renderpass_cache.EndRendering();
+        if (watch_data) {
+            data_watch.OnSubmit();
+        }
+    });
 
     // Prepare the static buffer descriptor set.
     const auto buffer_set = pipeline_cache.Acquire(DescriptorHeapType::Buffer);
@@ -161,6 +193,12 @@ void RasterizerVulkan::TickFrame() {
     res_cache.TickFrame();
     runtime.FreeRetired();
     ++frame_count;
+    in_place_data.OnFrame();
+    if (watch_data) {
+        MasterSemaphore* const semaphore = scheduler.GetMasterSemaphore();
+        semaphore->Refresh();
+        data_watch.OnFrame(semaphore->KnownGpuTick());
+    }
 }
 
 void RasterizerVulkan::LoadDefaultDiskResources(
@@ -288,6 +326,10 @@ void RasterizerVulkan::SetupVertexArray() {
     layout.binding_count = 0;
     layout.attribute_count = 16;
     enable_attributes.fill(false);
+    bindings_in_guest_memory = 0;
+    if (watch_data) {
+        data_watch.NoteDraw();
+    }
 
     u32 buffer_offset = 0;
     for (const auto& loader : vertex_attributes.attribute_loaders) {
@@ -332,21 +374,49 @@ void RasterizerVulkan::SetupVertexArray() {
             base_address + loader.data_offset + (vs_input_index_min * loader.byte_count);
         const u32 vertex_num = vs_input_index_max - vs_input_index_min + 1;
         u32 data_size = loader.byte_count * vertex_num;
+        memory.NoteGpuReference(data_addr, data_size, Memory::GpuReference::VertexData);
         res_cache.FlushRegion(data_addr, data_size);
 
-        const MemoryRef src_ref = memory.GetPhysicalRef(data_addr);
-        if (src_ref.GetSize() < data_size) {
-            LOG_ERROR(Render_Vulkan,
-                      "Vertex buffer size {} exceeds available space {} at address {:#016X}",
-                      data_size, src_ref.GetSize(), data_addr);
-        }
-
-        const u8* src_ptr = src_ref.GetPtr();
+        // A plain pointer: a reference would count the memory's users up and down, with
+        // the bus locked, for every stream of every draw
+        // (From the copy that came with the command, for a page the game keeps writing:
+        // that is outside the emulated memory, and so not read in place below)
+        const u8* src_ptr = memory.GpuRead(data_addr, data_size);
         u8* dst_ptr = array_ptr + buffer_offset;
+
+        // Create the binding associated with this loader
+        VertexBinding& binding = layout.bindings[layout.binding_count];
+        binding.binding.Assign(layout.binding_count);
+        binding.fixed.Assign(0);
+        // Will be adjusted on pipeline build, to keep the info transferable.
+        binding.byte_count.Assign(loader.byte_count);
 
         // Align stride up if required by Vulkan implementation.
         const u32 aligned_stride =
             Common::AlignUp(static_cast<u32>(loader.byte_count), stride_alignment);
+
+        // With the emulated memory a buffer of the host GPU, the data is used where the game
+        // has it. Not if the device wants another stride than the game's, and not from an
+        // address the copy below would not put it at either: one that is no multiple of four,
+        // which a device may refuse for an attribute of that size.
+        std::optional<u32> in_place;
+        if (aligned_stride == loader.byte_count) {
+            in_place = guest_memory.Offset(src_ptr, data_size);
+            // And only what the game leaves alone: the GPU reads it later than now
+            if (in_place && (*in_place % 4 != 0 || !MayReadInPlace(data_addr, data_size))) {
+                in_place.reset();
+            }
+        }
+        if (watch_data) {
+            data_watch.NoteUse(src_ptr, data_size, false, in_place.has_value(),
+                               scheduler.CurrentTick());
+        }
+        if (in_place) {
+            bindings_in_guest_memory |= static_cast<u16>(1u << layout.binding_count);
+            binding_offsets[layout.binding_count++] = *in_place;
+            continue;
+        }
+
         if (aligned_stride == loader.byte_count) {
             std::memcpy(dst_ptr, src_ptr, data_size);
         } else {
@@ -355,13 +425,6 @@ void RasterizerVulkan::SetupVertexArray() {
                             loader.byte_count);
             }
         }
-
-        // Create the binding associated with this loader
-        VertexBinding& binding = layout.bindings[layout.binding_count];
-        binding.binding.Assign(layout.binding_count);
-        binding.fixed.Assign(0);
-        // Will be adjusted on pipeline build, to keep the info transferable.
-        binding.byte_count.Assign(loader.byte_count);
 
         // Keep track of the binding offsets so we can bind the vertex buffer later
         binding_offsets[layout.binding_count++] = static_cast<u32>(array_offset + buffer_offset);
@@ -435,10 +498,53 @@ void RasterizerVulkan::SetupFixedAttribs() {
     stream_buffer.Commit(offset);
 }
 
+void RasterizerVulkan::LookUpDrawSite() {
+    site = nullptr;
+    site_matches = false;
+    if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyDrawResolve) != 0) {
+        return;
+    }
+    if (draw_sites.empty()) {
+        draw_sites.resize(std::size_t{1} << DRAW_SITE_BITS);
+    }
+    const u64 shaping = ShapingHash();
+    const u64 code_hash = pica.vs_setup.GetProgramCodeHash();
+    const u64 swizzle_hash = pica.vs_setup.GetSwizzleDataHash();
+    const void* const shader_cache = pipeline_cache.DiskCacheIdentity();
+    const u64 slot =
+        (shaping ^ (code_hash * 0x9E3779B97F4A7C15ull) ^ (swizzle_hash * 0xC2B2AE3D27D4EB4Full)) *
+        0xD6E8FEB86659FD93ull;
+    DrawSite& entry = draw_sites[slot >> (64 - DRAW_SITE_BITS)];
+    site = &entry;
+
+    if (entry.filled && entry.shaping == shaping && entry.vs_code_hash == code_hash &&
+        entry.vs_swizzle_hash == swizzle_hash && entry.shader_cache == shader_cache &&
+        std::memcmp(&entry.user_config, &user_config, sizeof(user_config)) == 0) {
+        site_matches = true;
+        return;
+    }
+    entry = DrawSite{};
+    entry.filled = true;
+    entry.shaping = shaping;
+    entry.vs_code_hash = code_hash;
+    entry.vs_swizzle_hash = swizzle_hash;
+    entry.shader_cache = shader_cache;
+    entry.user_config = user_config;
+}
+
 bool RasterizerVulkan::SetupVertexShader() {
     MICROPROFILE_SCOPE(Vulkan_VS);
-    return pipeline_cache.UseProgrammableVertexShader(regs, pica.vs_setup,
-                                                      pipeline_info.state.vertex_layout);
+    if (site_matches && site->has_vs) {
+        pipeline_cache.RestoreShader(ProgramType::VS, site->vs);
+        return true;
+    }
+    const bool usable = pipeline_cache.UseProgrammableVertexShader(
+        regs, pica.vs_setup, pipeline_info.state.vertex_layout);
+    if (usable && site) {
+        site->vs = pipeline_cache.ChosenFor(ProgramType::VS);
+        site->has_vs = true;
+    }
+    return usable;
 }
 
 bool RasterizerVulkan::SetupGeometryShader() {
@@ -458,7 +564,16 @@ bool RasterizerVulkan::SetupGeometryShader() {
         return true;
     }
 
-    return pipeline_cache.UseFixedGeometryShader(regs);
+    if (site_matches && site->has_gs) {
+        pipeline_cache.RestoreShader(ProgramType::GS, site->gs);
+        return true;
+    }
+    const bool usable = pipeline_cache.UseFixedGeometryShader(regs);
+    if (usable && site) {
+        site->gs = pipeline_cache.ChosenFor(ProgramType::GS);
+        site->has_gs = true;
+    }
+    return usable;
 }
 
 bool RasterizerVulkan::AccelerateDrawBatch(bool is_indexed) {
@@ -481,21 +596,53 @@ bool RasterizerVulkan::AccelerateDrawBatch(bool is_indexed) {
 
     // Vertex data setup might involve scheduler flushes so perform it
     // early to avoid invalidating our state in the middle of the draw.
-    vertex_info = AnalyzeVertexArray(is_indexed, instance.GetMinVertexStrideAlignment());
+    LookUpDrawSite();
+
+    // The range of the indices is worked out by reading them all. A draw in a state seen
+    // before, whose indices were read in place then and have not been written since (the
+    // cache's own writing back included: that ends their being read in place), has the range
+    // it had.
+    bool scan = true;
+    if (is_indexed && site_matches && site->has_index_range) {
+        const PAddr index_addr = regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
+                                 regs.pipeline.index_array.offset;
+        const u32 index_size =
+            regs.pipeline.num_vertices * (regs.pipeline.index_array.format != 0 ? 2 : 1);
+        res_cache.FlushRegion(index_addr, index_size);
+        if (site->index_generation == in_place_data.Generation()) {
+            vertex_info = MakeVertexArrayInfo(site->index_min, site->index_max,
+                                              instance.GetMinVertexStrideAlignment());
+            scan = false;
+        }
+    }
+    if (scan) {
+        reading_draw_data = true;
+        vertex_info = AnalyzeVertexArray(is_indexed, instance.GetMinVertexStrideAlignment());
+        reading_draw_data = false;
+        if (site) {
+            site->has_index_range = false;
+            site->index_min = vertex_info.vs_input_index_min;
+            site->index_max = vertex_info.vs_input_index_max;
+        }
+    }
     if (vertex_info.Invalid()) {
         // Do not draw anything if the vertex array is invalid.
+        site = nullptr;
+        site_matches = false;
         return true;
     }
     SetupVertexArray();
 
-    if (!SetupVertexShader()) {
-        return false;
-    }
-    if (!SetupGeometryShader()) {
+    if (!SetupVertexShader() || !SetupGeometryShader()) {
+        site = nullptr;
+        site_matches = false;
         return false;
     }
 
-    return Draw(true, is_indexed);
+    const bool drawn = Draw(true, is_indexed);
+    site = nullptr;
+    site_matches = false;
+    return drawn;
 }
 
 bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
@@ -533,6 +680,7 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
         .vertex_offset = -static_cast<s32>(vertex_info.vs_input_index_min),
         .binding_count = pipeline_info.state.vertex_layout.binding_count,
         .bindings = binding_offsets,
+        .in_guest_memory = bindings_in_guest_memory,
         .is_indexed = is_indexed,
     };
 
@@ -540,7 +688,18 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
         std::array<vk::DeviceSize, 16> offsets;
         std::transform(params.bindings.begin(), params.bindings.end(), offsets.begin(),
                        [](u32 offset) { return static_cast<vk::DeviceSize>(offset); });
-        cmdbuf.bindVertexBuffers(0, params.binding_count, vertex_buffers.data(), offsets.data());
+        if (params.in_guest_memory != 0) {
+            std::array<vk::Buffer, 16> buffers = vertex_buffers;
+            for (u32 i = 0; i < params.binding_count; i++) {
+                if ((params.in_guest_memory >> i) & 1) {
+                    buffers[i] = guest_memory.Handle();
+                }
+            }
+            cmdbuf.bindVertexBuffers(0, params.binding_count, buffers.data(), offsets.data());
+        } else {
+            cmdbuf.bindVertexBuffers(0, params.binding_count, vertex_buffers.data(),
+                                     offsets.data());
+        }
         if (params.is_indexed) {
             cmdbuf.drawIndexed(params.vertex_count, 1, 0, params.vertex_offset, 0);
         } else {
@@ -589,9 +748,39 @@ void RasterizerVulkan::SetupIndexArray() {
     const u32 index_buffer_size = regs.pipeline.num_vertices * (native_u8 ? 1 : 2);
     const vk::IndexType index_type = native_u8 ? vk::IndexType::eUint8EXT : vk::IndexType::eUint16;
 
+    const PAddr index_addr =
+        regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() + regs.pipeline.index_array.offset;
     const u8* index_data =
-        memory.GetPhysicalPointer(regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
-                                  regs.pipeline.index_array.offset);
+        memory.GpuRead(index_addr, regs.pipeline.num_vertices * (index_u8 ? 1 : 2));
+    memory.NoteGpuReference(index_addr, regs.pipeline.num_vertices * (index_u8 ? 1 : 2),
+                            Memory::GpuReference::IndexData);
+
+    // The indices as the game has them, if the device can read them there
+    std::optional<u32> in_place;
+    if (!index_u8 || native_u8) {
+        in_place = guest_memory.Offset(index_data, index_buffer_size);
+        if (in_place &&
+            ((!index_u8 && *in_place % 2 != 0) || !MayReadInPlace(index_addr, index_buffer_size))) {
+            in_place.reset();
+        }
+    }
+    if (watch_data) {
+        data_watch.NoteUse(index_data, regs.pipeline.num_vertices * (index_u8 ? 1 : 2), true,
+                           in_place.has_value(), scheduler.CurrentTick());
+    }
+    // Read where they are, the indices cannot change without the watch hearing of it: from
+    // here on the range that was worked out for this draw holds until it does
+    if (site && !site->has_index_range) {
+        site->has_index_range = in_place.has_value();
+        site->index_generation = in_place_data.Generation();
+    }
+    if (in_place) {
+        scheduler.Record([buffer = guest_memory.Handle(), offset = *in_place,
+                          index_type](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindIndexBuffer(buffer, offset, index_type);
+        });
+        return;
+    }
 
     auto [index_ptr, index_offset, _] = stream_buffer.Map(index_buffer_size, 2);
 
@@ -684,15 +873,20 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     bound_target.depth = using_depth_fb;
     bound_target.valid = !shadow_rendering;
 
+    // Getting the target ready brings to it what the game filled its memory with. That is
+    // held back until the render pass begins, which can then clear instead of load.
+    renderpass_cache.SetClearDeferral(true);
     auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
     fb_helper.SetWrittenAttachments(needs_color_fb, needs_depth_fb);
     const Framebuffer* framebuffer = fb_helper.Framebuffer();
     if (!framebuffer->Handle()) {
+        renderpass_cache.SetClearDeferral(false);
         return true;
     }
 
     const auto draw_rect = fb_helper.DrawRect();
     if (draw_rect.GetArea() == 0) {
+        renderpass_cache.SetClearDeferral(false);
         return true;
     }
 
@@ -741,8 +935,20 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         !write_color_fb && !shadow_rendering &&
         (alpha_test.enable == 0 || alpha_test.func == Pica::FramebufferRegs::CompareFunc::Always) &&
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyColourlessShader) == 0;
-    pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value(), host_scissor,
-                                     color_unused);
+    if (site_matches && site->has_fs && site->fs_depth_from_viewport == depth_range.has_value() &&
+        site->fs_host_scissor == host_scissor && site->fs_color_unused == color_unused) {
+        pipeline_cache.RestoreShader(ProgramType::FS, site->fs);
+    } else {
+        pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value(), host_scissor,
+                                         color_unused);
+        if (site) {
+            site->fs = pipeline_cache.ChosenFor(ProgramType::FS);
+            site->has_fs = true;
+            site->fs_depth_from_viewport = depth_range.has_value();
+            site->fs_host_scissor = host_scissor;
+            site->fs_color_unused = color_unused;
+        }
+    }
     pipeline_info.dynamic_info.depth_min = depth_range ? depth_range->min_depth : 0.f;
     pipeline_info.dynamic_info.depth_max = depth_range ? depth_range->max_depth : 1.f;
 
@@ -781,9 +987,19 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         CITRA_FRAME_DUMP("{}", text);
     }
 #endif
+    if (framebuffer->color_id) {
+        // Where the colour target is written: its second image is kept up with it only there
+        Surface& color_target = res_cache.GetSurface(framebuffer->color_id);
+        if (shadow_rendering) {
+            color_target.NoteAllWritten();
+        } else {
+            color_target.NoteWritten(draw_rect);
+        }
+    }
     // The draw is confined to that rectangle. If it overwrites all of it and a render pass
     // begins with it, there is nothing in the rectangle for the pass to load.
     renderpass_cache.BeginRendering(framebuffer, draw_rect, overwrites_color, overwrites_depth);
+    renderpass_cache.SetClearDeferral(false);
 
     // Configure viewport and scissor
     const auto viewport = fb_helper.Viewport();
@@ -845,10 +1061,27 @@ bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyAttachments) == 0;
 
     const auto pica_textures = regs.texturing.GetTextures();
-    const bool use_cube_heap =
-        pica_textures[0].enabled && pica_textures[0].config.type == TextureType::ShadowCube;
-    const auto texture_set = pipeline_cache.Acquire(use_cube_heap ? DescriptorHeapType::Texture
-                                                                  : DescriptorHeapType::Texture);
+
+    // What each binding of the set is to hold is gathered first. Most draws ask for what the
+    // draw before them had, and then that draw's set is used again instead of a new one being
+    // taken and written; the writing alone was 2% of the emulation thread in one game. Not
+    // with a cube in unit 0, which fills its bindings itself and needs the set for that.
+    const bool cube =
+        pica_textures[0].enabled && (pica_textures[0].config.type == TextureType::ShadowCube ||
+                                     pica_textures[0].config.type == TextureType::TextureCube);
+    std::array<TextureBinding, 4> wanted{};
+    bool reusable = !cube;
+    vk::DescriptorSet texture_set{};
+    if (cube) {
+        texture_set = pipeline_cache.Acquire(DescriptorHeapType::Texture);
+    }
+    const auto bind = [&](u32 binding, vk::ImageView view, vk::Sampler sampler) {
+        if (cube) {
+            update_queue.AddImageSampler(texture_set, binding, 0, view, sampler);
+        } else {
+            wanted[binding] = TextureBinding{view, sampler};
+        }
+    };
 
     for (u32 texture_index = 0; texture_index < pica_textures.size(); ++texture_index) {
         const auto& texture = pica_textures[texture_index];
@@ -860,24 +1093,20 @@ bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
             case TextureType::ShadowCube: {
                 const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_CUBE_ID);
                 if (instance.IsNullDescriptorSupported()) {
-                    update_queue.AddImageSampler(texture_set, texture_index, 0, vk::ImageView{},
-                                                 null_sampler.Handle());
+                    bind(texture_index, vk::ImageView{}, null_sampler.Handle());
                 } else {
                     Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_CUBE_ID);
-                    update_queue.AddImageSampler(texture_set, texture_index, 0,
-                                                 null_surface.ImageView(), null_sampler.Handle());
+                    bind(texture_index, null_surface.ImageView(), null_sampler.Handle());
                 }
                 break;
             }
             default: {
                 const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_ID);
                 if (instance.IsNullDescriptorSupported()) {
-                    update_queue.AddImageSampler(texture_set, texture_index, 0, vk::ImageView{},
-                                                 null_sampler.Handle());
+                    bind(texture_index, vk::ImageView{}, null_sampler.Handle());
                 } else {
                     Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
-                    update_queue.AddImageSampler(texture_set, texture_index, 0,
-                                                 null_surface.ImageView(), null_sampler.Handle());
+                    bind(texture_index, null_surface.ImageView(), null_sampler.Handle());
                 }
                 break;
             }
@@ -890,12 +1119,21 @@ bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
             switch (texture.config.type.Value()) {
             case TextureType::Shadow2D: {
                 Surface& surface = res_cache.GetTextureSurface(texture);
+                // The shader looks the shadow map up by texel, and is told its size
+                const auto shadow_extent = surface.RealExtent();
+                const Common::Vec4f shadow_size{static_cast<f32>(shadow_extent.width),
+                                                static_cast<f32>(shadow_extent.height),
+                                                1.f / static_cast<f32>(shadow_extent.width),
+                                                1.f / static_cast<f32>(shadow_extent.height)};
+                if (fs_data.tex_size[texture_index] != shadow_size) {
+                    fs_data.tex_size[texture_index] = shadow_size;
+                    fs_data_dirty = true;
+                }
                 // The shader gathers the texels, which hold depths as integers: a sampler
                 // that filters has no business with those
                 Sampler& sampler = res_cache.GetSampler(texture.config, true);
                 surface.flags |= VideoCore::SurfaceFlagBits::ShadowSource;
-                update_queue.AddImageSampler(texture_set, texture_index, 0, surface.StorageView(),
-                                             sampler.Handle());
+                bind(texture_index, surface.StorageView(), sampler.Handle());
                 continue;
             }
             case TextureType::ShadowCube: {
@@ -937,14 +1175,16 @@ bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
             CITRA_FRAME_DUMP("  vk tex{} is the colour target, all overwritten: the target moves "
                              "to its other image",
                              texture_index);
+            reusable = false;
             swapped_sample_view = surface.SwapForOverwrite(draw_rect);
             swapped_color_view = surface.FramebufferView();
             texture_view = swapped_sample_view;
         } else {
             CITRA_FRAME_DUMP("  vk tex{} is the colour target: sampling a copy", texture_index);
+            reusable = false;
             texture_view = surface.CopyImageView();
         }
-        update_queue.AddImageSampler(texture_set, texture_index, 0, texture_view, sampler.Handle());
+        bind(texture_index, texture_view, sampler.Handle());
     }
 
     if ((pipeline_info.state.blending.rgb_blend_emulation ||
@@ -952,9 +1192,29 @@ bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
         framebuffer->color_id) {
         const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SAMPLER_ID);
         Surface& color_surface = res_cache.GetSurface(framebuffer->color_id);
+        reusable = false;
         CITRA_FRAME_DUMP("  vk blend emulation: shader reads a copy of the colour target");
-        update_queue.AddImageSampler(texture_set, 3, 0, color_surface.CopyImageView(),
-                                     null_sampler.Handle());
+        bind(3, color_surface.CopyImageView(), null_sampler.Handle());
+    }
+    if (cube) {
+        last_texture_set.valid = false;
+    } else {
+        const u64 tick = scheduler.CurrentTick();
+        const bool same =
+            reusable && last_texture_set.valid && last_texture_set.tick == tick &&
+            last_texture_set.bindings == wanted &&
+            (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyTextureSets) == 0;
+        if (!same) {
+            texture_set = pipeline_cache.Acquire(DescriptorHeapType::Texture);
+            for (u32 binding = 0; binding < 3; binding++) {
+                update_queue.AddImageSampler(texture_set, binding, 0, wanted[binding].view,
+                                             wanted[binding].sampler);
+            }
+            if (wanted[3].sampler) {
+                update_queue.AddImageSampler(texture_set, 3, 0, wanted[3].view, wanted[3].sampler);
+            }
+            last_texture_set = LastTextureSet{wanted, tick, reusable};
+        }
     }
     return static_cast<bool>(swapped_color_view);
 }
@@ -1042,17 +1302,56 @@ void RasterizerVulkan::FlushAll() {
     res_cache.FlushAll();
 }
 
+void RasterizerVulkan::SubmitPendingWork() {
+    scheduler.Flush();
+}
+
 void RasterizerVulkan::FlushRegion(PAddr addr, u32 size) {
+    if (!reading_draw_data) {
+        in_place_data.OnRead(addr, size);
+        if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureCommandLists) !=
+                0 &&
+            res_cache.HoldsNewer(addr, size)) [[unlikely]] {
+            Common::Hitches::NoteGpuCall(Common::Hitches::GpuCall::MemoryReadNewer);
+        }
+        if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyCachedPageReads) ==
+            0) {
+            res_cache.NoteCpuRead(addr, size);
+        }
+        res_cache.NoteReadbackForGame(addr, size);
+    }
     res_cache.FlushRegion(addr, size);
+}
+
+bool RasterizerVulkan::MayReadInPlace(PAddr addr, u32 size) {
+    return in_place_data.Use(addr, size, scheduler.CurrentTick());
+}
+
+void RasterizerVulkan::WaitForDataInPlace(PAddr addr, u32 size) {
+    const u64 tick =
+        in_place_data.OnWrite(addr, size, scheduler.GetMasterSemaphore()->KnownGpuTick());
+    if (tick == 0) {
+        return;
+    }
+    // A draw the GPU is not through with reads what is about to be written, where it is
+    const auto start = std::chrono::steady_clock::now();
+    scheduler.Wait(tick);
+    in_place_data.NoteWait(std::chrono::steady_clock::now() - start);
 }
 
 void RasterizerVulkan::InvalidateRegion(PAddr addr, u32 size) {
     bound_target.valid = false;
+    if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureCommandLists) != 0 &&
+        res_cache.TouchesSurface(addr, size)) [[unlikely]] {
+        Common::Hitches::NoteGpuCall(Common::Hitches::GpuCall::MemoryWriteSurface);
+    }
+    WaitForDataInPlace(addr, size);
     res_cache.InvalidateRegion(addr, size);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(PAddr addr, u32 size) {
     bound_target.valid = false;
+    WaitForDataInPlace(addr, size);
     res_cache.FlushRegion(addr, size);
     res_cache.InvalidateRegion(addr, size);
 }
@@ -1060,6 +1359,7 @@ void RasterizerVulkan::FlushAndInvalidateRegion(PAddr addr, u32 size) {
 void RasterizerVulkan::ClearAll(bool flush) {
     bound_target.valid = false;
     res_cache.ClearAll(flush);
+    in_place_data.Reset();
 }
 
 bool RasterizerVulkan::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {

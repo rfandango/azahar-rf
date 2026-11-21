@@ -127,6 +127,115 @@ enum Experiment2 : std::uint32_t {
     /// A title that asks for the New 3DS's 804 MHz processor clock gets all of that emulated
     /// CPU time whether the host can deliver it in real time or not, as before
     FixedProcessorClock = 512,
+    /// Work nobody sees: a draw counts as writing and reading all of its target and all of
+    /// each texture, as before, not only the rows its viewport and scissor confine it to
+    LegacyWholeTargetWork = 1024,
+    /// Vulkan: a fill that is brought to a target as a draw gets it ready is a clear by
+    /// itself, which the render pass of the draw then loads, as before; the pass does not
+    /// do it as it begins
+    LegacyClearBeforePass = 8192,
+    /// Fragment shaders round every combiner stage's result and the final colour to 1/255
+    /// also where the value is rounded already, as before. Shaders made with this are kept
+    /// apart and in memory only.
+    LegacyStageRounding = 16384,
+    /// Every system call is timed and every switch between emulated cores sets process, page
+    /// table and recompiler anew, as before
+    LegacyEmulationOverheads = 65536,
+    /// The recompiler's dispatcher calls out for the block of every guest return and
+    /// indirect branch, as before, without looking in its table of recent ones first. Read
+    /// when a recompiler is set up.
+    LegacyDispatcher = 131072,
+    /// The recompiled code looks every address up in the page table, as before, also where
+    /// it would reach the emulated memory through the host's own address translation, a
+    /// second view of each emulated address space (Common::AddressSpaceView): Android on
+    /// arm64. Read when the emulated system is set up.
+    LegacyMemoryAccess = 262144,
+    /// Every read the game makes on a page a texture or target is cached on is announced to
+    /// the rasterizer, as before, also where it holds nothing newer than the emulated memory
+    /// (VideoCore::RasterizerCache::NoteCpuRead)
+    LegacyCachedPageReads = 4194304,
+    /// Every draw looks its render target up in the cache, as before, also one into the
+    /// target of the draw before it (VideoCore::RasterizerCache::GetFramebufferSurfaces)
+    LegacyTargetLookup = 8388608,
+    /// Every draw looks each of its textures up in the cache, as before, also one that was
+    /// looked up this frame with the cache as it still is
+    /// (VideoCore::RasterizerCache::GetTextureSurface)
+    LegacyTextureLookup = 16777216,
+    /// Vulkan: every draw has its pipeline looked up by the hash of all its state, as
+    /// before, also one that asks for the pipeline the draw before it used
+    LegacyPipelineLookup = 33554432,
+    /// Vulkan: every draw takes a descriptor set for its textures and writes it, as before,
+    /// also one whose texture units hold what the draw before it had
+    LegacyTextureSets = 134217728,
+    /// Every write the game makes on a page a surface is cached on is announced to the
+    /// rasterizer, as before, also one that touches nothing a surface covers
+    /// (Memory::MemorySystem::RasterizerSetSurfaceCells)
+    LegacyWriteAnnouncements = 268435456,
+    /// Vulkan: every draw has its shaders looked up from the registers and its index data
+    /// scanned, as before, also one whose registers are as they were for a draw before it
+    /// (RasterizerVulkan::DrawSite)
+    LegacyDrawResolve = 536870912,
+    /// The command lists, fills and transfers a game sends are decoded on the emulation
+    /// thread, where the game hands them over, as before; not on a thread of their own while
+    /// the game goes on (VideoCore::GPU::Submit). Read when the emulated GPU is set up.
+    LegacyGpuDecoding = 1073741824,
+    /// With the decoder thread: the game gets the interrupt that says a command is done when
+    /// the host is done with it, not when it hands the command over. As it is otherwise, the
+    /// game is told at hand-over, with the delay the command at that place of its frame took
+    /// the frame before, and the decoding goes on behind it: a game that waits for "done"
+    /// before it goes on works on its next frame while the last is decoded. The bytes of a
+    /// command list are copied at hand-over, and what the decoder reads or writes cannot be
+    /// touched without waiting for it, or is copied as well where the game keeps writing it
+    /// (Memory::MemorySystem::ArmGpuReferences). Read when the emulated GPU is set up.
+    LateGpuCompletion = 2147483648,
+    /// For measuring. Every command list, sent or called from one, is compared with what
+    /// was at its address the time before, and every read and write the game makes on a
+    /// cached page is looked up in the cache, for the lines "command lists", "lists called
+    /// from them" and "of those" of the hitch summary. Costs a few percent of the emulation
+    /// thread.
+    MeasureCommandLists = 67108864,
+    /// Vulkan: every draw copies its vertex and index data to a buffer of the renderer, as
+    /// before, also where the emulated system's memory is a buffer of the host GPU as well,
+    /// the same pages for both as on the console, and a draw takes the data from where the
+    /// game has it (Vulkan::GuestMemory, Vulkan::InPlaceData): Android on arm64. Read when
+    /// the emulated system and the renderer are set up.
+    LegacyVertexCopies = 524288,
+    /// For measuring. Vulkan: counts how much of the vertex and index data of its draws
+    /// the game writes anew from frame to frame, and how much of it before the host GPU has
+    /// drawn with it, which is what a draw that takes it in place would get wrong
+    /// (Vulkan::GuestDataWatch). A line in the log every ten seconds.
+    MeasureVertexData = 1048576,
+    /// Vulkan: every readback of a small render target waits for the host GPU, as before,
+    /// also one the game reads every frame (VideoCore::RasterizerCache::ServeLateReadbacks).
+    LegacySmallReadbacks = 2097152,
+    /// Vulkan, with multisampling: the fragment shader runs once a pixel, not once a
+    /// sample. Read when a pipeline is built.
+    NoSampleShading = 32768,
+    /// For measuring, the picture may be wrong. Vulkan: no render pass loads what its
+    /// attachments hold, which tells what the loads cost a GPU that renders in tiles
+    NoAttachmentLoads = 2048,
+    /// For measuring, the picture may be wrong. Vulkan: no render pass stores depth and
+    /// stencil
+    NoDepthStores = 4096,
+};
+
+/// A third word of them (`debug.azahar.experiment3`): the first two are full.
+enum Experiment3 : std::uint32_t {
+    /// A game that draws its scene twice, a part of a pixel apart, and blends the two images
+    /// (its own anti-aliasing) has both passes drawn, as before, also above the console's
+    /// resolution. See Pica::PicaCore::TwinPass.
+    KeepSecondScenePass = 1,
+    /// For finding out why a scene drawn twice is not taken for one: the first draw of a
+    /// second pass that is not like its counterpart in the first is described in the log
+    /// (a dozen times).
+    ExplainScenePasses = 2,
+    /// Vulkan: a blit between two surfaces is recorded when the game asks for it, as before,
+    /// also one that fills all of its destination (Vulkan::TextureRuntime::BlitTextures).
+    LegacyTransfers = 4,
+    /// Vulkan: the swapchain's images are upright and the compositor turns them, as before,
+    /// also where the display's panel lies turned (Vulkan::Swapchain::GetPreRotation). Read
+    /// when a swapchain is made.
+    LegacyDisplayRotation = 8,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as
@@ -143,6 +252,8 @@ struct InjectedStall {
 std::uint32_t Experiments();
 /// Currently active Experiment2 flags.
 std::uint32_t Experiments2();
+/// Currently active Experiment3 flags.
+std::uint32_t Experiments3();
 /// The hold-up currently asked for.
 InjectedStall Stall();
 #else
@@ -150,6 +261,9 @@ constexpr std::uint32_t Experiments() {
     return 0;
 }
 constexpr std::uint32_t Experiments2() {
+    return 0;
+}
+constexpr std::uint32_t Experiments3() {
     return 0;
 }
 constexpr InjectedStall Stall() {

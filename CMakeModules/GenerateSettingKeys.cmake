@@ -51,6 +51,7 @@ foreach(KEY IN ITEMS
     "use_display_refresh_rate_detection"
     "use_shader_jit"
     "resolution_factor"
+    "dynamic_resolution"
     "antialiasing"
     "frame_limit"
     "turbo_limit"

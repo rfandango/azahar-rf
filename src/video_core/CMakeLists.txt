@@ -53,6 +53,7 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     pica/vertex_loader.cpp
     pica/vertex_loader.h
     rasterizer_cache/framebuffer_base.h
+    rasterizer_cache/node_pool.h
     rasterizer_cache/pixel_format.cpp
     rasterizer_cache/pixel_format.h
     rasterizer_cache/rasterizer_cache.cpp
@@ -174,6 +175,8 @@ if (ENABLE_VULKAN)
         renderer_vulkan/vk_descriptor_update_queue.h
         renderer_vulkan/vk_graphics_pipeline.cpp
         renderer_vulkan/vk_graphics_pipeline.h
+        renderer_vulkan/vk_guest_memory.cpp
+        renderer_vulkan/vk_guest_memory.h
         renderer_vulkan/vk_master_semaphore.cpp
         renderer_vulkan/vk_master_semaphore.h
         renderer_vulkan/vk_memory_util.cpp

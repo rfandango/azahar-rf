@@ -81,6 +81,10 @@ public:
     void NotifySurfaceChanged(bool second) override;
 
     void SwapBuffers() override;
+    void ComposeFrame(u64 vblank) override;
+    bool ComposesApart() const override {
+        return true;
+    }
     void TryPresent(int timeout_ms, bool is_secondary) override {}
 
 private:
@@ -91,9 +95,15 @@ private:
     void ConfigureFramebufferTexture(TextureInfo& texture,
                                      const Pica::FramebufferConfig& framebuffer);
     void ConfigureRenderPipeline();
+    /// Composes the image of the VBlank `composing_vblank` and hands it to the window
+    void Compose();
+    u64 composing_vblank{};
+    /// By how many degrees the frame being drawn is turned, see Swapchain::GetPreRotation
+    u32 frame_rotation{};
     void PrepareRendertarget();
     void LimitFramesAheadOfGpu() override;
     bool AlwaysLimitsFramesAheadOfGpu() const override;
+    std::optional<std::chrono::nanoseconds> TakeGpuTime(bool wanted) override;
     void RenderScreenshot();
     void RenderScreenshotWithStagingCopy();
     bool TryRenderScreenshotWithHostMemory();
