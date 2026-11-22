@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <span>
@@ -13,6 +14,7 @@
 #include <boost/container/small_vector.hpp>
 #include "common/common_types.h"
 #include "common/file_util.h"
+#include "common/thread_worker.h"
 
 namespace Core {
 
@@ -26,12 +28,17 @@ namespace Core {
  * was at the same address are harmless, and several are kept per location.
  *
  * A file is only read back by a build with the recompiler that wrote it.
+ *
+ * The file is written by a thread of its own. The storage of a phone can hold a single write
+ * for many seconds (13.8 s were seen for a quarter of a megabyte), and the thread that keeps a
+ * block is the one that runs the game.
  */
 class JitCodeCache {
 public:
     /// `host_mmu`: whether the recompiler is set up for host MMU access, which makes for
     /// other code: what is kept of one kind is not taken for the other
     JitCodeCache(u64 program_id, bool host_mmu);
+    /// Waits until everything is in the file
     ~JitCodeCache();
 
     JitCodeCache(const JitCodeCache&) = delete;
@@ -48,7 +55,8 @@ public:
     /// Keeps a block for the location.
     void Store(u64 location, std::span<const std::byte> block);
 
-    /// Writes the blocks that are not in the file yet.
+    /// Hands the blocks that are not in the file yet to the thread that writes it. Does not
+    /// wait for the storage.
     void Flush();
 
 private:
@@ -60,6 +68,8 @@ private:
     void Load();
     bool ParseRecords();
     void LogActivity(std::chrono::steady_clock::time_point now);
+    /// On the writer's thread: writes the file from scratch with these records, or adds them
+    void WriteOut(std::span<const std::byte> records, bool whole_file);
 
     u64 program_id;
     bool host_mmu;
@@ -69,14 +79,24 @@ private:
     std::vector<std::byte> data;
     std::unordered_map<u64, boost::container::small_vector<Entry, 1>> entries;
 
-    /// How much of data the file holds, and whether the file has to be written from scratch
+    /// How much of data was handed to the writer, and whether the file has to be written from
+    /// scratch
     std::size_t flushed_size{};
     bool rewrite_file{true};
-    /// The file, open for adding to it from the moment it was read or written anew: opening
-    /// it can take long on some storage
-    FileUtil::IOFile append_file;
     bool full{};
     std::chrono::steady_clock::time_point last_flush{};
+
+    // The writer's side
+    /// The file, open for adding to it from the moment it was read or written anew: opening
+    /// it can take long on some storage. The writer's alone once the first request is queued.
+    FileUtil::IOFile append_file;
+    /// Adding to the file failed: requests to add more are passed over until one writes the
+    /// file from scratch
+    bool writer_needs_whole{};
+    /// From the writer: adding to the file failed, it has to be written from scratch
+    std::atomic_bool append_failed{};
+    /// From the writer: writing the file from scratch failed, nothing more is kept
+    std::atomic_bool write_gave_up{};
 
     // What happened since the last log line
     u64 last_found_location{};
@@ -85,6 +105,9 @@ private:
     u32 replaced{};
     u32 stored{};
     std::chrono::steady_clock::time_point last_log{};
+
+    /// The last member: its thread ends before what its requests work on
+    Common::ThreadWorker writer{1, "JitCodeWriter"};
 };
 
 } // namespace Core

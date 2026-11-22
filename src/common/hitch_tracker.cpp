@@ -275,6 +275,9 @@ std::atomic<u32> audio_next{0};
 std::atomic<u32> audio_sample_rate{0};
 /// Time other threads waited in AnyThread scopes since the last VBlank
 std::atomic<Nanos> foreign_stall{0};
+/// Whether the app has the emulation paused, and whether it let it go on since the last VBlank
+std::atomic_bool app_paused{false};
+std::atomic_bool app_resumed{false};
 
 struct OpenScope {
     Category category;
@@ -1181,6 +1184,13 @@ u32 CurrentGameFrame() {
     return game_frame_seq.load(std::memory_order_relaxed);
 }
 
+void NotePaused(bool paused) {
+    app_paused.store(paused, std::memory_order_relaxed);
+    if (!paused) {
+        app_resumed.store(true, std::memory_order_relaxed);
+    }
+}
+
 void EndVBlank() {
     ThreadState& ts = thread_state;
     if (!IsEnabled()) {
@@ -1207,8 +1217,26 @@ void EndVBlank() {
     const Nanos pipeline_stall = foreign_stall.exchange(0, std::memory_order_relaxed);
     const u32 game_frame = game_frame_seq.load(std::memory_order_relaxed);
 
+    const bool by_the_app = app_resumed.exchange(false, std::memory_order_relaxed) ||
+                            app_paused.load(std::memory_order_relaxed);
     if (wall >= DISCONTINUITY) {
-        // Paused, or the app was in the background
+        // Paused, the app was in the background, a state was loaded, or something on the host
+        // held the thread. Not a hitch to count, but said: a standstill nobody asked for has to
+        // be found in the log, and how long the thread ran tells waiting from working.
+        if (by_the_app) {
+            LOG_INFO(Common, "Emulation stood still for {:.1f} s, paused by the app", wall / 1e9);
+        } else if (cpu >= 0 && cpu_used >= wall / 2) {
+            // Loading a state, as a rule
+            LOG_INFO(Common,
+                     "Emulation stood still for {:.1f} s without the app pausing it, its thread "
+                     "at work for {:.0f} ms of that",
+                     wall / 1e9, cpu_used / 1e6);
+        } else {
+            LOG_WARNING(Common,
+                        "Emulation stood still for {:.1f} s without the app pausing it: its "
+                        "thread ran for {:.0f} ms of that and waited for the rest",
+                        wall / 1e9, cpu < 0 ? 0.0 : cpu_used / 1e6);
+        }
         ResetFrame(ts);
         ts.last_game_frame = game_frame;
         ts.skip_frame = true;

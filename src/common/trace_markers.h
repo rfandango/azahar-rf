@@ -236,6 +236,10 @@ enum Experiment3 : std::uint32_t {
     /// also where the display's panel lies turned (Vulkan::Swapchain::GetPreRotation). Read
     /// when a swapchain is made.
     LegacyDisplayRotation = 8,
+    /// For seeing that the game does not wait for its storage: every write of the recompiled
+    /// code that is kept (Core::JitCodeCache) is held for five seconds first, as a storage
+    /// that stalls would.
+    SlowCodeStorage = 16,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as

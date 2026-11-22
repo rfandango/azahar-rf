@@ -266,6 +266,10 @@ u32 CurrentGameFrame();
 /// Called once per VBlank on the emulation thread, which is how that thread is recognised.
 void EndVBlank();
 
+/// The app paused the emulation, or let it go on. Any thread. The log says of every standstill
+/// of the emulation whether the app asked for it.
+void NotePaused(bool paused);
+
 /// Whether the presentation backend reports when images reached the display, the refresh
 /// period of that display, and how images are queued for it (a string literal, for display).
 void SetDisplayTiming(bool available, std::chrono::nanoseconds refresh_period,

@@ -63,9 +63,20 @@ file(GLOB_RECURSE RECOMPILER_FILES CONFIGURE_DEPENDS
 )
 list(SORT RECOMPILER_FILES)
 set(COMBINED "")
+# The store itself decides nothing about the code that is kept, and its file has a version of
+# its own (FILE_VERSION): a change to how the file is written must not throw away what every
+# title has gathered. Its two sources stand in the hash with the sums they had when they were
+# taken out of it, which left the hash as it was.
+set(RECOMPILER_STORE_SUM_jit_code_cache.cpp "e33e6f25e1cc32e814d73b657b2ad3bf")
+set(RECOMPILER_STORE_SUM_jit_code_cache.h "014b5cd2fb3d16c3fc87a2e5dad67118")
 foreach (F IN LISTS RECOMPILER_FILES)
-    file(MD5 "${F}" TMP)
     file(RELATIVE_PATH NAME "${CMAKE_SOURCE_DIR}" "${F}")
+    get_filename_component(BASENAME "${F}" NAME)
+    if (NAME MATCHES "^src/core/arm/dynarmic/" AND DEFINED RECOMPILER_STORE_SUM_${BASENAME})
+        set(TMP "${RECOMPILER_STORE_SUM_${BASENAME}}")
+    else()
+        file(MD5 "${F}" TMP)
+    endif()
     string(APPEND COMBINED "${NAME}=${TMP}\n")
 endforeach()
 get_cmake_property(RECOMPILER_OPTIONS CACHE_VARIABLES)

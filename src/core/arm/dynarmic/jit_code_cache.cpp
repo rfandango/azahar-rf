@@ -4,12 +4,14 @@
 
 #include <cstring>
 #include <string_view>
+#include <thread>
 #include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/file_util.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/scm_rev.h"
+#include "common/trace_markers.h"
 #include "core/arm/dynarmic/jit_code_cache.h"
 
 namespace Core {
@@ -23,6 +25,8 @@ constexpr u32 FILE_VERSION = 1;
 /// Blocks are written to the file when this much has gathered, or after this long
 constexpr std::size_t FLUSH_SIZE = 256 * 1024;
 constexpr std::chrono::seconds FLUSH_INTERVAL{3};
+/// A write that takes longer is worth a line in the log
+constexpr std::chrono::milliseconds SLOW_WRITE{100};
 /// Nothing more is kept beyond this size
 constexpr std::size_t MAX_SIZE = 256 * 1024 * 1024;
 /// Blocks kept per location: code of other programs or modules at the same address
@@ -70,10 +74,21 @@ JitCodeCache::JitCodeCache(u64 program_id_, bool host_mmu_)
     : program_id{program_id_}, host_mmu{host_mmu_}, path{CachePath(program_id)} {
     Load();
     last_flush = last_log = std::chrono::steady_clock::now();
+    if (rewrite_file && !data.empty()) {
+        // A file whose end was cut off is written from scratch now, while the game is
+        // starting: all of it is copied for the writer, which is not for the middle of a game
+        Flush();
+    }
 }
 
 JitCodeCache::~JitCodeCache() {
     Flush();
+    writer.WaitForRequests();
+    if (append_failed.load()) {
+        // The last addition failed: from scratch, then
+        Flush();
+        writer.WaitForRequests();
+    }
 }
 
 void JitCodeCache::Load() {
@@ -212,15 +227,44 @@ void JitCodeCache::Store(u64 location, std::span<const std::byte> block) {
 
 void JitCodeCache::Flush() {
     last_flush = std::chrono::steady_clock::now();
+    if (write_gave_up.load(std::memory_order_relaxed)) {
+        full = true;
+        return;
+    }
+    if (append_failed.exchange(false)) {
+        // What the file holds now is unknown: written from scratch
+        rewrite_file = true;
+    }
     if (flushed_size == data.size() && !rewrite_file) {
         return;
     }
 
-    if (rewrite_file) {
+    // A copy for the writer, as data moves when it grows: a quarter of a megabyte as a rule,
+    // all of it only where the file is written from scratch
+    const std::size_t from = rewrite_file ? 0 : flushed_size;
+    std::vector<std::byte> records(data.begin() + static_cast<std::ptrdiff_t>(from), data.end());
+    writer.QueueWork([this, records = std::move(records), whole_file = rewrite_file] {
+        WriteOut(records, whole_file);
+    });
+    rewrite_file = false;
+    flushed_size = data.size();
+}
+
+void JitCodeCache::WriteOut(std::span<const std::byte> records, bool whole_file) {
+    if (write_gave_up.load(std::memory_order_relaxed) || (!whole_file && writer_needs_whole)) {
+        // Nothing more is written, or the request that writes the file from scratch follows
+        return;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    if (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::SlowCodeStorage) {
+        std::this_thread::sleep_for(std::chrono::seconds{5});
+    }
+    if (whole_file) {
         append_file.Close();
         if (!FileUtil::CreateFullPath(path)) {
             LOG_ERROR(Core_ARM11, "Could not create the directory of {}", path);
-            full = true;
+            write_gave_up = true;
             return;
         }
         // The file stays open: what comes later is added through the same handle
@@ -233,30 +277,38 @@ void JitCodeCache::Flush() {
         };
         if (!append_file.IsOpen() ||
             append_file.WriteBytes(&header, sizeof(header)) != sizeof(header) ||
-            append_file.WriteBytes(data.data(), data.size()) != data.size() ||
+            append_file.WriteBytes(records.data(), records.size()) != records.size() ||
             !append_file.Flush()) {
             LOG_ERROR(Core_ARM11, "Could not write {}", path);
             append_file.Close();
-            full = true;
+            write_gave_up = true;
             return;
         }
-        rewrite_file = false;
+        writer_needs_whole = false;
     } else {
         if (!append_file.IsOpen()) {
             append_file = FileUtil::IOFile{path, "ab"};
         }
-        const std::size_t size = data.size() - flushed_size;
         if (!append_file.IsOpen() ||
-            append_file.WriteBytes(data.data() + flushed_size, size) != size ||
+            append_file.WriteBytes(records.data(), records.size()) != records.size() ||
             !append_file.Flush()) {
             LOG_ERROR(Core_ARM11, "Could not add to {}", path);
-            // What the file holds now is unknown: written anew next time
+            // What the file holds now is unknown
             append_file.Close();
-            rewrite_file = true;
+            writer_needs_whole = true;
+            append_failed = true;
             return;
         }
     }
-    flushed_size = data.size();
+
+    const auto took = std::chrono::steady_clock::now() - start;
+    if (took >= SLOW_WRITE) {
+        LOG_WARNING(Core_ARM11,
+                    "The storage took {} ms to write {} KB of recompiled code (the game did not "
+                    "wait for it)",
+                    std::chrono::duration_cast<std::chrono::milliseconds>(took).count(),
+                    records.size() / 1024);
+    }
 }
 
 void JitCodeCache::LogActivity(std::chrono::steady_clock::time_point now) {

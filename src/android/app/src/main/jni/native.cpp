@@ -858,6 +858,7 @@ jboolean JNICALL Java_org_citra_citra_1emu_utils_GpuDriverHelper_isAdrenoGpu(JNI
 void Java_org_citra_citra_1emu_NativeLibrary_unPauseEmulation([[maybe_unused]] JNIEnv* env,
                                                               [[maybe_unused]] jobject obj) {
     pause_emulation = false;
+    Common::Hitches::NotePaused(false);
     running_cv.notify_all();
     auto* handler = InputManager::NDKMotionHandler();
     if (handler) {
@@ -868,6 +869,7 @@ void Java_org_citra_citra_1emu_NativeLibrary_unPauseEmulation([[maybe_unused]] J
 void Java_org_citra_citra_1emu_NativeLibrary_pauseEmulation([[maybe_unused]] JNIEnv* env,
                                                             [[maybe_unused]] jobject obj) {
     pause_emulation = true;
+    Common::Hitches::NotePaused(true);
     auto* handler = InputManager::NDKMotionHandler();
     if (handler) {
         handler->DisableSensors();
