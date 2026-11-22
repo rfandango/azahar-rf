@@ -301,15 +301,26 @@ public:
      * whatever it is given (a thread that never sleeps, as while Monster Hunter 4 Ultimate
      * plays its opening video) costs the host three times the work too, and where the host
      * does not have that, everything ran slow: video at half speed, sound stretched. Such a
-     * title is given what the host manages in real time instead, never less than the Old
-     * 3DS's clock, and all of it again as soon as there is room.
+     * title is given what the host manages in real time instead, and all of it again as soon
+     * as there is room.
+     *
+     * Down to the Old 3DS's clock that goes by the time the host took, waits included. Below
+     * it, for every title, it goes by `host_cpu`, the time the emulation thread itself ran in
+     * `host_work`: a host that cannot run a thread of that kind in real time even at the
+     * console's own clock (one with cores of the Cortex-A73's class under Hyrule Warriors
+     * Legends, which needed twice the time) gives it as much as it manages, down to two fifths
+     * of that clock. The title then gets less done in a frame, as on a slower console, where
+     * before all of it ran slow, sound included. Waiting does not count there: giving a title
+     * less does not make the GPU faster. Without `host_cpu` (zero) nothing goes below the
+     * console's clock.
      *
      * With `reproducible` the title is given all it asked for whatever the host does: what
      * the emulation does must then not depend on the machine it runs on (an input movie
      * being recorded or played back).
      */
     void GovernProcessorClock(std::chrono::microseconds emulated,
-                              std::chrono::microseconds host_work, double speed_limit,
+                              std::chrono::microseconds host_work,
+                              std::chrono::microseconds host_cpu, double speed_limit,
                               bool reproducible);
 
     std::chrono::microseconds GetGlobalTimeUs() const;
@@ -347,6 +358,10 @@ private:
         u32 vblanks = 0;
         s64 emulated_us = 0;
         s64 work_us = 0;
+        s64 cpu_us = 0;
+        /// Stretches in a row in which the thread's own work was too much at the console's
+        /// clock or below
+        u32 overloaded = 0;
         bool has_baseline = false;
         std::array<u64, 4> ticks{};
         std::array<u64, 4> idle_ticks{};

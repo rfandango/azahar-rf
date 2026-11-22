@@ -10,12 +10,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include "common/common_types.h"
-
-namespace Pica {
-struct DisplayTransferConfig;
-struct MemoryFillConfig;
-struct RegsInternal;
-} // namespace Pica
+#include "video_core/work_rules.h"
 
 namespace VideoCore {
 
@@ -101,17 +96,9 @@ private:
     boost::container::small_vector<MemoryRange, 16> ranges;
 };
 
-/// How the texture coordinates of a draw go with the rows of its target, for each set of
-/// coordinates where that is a straight line: v = scale * row + offset, the row counted
-/// from the bottom of the target as the viewport counts it
-struct DrawTextureRows {
-    std::array<bool, 3> known{};
-    std::array<f32, 3> scale{};
-    std::array<f32, 3> offset{};
-};
-
 /**
- * Leaves out GPU work whose result nobody gets to see.
+ * Leaves out GPU work whose result nobody gets to see. One of the rules of WorkRules, the one
+ * that votes Unseen, and the one that keeps the watch over what was left out wrongly.
  *
  * A game in stereoscopic mode renders the top screen twice. With one eye on display, half of
  * that is for nothing, as is anything else a game renders and then does not use. Which work
@@ -144,10 +131,24 @@ struct DrawTextureRows {
  * images meet in a buffer, a game's filter takes in a row of the other one, and that row
  * is not kept as it was for it.
  */
-class FrameLiveness {
+class FrameLiveness final : public WorkRule {
 public:
     explicit FrameLiveness(GPU& gpu);
-    ~FrameLiveness();
+    ~FrameLiveness() override;
+
+    const char* Name() const override {
+        return "unseen work";
+    }
+    const char* Why() const override {
+        return "nobody sees its result";
+    }
+    /// As a rule it is told of every piece of work the game sends, also of what another rule
+    /// leaves out as done already: memory is then as if that had been carried out, which is
+    /// how it is entered here.
+    Vote OnDraw(DrawFacts& facts) override;
+    Vote OnFill(const FillFacts& facts) override;
+    Vote OnTransfer(const TransferFacts& facts) override;
+    void OnFrameEnd(const FrameFacts& facts) override;
 
     /// Titles that are known not to cope with a missing right eye are left alone
     void SetAllowed(bool allowed_) {
@@ -165,8 +166,14 @@ public:
 
     /// Called for each draw. Returns false for the ones to leave out, which are none if the
     /// draw cannot be left out any more.
+    /// overwrites_colour, overwrites_depth: the draw writes every pixel of the rows it is
+    /// confined to anew, the colour or depth and stencil of it, whatever those held: its
+    /// triangles cover its viewport, the viewport is as wide as the target, and no test or
+    /// blending lets through what was there (a clear done by drawing, also one that tests
+    /// nothing but still writes depth, which replaces_target does not take in).
     bool ShouldAllowDraw(const Pica::RegsInternal& regs, bool replaces_target,
-                         bool may_leave_out = true, const DrawTextureRows* texture_rows = nullptr);
+                         bool may_leave_out = true, const DrawTextureRows* texture_rows = nullptr,
+                         bool overwrites_colour = false, bool overwrites_depth = false);
 
     /// Called for each texture copy and display transfer. Returns false for the ones to leave
     /// out; the game is told they are done as usual.
@@ -229,6 +236,9 @@ private:
         Kind kind{};
         /// Nothing of what the first place it writes held is left afterwards
         bool replaces{};
+        /// A draw: nothing of what the rows of its depth buffer held is left afterwards, and
+        /// nothing of it went into the result
+        bool replaces_depth{};
         /// The image in the first place it writes is all new afterwards
         bool renews{};
         /// Its result is on display or goes to the game
@@ -276,6 +286,19 @@ private:
     void GuestRead(const MemoryRange& range);
     void Mispredicted(const char* reader, const MemoryRange& range);
     void LookAtLastFrames();
+    /// Writes to the log what the frame that just ended was made of, see EndFrame
+    void LogOutline() const;
+    /// Whether the game drew with the stencil test on lately (see OnDraw)
+    bool StencilInUse() const {
+        return stencil_seen && frame - stencil_last_frame <= STENCIL_FORGOTTEN_AFTER;
+    }
+    static constexpr u32 STENCIL_FORGOTTEN_AFTER = 600;
+    bool stencil_seen = false;
+    u32 stencil_last_frame = 0;
+    /// Frames in a row with a transfer left out and every draw carried out, below zero
+    /// while the outline was written lately; how often it was written
+    s32 outline_streak = 0;
+    u32 outlines_logged = 0;
 
     GPU& gpu;
     bool allowed = true;
@@ -286,6 +309,11 @@ private:
     /// Frames to render everything for after a wrong guess, and how many of those there were
     u32 distrust = 0;
     u32 wrong_guesses = 0;
+    /// How often the time after a wrong guess was doubled, the time the last one was given,
+    /// and the frames since it
+    u32 distrust_doublings = 0;
+    u32 last_distrust = 0;
+    u64 frames_since_wrong_guess = 0;
 
     /// The steps of the frame under way and of the one before
     std::vector<Step> current;

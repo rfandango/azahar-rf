@@ -34,6 +34,9 @@
 #include "video_core/renderer_software/sw_blitter.h"
 #include "video_core/right_eye_disabler.h"
 #include "video_core/video_core.h"
+#include "video_core/work_rules.h"
+#include "video_core/work_rules/repeated_eye_rule.h"
+#include "video_core/work_rules/twin_pass_rule.h"
 
 namespace VideoCore {
 
@@ -144,8 +147,15 @@ static bool WantsDecoderThread() {
 GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
          Frontend::EmuWindow* secondary_window)
     : right_eye_disabler{std::make_unique<RightEyeDisabler>(*this)},
-      frame_liveness{std::make_unique<FrameLiveness>(*this)},
+      work_rules{std::make_unique<WorkRules>()},
+      frame_liveness{work_rules->Add(std::make_unique<FrameLiveness>(*this))},
       impl{std::make_unique<Impl>(system, emu_window, secondary_window)} {
+    // The rules that find work that need not be done. This is the one place they are named:
+    // a new rule is a class behind VideoCore::WorkRule and a line here. Their order does not
+    // matter, each is told of everything and votes.
+    work_rules->Add(std::make_unique<RepeatedEyeRule>());
+    work_rules->Add(std::make_unique<TwinPassRule>());
+
     impl->vblank_event = impl->timing.RegisterEvent(
         "GPU::VBlankCallback",
         [this](uintptr_t user_data, s64 cycles_late) { VBlankCallback(user_data, cycles_late); });
@@ -153,7 +163,8 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
-    impl->pica.SetDrawFilter(frame_liveness.get());
+    impl->pica.SetWorkRules(work_rules.get());
+    CITRA_FRAME_DUMP_GAME_START();
 
     if (WantsDecoderThread()) {
         LOG_INFO(HW_GPU, "Commands are decoded on a thread of their own");
@@ -602,11 +613,7 @@ void GPU::ReportDecoderWaits() {
     const auto [volatile_pages, copied] = impl->memory.TakeSnapshotFigures();
     waits += fmt::format("; {} pages copied at hand-over, {:.0f} KiB a vblank", volatile_pages,
                          static_cast<double>(copied) / 1024.0 / REPORT_VBLANKS);
-    if (const u64 twins = impl->pica.TakeLeftOutTwins(); twins != 0) {
-        waits += fmt::format("; {:.1f} draws a vblank left out as the second pass of a scene "
-                             "drawn twice",
-                             static_cast<double>(twins) / REPORT_VBLANKS);
-    }
+    waits += work_rules->TakeLeftOutText(REPORT_VBLANKS);
     const auto [copies_given, copies_read] = impl->memory.TakeSnapshotReadFigures();
     if (copies_given != 0) {
         waits +=
@@ -971,7 +978,7 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
         CITRA_FRAME_DUMP("bufferswap top (guest frame end) to {:08X}, {} bytes a row, {} rows",
                          *phys_address_left, info.stride, framebuffer.height.Value());
         right_eye_disabler->ReportEndFrame();
-        frame_liveness->EndFrame();
+        work_rules->EndFrame(FrameFacts{impl->pica.regs.framebuffer_config[0]});
     }
 }
 
@@ -1161,8 +1168,6 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
     if (!config.trigger) {
         return;
     }
-    impl->pica.NoteTargetCommand();
-
     CITRA_TRACE_SCOPE("GPU::MemoryFill");
     CITRA_HITCH_SCOPE(GpuEmulation);
 
@@ -1171,10 +1176,11 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
         impl->renderer->NotifyScreenChanged();
     }
 
-    // Perform memory fill, unless nobody gets to see what is filled.
+    // Perform memory fill, unless a rule finds that it need not be done.
     CITRA_FRAME_DUMP("fill {}", config.DebugName());
-    if (!frame_liveness->ShouldAllowFill(config)) {
-        CITRA_FRAME_DUMP("  fill left out: nobody sees its result");
+    if (work_rules->LeavesOutFill(
+            FillFacts{config.GetStartAddress(), config.GetEndAddress(), config})) {
+        CITRA_FRAME_DUMP("  fill left out: {}", work_rules->LastWhy());
     } else if (!impl->rasterizer->AccelerateFill(config)) {
         CITRA_TRACE_SCOPE("GPU::MemoryFill (software fallback)");
         CITRA_FRAME_DUMP("  fill: SOFTWARE fallback");
@@ -1210,7 +1216,6 @@ void GPU::MemoryTransfer() {
     if (!config.trigger.Value()) {
         return;
     }
-    impl->pica.NoteTargetCommand();
 
     MICROPROFILE_SCOPE(GPU_DisplayTransfer);
     CITRA_TRACE_SCOPE(config.is_texture_copy ? "GPU::TextureCopy" : "GPU::DisplayTransfer");
@@ -1229,6 +1234,30 @@ void GPU::MemoryTransfer() {
     if (IsOnDisplay(impl->pica.regs.framebuffer_config, output_start, output_start + output_size)) {
         impl->renderer->NotifyScreenChanged();
     }
+    // Whether a rule finds that it need not be done. What it reads and writes as memory: a
+    // transfer reads as many rows as it puts out, each as long as the rows of its source are;
+    // a copy reads and writes rows with gaps between them.
+    bool left_out;
+    {
+        const PAddr input_start = config.GetPhysicalInputAddress();
+        const u32 last_row_read = std::min<u32>(config.output_width, config.input_width);
+        u32 input_size = config.output_height == 0
+                             ? 0
+                             : ((config.output_height - 1) * config.input_width + last_row_read) *
+                                   BytesPerPixel(config.input_format);
+        u32 written = output_size;
+        if (config.is_texture_copy) {
+            const auto extent = [&](u32 width, u32 gap) {
+                const u32 row = width * 16;
+                const u32 size = config.texture_copy.size;
+                return row != 0 && size > row ? (size / row - 1) * (row + gap * 16) + row : size;
+            };
+            input_size = extent(config.texture_copy.input_width, config.texture_copy.input_gap);
+            written = extent(config.texture_copy.output_width, config.texture_copy.output_gap);
+        }
+        left_out = work_rules->LeavesOutTransfer(TransferFacts{
+            input_start, input_start + input_size, output_start, output_start + written, config});
+    }
 
     u64 delay{};
     // Perform memory transfer
@@ -1243,8 +1272,8 @@ void GPU::MemoryTransfer() {
                          config.texture_copy.size, config.texture_copy.input_width * 16,
                          config.texture_copy.input_gap * 16, config.texture_copy.output_width * 16,
                          config.texture_copy.output_gap * 16);
-        if (!frame_liveness->ShouldAllowTransfer(config)) {
-            CITRA_FRAME_DUMP("  texcopy left out: nobody sees its result");
+        if (left_out) {
+            CITRA_FRAME_DUMP("  texcopy left out: {}", work_rules->LastWhy());
         } else if (!impl->rasterizer->AccelerateTextureCopy(config)) {
             CITRA_TRACE_SCOPE("GPU::TextureCopy (software fallback)");
             CITRA_FRAME_DUMP("  texcopy: SOFTWARE fallback");
@@ -1256,8 +1285,8 @@ void GPU::MemoryTransfer() {
             DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
             config.texture_copy.size);
     } else {
-        if (!frame_liveness->ShouldAllowTransfer(config)) {
-            CITRA_FRAME_DUMP("transfer {} left out: nobody sees its result", config.DebugName());
+        if (left_out) {
+            CITRA_FRAME_DUMP("transfer {} left out: {}", config.DebugName(), work_rules->LastWhy());
         } else if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                                   config.input_height)) {
             CITRA_FRAME_DUMP("transfer {} in {}x{} fmt {} out {}x{} fmt {} flags {:08X}",

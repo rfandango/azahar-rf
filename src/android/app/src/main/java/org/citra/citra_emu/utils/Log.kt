@@ -17,4 +17,7 @@ object Log {
     external fun error(message: String)
 
     external fun critical(message: String)
+
+    /** Writes what the log file's buffer still holds to the file. */
+    external fun flush()
 }

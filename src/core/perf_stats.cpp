@@ -19,6 +19,26 @@
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
 
+#ifndef _WIN32
+#include <time.h>
+#endif
+
+namespace {
+
+/// The processor time the calling thread has used so far, or zero where it cannot be told
+std::chrono::microseconds ThreadCpuTime() {
+#ifndef _WIN32
+    timespec time{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) == 0) {
+        return std::chrono::microseconds{static_cast<s64>(time.tv_sec) * 1'000'000 +
+                                         time.tv_nsec / 1000};
+    }
+#endif
+    return std::chrono::microseconds::zero();
+}
+
+} // Anonymous namespace
+
 using namespace std::chrono_literals;
 using DoubleSecs = std::chrono::duration<double, std::chrono::seconds::period>;
 using std::chrono::duration_cast;
@@ -300,6 +320,12 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
     auto now = Clock::now();
     last_interval_emulated = current_system_time_us - previous_system_time_us;
     last_interval_work = duration_cast<microseconds>(now - previous_walltime);
+    // Of that, what the thread spent running: the rest it waited (for the GPU, for a file)
+    const microseconds cpu_time = ThreadCpuTime();
+    last_interval_cpu = previous_cpu_time > microseconds::zero() && cpu_time > previous_cpu_time
+                            ? std::min(cpu_time - previous_cpu_time, last_interval_work)
+                            : microseconds::zero();
+    previous_cpu_time = cpu_time;
     double sleep_scale =
         Settings::GetFrameLimit() / 100.0 * pacing_scale.load(std::memory_order_relaxed);
 

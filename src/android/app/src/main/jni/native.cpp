@@ -25,6 +25,7 @@
 #endif
 
 #include "common/common_paths.h"
+#include "common/diagnostics.h"
 #include "common/dynamic_library.h"
 #include "common/file_derived.h"
 #include "common/file_util.h"
@@ -38,6 +39,7 @@
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "common/thread.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/camera/factory.h"
@@ -450,6 +452,17 @@ void InitializeGpuDriver(const std::string& hook_lib_dir, const std::string& cus
     void* handle{};
     const char* file_redirect_dir_{};
     int featureFlags{};
+
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    // Before the driver is loaded, which reads its environment as it comes in: what the last
+    // run left is put with the logs (the driver starts its log anew), then the settings of
+    // diag.txt are taken and the driver is told where to write
+    Common::Diagnostics::LoadControlFile();
+    Common::Diagnostics::CollectFiles();
+    Common::Diagnostics::PrepareDriverEnvironment();
+    Common::TraceMarkers::RefreshSettings();
+    Common::Diagnostics::LogDeviceReport();
+#endif
 
     // Enable driver file redirection when renderer debugging is enabled.
     if (Settings::values.renderer_debug && file_redirect_dir.size()) {
@@ -1085,6 +1098,10 @@ void Java_org_citra_citra_1emu_NativeLibrary_run__Ljava_lang_String_2(JNIEnv* en
     }
 
     const Core::System::ResultStatus result{RunCitra(path)};
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    // The driver's log and what else was written for this game, to where the user finds it
+    Common::Diagnostics::CollectFiles();
+#endif
     if (result != Core::System::ResultStatus::Success) {
         env->CallStaticVoidMethod(IDCache::GetNativeLibraryClass(),
                                   IDCache::GetExitEmulationActivity(), static_cast<int>(result));

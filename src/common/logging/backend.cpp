@@ -2,7 +2,13 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/regex.hpp>
 
@@ -34,6 +40,7 @@
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "common/thread.h"
+#include "common/trace_markers.h"
 
 namespace Common::Log {
 
@@ -161,21 +168,66 @@ public:
 
         // _SH_DENYWR allows read only access to the file for other programs.
         // It is #defined to 0 on other platforms
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+        writer = std::make_shared<Writer>();
+        writer->file = std::make_unique<FileUtil::IOFile>(filename, "w", _SH_DENYWR);
+        writer_thread = std::thread([state = writer] { WriterLoop(*state); });
+#else
         file = std::make_unique<FileUtil::IOFile>(filename, "w", _SH_DENYWR);
+#endif
     }
 
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    ~FileBackend() override {
+        StopWriter();
+    }
+#else
     ~FileBackend() override = default;
+#endif
 
     void Write(const Entry& entry) override {
         if (!enabled) {
             return;
         }
 
-        bytes_written += file->WriteString(FormatLogMessage(entry).append(1, '\n'));
+        // A message can carry a zero byte (a fixed-size name of the guest's, printed whole),
+        // which makes the file something other than text to the programs it is shared with
+        std::string message = FormatLogMessage(entry);
+        std::erase(message, '\0');
+        message.append(1, '\n');
 
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
         const auto write_limit = 100_MiB;
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+        // The log of a profiling build is what people send in, and it is written where the
+        // user can get at it: shared storage, which can hold a write up for seconds on end
+        // (a Retroid Pocket 5 let a burst of lines through at 12 KiB a second for 20 s, each
+        // block of 4 KiB kept waiting longer than the one before). Written from the thread
+        // that takes the lines from the queue, that kept every line behind it from the system
+        // log as well, and once the queue was full every thread that logs would have waited
+        // with it, the emulation's among them. So the lines are handed to a thread of the
+        // file's own, which waits for the storage by itself. The file is flushed every few
+        // seconds, at once after an error, and when asked (see Flush): it is never far behind
+        // what the storage lets through.
+        bytes_written += message.size();
+        {
+            std::scoped_lock lock{writer->mutex};
+            if (writer->pending.size() + message.size() > MOST_PENDING) {
+                writer->dropped_lines++;
+            } else {
+                writer->pending += message;
+                writer->appended += message.size();
+            }
+            writer->flush_wanted = writer->flush_wanted || entry.log_level >= Level::Error;
+        }
+        writer->wake.notify_one();
+        if (bytes_written > write_limit) {
+            // Stop writing after the write limit is exceeded.
+            enabled = false;
+        }
+#else
+        bytes_written += file->WriteString(message);
         const bool write_limit_exceeded = bytes_written > write_limit;
         if (entry.log_level >= Level::Error || write_limit_exceeded) {
             if (write_limit_exceeded) {
@@ -185,14 +237,33 @@ public:
             }
             file->Flush();
         }
+#endif
     }
 
     void Flush() override {
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+        // Until what was handed over so far is in the file, but not for longer than the
+        // caller can stand still: the storage may be holding the writes up
+        std::unique_lock lock{writer->mutex};
+        if (writer->stopped) {
+            return;
+        }
+        const u64 target = writer->appended;
+        writer->flush_wanted = true;
+        writer->wake.notify_one();
+        writer->drained.wait_for(
+            lock, FLUSH_WAIT, [&] { return writer->flushed_through >= target || writer->stopped; });
+#else
         file->Flush();
+#endif
     }
 
     void Close() override {
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+        StopWriter();
+#else
         file->Close();
+#endif
         enabled = false;
     }
 
@@ -202,7 +273,123 @@ public:
     }
 
 private:
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    /// What the backend and the thread that writes the file share. Owned by both, so that a
+    /// writer the storage does not let go of can be left behind when the backend goes.
+    struct Writer {
+        std::unique_ptr<FileUtil::IOFile> file;
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::condition_variable drained;
+        /// Lines not yet written, and how many were not kept because too much was waiting
+        std::string pending;
+        u64 dropped_lines = 0;
+        /// Bytes handed over so far, and how many of them are in the file and flushed
+        u64 appended = 0;
+        u64 flushed_through = 0;
+        bool flush_wanted = false;
+        bool stop = false;
+        bool stopped = false;
+    };
+    /// What may wait to be written; lines beyond it are counted and left out
+    static constexpr std::size_t MOST_PENDING = 32 * 1024 * 1024;
+    /// How long a flush or the end waits for the storage
+    static constexpr std::chrono::milliseconds FLUSH_WAIT{2500};
+
+    static void WriterLoop(Writer& state) {
+        using Clock = std::chrono::steady_clock;
+        Common::SetCurrentThreadName("LogFile");
+        std::string chunk;
+        Clock::time_point last_flush = Clock::now();
+        Clock::time_point last_report{};
+        bool unflushed = false;
+        std::unique_lock lock{state.mutex};
+        while (true) {
+            state.wake.wait_for(lock, std::chrono::seconds{1}, [&] {
+                return state.stop || !state.pending.empty() || state.flush_wanted;
+            });
+            const bool stopping = state.stop;
+            chunk.clear();
+            chunk.swap(state.pending);
+            const u64 through = state.appended;
+            const u64 dropped = std::exchange(state.dropped_lines, 0);
+            const bool flush_now = state.flush_wanted || stopping;
+            state.flush_wanted = false;
+            lock.unlock();
+
+            const Clock::time_point before = Clock::now();
+            if (dropped != 0) {
+                chunk += fmt::format("[the log: {} lines were not kept while the storage held "
+                                     "its writes up]\n",
+                                     dropped);
+            }
+            if (!chunk.empty()) {
+                if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::SlowLogStorage) !=
+                    0) [[unlikely]] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{
+                        std::min<std::size_t>(chunk.size() / 12, 20'000)});
+                }
+                state.file->WriteString(chunk);
+                unflushed = true;
+            }
+            if (unflushed && (flush_now || before - last_flush >= std::chrono::seconds{5})) {
+                state.file->Flush();
+                last_flush = Clock::now();
+                unflushed = false;
+            }
+            const Clock::time_point after = Clock::now();
+            const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(after - before);
+
+            lock.lock();
+            if (!unflushed) {
+                state.flushed_through = through;
+                state.drained.notify_all();
+            }
+            const std::size_t waiting = state.pending.size();
+            if (took >= std::chrono::milliseconds{500} &&
+                after - last_report >= std::chrono::seconds{30} && !stopping) {
+                // (Said outside of the lock: the line comes back here through the queue)
+                last_report = after;
+                lock.unlock();
+                LOG_WARNING(Log,
+                            "The storage took {} ms to write {} KiB of the log; {} KiB more "
+                            "waited meanwhile",
+                            took.count(), chunk.size() / 1024, waiting / 1024);
+                lock.lock();
+            }
+            if (stopping && state.pending.empty()) {
+                break;
+            }
+        }
+        state.stopped = true;
+        state.drained.notify_all();
+    }
+
+    void StopWriter() {
+        if (!writer_thread.joinable()) {
+            return;
+        }
+        bool done;
+        {
+            std::unique_lock lock{writer->mutex};
+            writer->stop = true;
+            writer->wake.notify_one();
+            done = writer->drained.wait_for(lock, FLUSH_WAIT, [&] { return writer->stopped; });
+        }
+        if (done) {
+            writer_thread.join();
+            writer->file->Close();
+        } else {
+            // The storage holds it: it finishes by itself, or with the process
+            writer_thread.detach();
+        }
+    }
+
+    std::shared_ptr<Writer> writer;
+    std::thread writer_thread;
+#else
     std::unique_ptr<FileUtil::IOFile> file;
+#endif
     bool enabled = true;
     std::size_t bytes_written = 0;
 };
@@ -321,6 +508,21 @@ public:
         filter = f;
     }
 
+    /// What was logged so far goes to the file, as far as that can be had in a few seconds:
+    /// first what is still in the queue to the backends, then what the file backend holds
+    /// back. From any thread but the backend's own.
+    void FlushFile() {
+#ifndef HAVE_LIBRETRO
+        const u64 target = pushed.load(std::memory_order_relaxed);
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds{1500};
+        while (popped.load(std::memory_order_relaxed) < target &&
+               std::chrono::steady_clock::now() < give_up) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        file_backend.Flush();
+#endif
+    }
+
     bool SetRegexFilter(const std::string& regex) {
         if (regex.empty()) {
             regex_filter = boost::regex();
@@ -357,6 +559,7 @@ public:
             });
         } else {
             message_queue.EmplaceWait(new_entry);
+            pushed.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -461,13 +664,20 @@ private:
                 // (for example, when the stop token is signaled).
                 if (entry.filename != nullptr) {
                     write_logs();
+                    popped.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             // Drain the logging queue. Only writes out up to MAX_LOGS_TO_WRITE to prevent a
             // case where a system is repeatedly spamming logs even on close.
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+            // (All of it in a build whose log is what people send in)
+            int max_logs_to_write = INT_MAX;
+#else
             int max_logs_to_write = filter.IsDebug() ? INT_MAX : 100;
+#endif
             while (max_logs_to_write-- && message_queue.TryPop(entry)) {
                 write_logs();
+                popped.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -546,6 +756,9 @@ private:
 #endif
 
     MPSCQueue<Entry> message_queue{};
+    /// Entries put into the queue and taken out of it and written, for FlushFile
+    std::atomic<u64> pushed{0};
+    std::atomic<u64> popped{0};
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
     std::jthread backend_thread;
 
@@ -581,6 +794,12 @@ void Stop() {
 
 void DisableLoggingInTests() {
     initialization_in_progress_suppress_logging = true;
+}
+
+void Flush() {
+    if (logging_initialized) {
+        Impl::Instance().FlushFile();
+    }
 }
 
 void SetGlobalFilter(const Filter& filter) {

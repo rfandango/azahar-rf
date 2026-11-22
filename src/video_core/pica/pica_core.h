@@ -8,7 +8,9 @@
 #include <atomic>
 #include <utility>
 #include <vector>
+#include <boost/container/small_vector.hpp>
 #include "common/common_types.h"
+#include "common/trace_markers.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
 #include "video_core/pica/geometry_pipeline.h"
@@ -25,9 +27,9 @@ class MemorySystem;
 }
 
 namespace VideoCore {
-class FrameLiveness;
 struct DrawTextureRows;
 class RasterizerInterface;
+class WorkRules;
 } // namespace VideoCore
 
 namespace Pica {
@@ -96,6 +98,10 @@ public:
         result += (1.f - culled_triangle_threshold) * triangle_count * nanoseconds_per_triangle;
         result += culled_triangle_threshold * triangle_count *
                   (nanoseconds_per_triangle * culled_triangle_time_cost);
+        if (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::FasterConsoleGpu)
+            [[unlikely]] {
+            result /= 4.f;
+        }
 
         triangle_count = 0;
         command_count = 0;
@@ -145,6 +151,20 @@ public:
     /// shaded here to find out. One, all of it, where that cannot be told.
     float SmallDrawViewportShare(bool is_indexed);
 
+    /// The box around the triangles of a draw, in the coordinates of the viewport, which goes
+    /// from -1 to 1 both ways, and cut to it
+    struct DrawBox {
+        float left;
+        float right;
+        float bottom;
+        float top;
+    };
+
+    /// The box around the vertices of the draw about to be carried out, for a draw of two
+    /// triangles at the most, whose vertices are shaded here to find out. False where that
+    /// cannot be told; a box without area for a draw that is outside of the viewport.
+    bool SmallDrawBox(bool is_indexed, DrawBox& box);
+
 private:
     void InitializeRegs();
 
@@ -178,82 +198,20 @@ private:
     bool sw_batch_open{};
     u32 sw_batch_draws{};
 
-    /// Some games smooth edges by drawing their scene twice into the same target, a part of
-    /// a pixel apart, and blending the two images (the "MT Framework" games do while the 3D
-    /// effect is off; in Monster Hunter 4 Ultimate it is a quarter of a frame's GPU time).
-    /// Above the console's resolution the host's pixels are smaller than that shift, and the
-    /// second image only costs. So this pattern is watched for: a run of draws to a target, a
-    /// quad that copies the target elsewhere, a second run to the target, and a quad that
-    /// blends the copy over it. Where it is seen the draws of the second run are compared
-    /// with those of the first, place by place. A twin goes by the same registers, the same
-    /// vertex shader and the same float uniforms but for a slight difference in a few of
-    /// them (the shifted projection). After some frames in which every draw of the second
-    /// run was a twin, twins are left out as they come, and if all of them were, the blending
-    /// as well: the target then holds the first image, which is what blending two images
-    /// that are all but the same comes to. A draw that is no twin is drawn, and all after it.
-    struct TwinPass {
-        enum class Phase : u8 {
-            Idle,
-            /// A run of draws to one target is under way
-            First,
-            /// The quad that copies the target elsewhere came after it
-            Copied,
-            /// The second run to the target is under way
-            Second,
-        };
-        struct Draw {
-            u64 state;
-            bool clear;
-            std::array<Common::Vec4<f24>, 96> uniforms;
-        };
-        static constexpr u32 MIN_DRAWS = 4;
-        static constexpr u32 MAX_DRAWS = 1024;
-        static constexpr u32 FRAMES_ALIKE = 4;
-        static constexpr u32 MAX_DIFFERING = 12;
-        /// How far a float uniform may be off, as a share of the largest value in the
-        /// registers around it (the rows of its matrix)
-        static constexpr float MAX_SHIFT = 0.02f;
+    /// What rules that leave work out want to know of the draw about to be made, see
+    /// VideoCore::DrawFacts
+    class Facts;
+    friend class Facts;
+    /// A triangle given vertex by vertex is drawn: the rules are told, none can leave it out
+    void TellRulesOfImmediateDraw();
 
-        Phase phase{};
-        /// The colour buffer of the run of draws under way, and how many it has
-        PAddr run_target{};
-        u32 run_draws{};
-        /// Of the two passes; where the first image is kept; the draws of the first pass
-        PAddr target{};
-        PAddr keep{};
-        u32 first_draws{};
-        /// The place in the second pass
-        u32 at{};
-        /// The target the bare pattern was seen at: runs to it are recorded
-        PAddr watched_target{};
-        /// The first pass of this frame was recorded; every draw of the second so far was a
-        /// twin; twins are left out as they come; how many were
-        bool compared{};
-        bool twins{};
-        bool leaving_out{};
-        u32 left_out_now{};
-        /// Frames in a row in which the whole second pass was twins
-        u32 frames_alike{};
-        std::vector<Draw> first;
-        /// With ExplainScenePasses: the registers of each of them, and lines written so far
-        std::vector<std::array<u32, 0x300>> first_regs;
-        u32 explained{};
-        /// For the log: the most float uniforms that differed, and by how much
-        u32 most_differing{};
-        float largest_shift{};
-        std::atomic<u64> left_out{};
-    } twin_pass;
-
-    /// Whether the draw that is about to be made is left out, see TwinPass. Called for every
-    /// draw, with whether it overwrites all of its viewport (a clear done with a quad).
-    bool IsLeftOutTwin(bool clears);
-    bool IsTwinOf(const TwinPass::Draw& first, bool clears, u64 state);
+    /// What makes a draw the same draw as another: a hash over the registers it goes by
+    /// and its vertex shader; for a clear done by drawing only over what the fragments go by
     u64 TwinState(bool clears);
     /// Calls back with each stretch of registers [from, to) that a draw goes by as the
     /// registers are now
     template <typename Func>
     void ForTwinRegisters(bool clears, Func&& func) const;
-    void ExplainNoTwin(bool clears);
     /// The float uniforms the vertex shader's program can read from its entry point, a bit
     /// for each (96 of them). Worked out once for each program.
     using UniformSet = std::array<u64, 2>;
@@ -268,8 +226,35 @@ private:
     ShaderEngine& EngineForFewVertices();
 
     /// Whether the triangles of the draw about to be carried out cover all of the viewport.
-    /// Only looks at draws of two triangles, whose vertices are shaded here to find out.
+    /// Only looks at draws of MAX_COVER_VERTICES vertices at the most, which are shaded here
+    /// to find out.
     bool CoversViewport(bool is_indexed, bool* exactly = nullptr);
+    /// The same for a draw that is not two triangles: a clear done with a mesh
+    bool MeshCoversViewport(bool is_indexed, bool* exactly);
+    /// Whether a mesh of up to MAX_COVER_VERTICES_LARGE vertices covers the middle of every
+    /// pixel of the console in its viewport (not whether it reaches the viewport's edges).
+    /// state: StateHash of the draw, by which one that does not cover is left alone for a
+    /// while.
+    bool LargeMeshCoversPixels(bool is_indexed, u64 state);
+    /// Shades the vertices of the draw about to be made and hands over what is drawn of
+    /// each of its triangles: the part within the depth range, as a polygon in pixels of
+    /// the console from the corner of the viewport (whose size is put in width and height),
+    /// if it faces the way that is kept. The sink returns false to stop. False if the
+    /// vertices are not to be had, or are more than most_vertices.
+    template <typename Sink>
+    bool ForDrawnTriangles(bool is_indexed, u32 most_vertices, f32& width, f32& height,
+                           Sink&& sink);
+    /// A bit for each pixel of the viewport, for LargeMeshCoversPixels
+    std::vector<u64> cover_bits;
+    /// Meshes that did not cover their viewport lately, and for how many more askings each
+    /// is left alone
+    struct CoverMiss {
+        u64 state{};
+        u32 misses{};
+        u32 rest{};
+    };
+    std::array<CoverMiss, 8> cover_misses{};
+    u32 cover_miss_next{};
 
     /// How the texture coordinates of the draw about to be carried out go with the rows of
     /// its target, for each set of coordinates where that is a straight line. Only looks at
@@ -287,13 +272,11 @@ private:
 #endif
 
 public:
-    /// A fill, a transfer or a copy is carried out: what runs of draws were under way are over
-    /// (see TwinPass)
-    void NoteTargetCommand();
-    /// Draws left out as twins since this was last asked
-    u64 TakeLeftOutTwins() {
-        return twin_pass.left_out.exchange(0, std::memory_order_relaxed);
-    }
+    /// The most vertices of a draw that is looked at for whether it covers its viewport
+    static constexpr u32 MAX_COVER_VERTICES = 36;
+    /// The same for a mesh that would reset the depth buffer, which is looked at pixel by
+    /// pixel
+    static constexpr u32 MAX_COVER_VERTICES_LARGE = 1024;
 
     union Regs {
         static constexpr std::size_t NUM_REGS = 0x732;
@@ -555,9 +538,10 @@ public:
 
     RenderPropertiesGuess GuessCmdRenderProperties(PAddr list, u32 size);
 
-    /// Sets who is asked about each draw before it is carried out, see FrameLiveness.
-    void SetDrawFilter(VideoCore::FrameLiveness* filter) {
-        draw_filter = filter;
+    /// Sets who is asked about each draw before it is carried out: the rules that find work
+    /// that need not be done, see VideoCore::WorkRules
+    void SetWorkRules(VideoCore::WorkRules* rules) {
+        work_rules = rules;
     }
 
 private:
@@ -569,7 +553,7 @@ private:
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
     const u8* list_copy{};
-    VideoCore::FrameLiveness* draw_filter{};
+    VideoCore::WorkRules* work_rules{};
     std::unique_ptr<ShaderEngine> shader_engine;
     /// Shades a few vertices while `shader_engine` does not have their shader ready
     std::unique_ptr<ShaderEngine> few_vertices_engine;

@@ -105,6 +105,13 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     utils.h
     video_core.cpp
     video_core.h
+    work_rules.cpp
+    work_rules.h
+    work_rules/draw_record.h
+    work_rules/repeated_eye_rule.cpp
+    work_rules/repeated_eye_rule.h
+    work_rules/twin_pass_rule.cpp
+    work_rules/twin_pass_rule.h
 )
 
 if (ENABLE_SOFTWARE_RENDERER)

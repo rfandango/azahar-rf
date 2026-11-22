@@ -353,9 +353,17 @@ void Config::ReadValues() {
     // Apply the log_filter setting as the logger has already been initialized
     // and doesn't pick up the filter on its own.
     Common::Log::Filter filter;
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    // A profiling build is there for its log, which people send in: nothing set on the device
+    // may thin it out
+    filter.ParseFilterString("*:Info");
+    Common::Log::SetGlobalFilter(filter);
+    Common::Log::SetRegexFilter("");
+#else
     filter.ParseFilterString(Settings::values.log_filter.GetValue());
     Common::Log::SetGlobalFilter(filter);
     Common::Log::SetRegexFilter(Settings::values.log_regex_filter.GetValue());
+#endif
 
     // Debugging
     Settings::values.record_frame_times =

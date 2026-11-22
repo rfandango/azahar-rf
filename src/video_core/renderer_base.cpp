@@ -323,7 +323,7 @@ void RendererBase::EndFrameParts(bool emulation, bool gpu) {
         const Core::Movie::PlayMode movie = system.Movie().GetPlayMode();
         system.CoreTiming().GovernProcessorClock(
             system.frame_limiter.LastIntervalEmulated(), system.frame_limiter.LastIntervalWork(),
-            Settings::GetFrameLimit() / 100.0,
+            system.frame_limiter.LastIntervalCpu(), Settings::GetFrameLimit() / 100.0,
             movie == Core::Movie::PlayMode::Recording || movie == Core::Movie::PlayMode::Playing);
     }
     if (gpu) {

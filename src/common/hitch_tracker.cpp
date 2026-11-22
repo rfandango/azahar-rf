@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 #include <fmt/format.h>
+#include "common/diagnostics.h"
 #include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/trace_markers.h"
@@ -1309,6 +1310,11 @@ void EndVBlank() {
     }
     if (!summary.empty()) {
         LogLines(summary);
+        // What the system was doing meanwhile: a clock held down or a hot device explains a
+        // slow stretch that nothing in the emulator does
+        if (const std::string system = Common::Diagnostics::SystemLine(); !system.empty()) {
+            LOG_INFO(Common, "Hitch summary: {}", system);
+        }
     }
 }
 

@@ -22,8 +22,14 @@ namespace {
 /// Looks at the last frames in a row that have to find a piece of work not needed before it
 /// is left out
 constexpr u16 REQUIRED_UNNEEDED = 30;
-/// Frames to render everything for after the first wrong guess, doubled with each one after
-constexpr u32 DISTRUST_FRAMES = 600;
+/// Frames to render everything for after a wrong guess, doubled with each one that follows
+/// closely on the one before (see Mispredicted). What a wrong guess costs on the screen is one
+/// image made from what its buffer held before, mostly the frame before; what this time costs
+/// is the right eye drawn for all of it. On an Adreno 610 Kid Icarus: Uprising ran at 95% of
+/// its speed with the right eye left out and at 75% with it drawn, and with 600 frames here
+/// that doubled every time, four wrong guesses in ten minutes (the game's start and three
+/// changes of scene) had it drawn for 180 of 500 seconds.
+constexpr u32 DISTRUST_FRAMES = 150;
 constexpr u32 MAX_DISTRUST_DOUBLINGS = 5;
 /// A frame with more steps than this is not looked at
 constexpr std::size_t MAX_STEPS = 4096;
@@ -418,8 +424,55 @@ bool FrameLiveness::WantsTextureRows(const Pica::RegsInternal& regs) const {
     return false;
 }
 
+Vote FrameLiveness::OnDraw(DrawFacts& facts) {
+    if (!active) {
+        return Vote::Carry;
+    }
+    const Pica::RegsInternal& regs = facts.Regs();
+    if (facts.IsImmediate()) {
+        // Its vertices are with the rasterizer already: carried out in any case
+        ShouldAllowDraw(regs, false, false);
+        return Vote::Carry;
+    }
+    // What the registers alone tell is asked first: whether the triangles cover the viewport
+    // has their vertices shaded
+    const bool replaces_target = MayReplaceTarget(regs) && facts.CoversViewport();
+    DrawTextureRows texture_rows;
+    const bool rows_known = WantsTextureRows(regs) && facts.TextureRows(texture_rows);
+    // A draw that covers its viewport writes every pixel of the rows it is confined to if
+    // the viewport is as wide as the target
+    const bool overwrites_colour =
+        facts.MayOverwriteColour() && facts.ViewportSpansTarget() && facts.CoversViewport();
+    // Depth and stencil are one buffer. A draw that renews the depth of every pixel but
+    // leaves the stencil renews the buffer as far as anything goes that work left out could
+    // have changed, as long as the game draws nothing with the stencil test on: only such
+    // draws write stencil. (Star Fox 64 3D resets the depth its two eyes share with a
+    // backdrop before each eye, in a buffer whose stencil bits it never uses.)
+    const bool renews_depth =
+        facts.MayOverwriteDepth() || (facts.MayOverwriteDepthValues() && !StencilInUse());
+    const bool overwrites_depth =
+        renews_depth && facts.ViewportSpansTarget() && facts.CoversViewport();
+    return ShouldAllowDraw(regs, replaces_target, true, rows_known ? &texture_rows : nullptr,
+                           overwrites_colour, overwrites_depth)
+               ? Vote::Carry
+               : Vote::Unseen;
+}
+
+Vote FrameLiveness::OnFill(const FillFacts& facts) {
+    return ShouldAllowFill(facts.config) ? Vote::Carry : Vote::Unseen;
+}
+
+Vote FrameLiveness::OnTransfer(const TransferFacts& facts) {
+    return ShouldAllowTransfer(facts.config) ? Vote::Carry : Vote::Unseen;
+}
+
+void FrameLiveness::OnFrameEnd([[maybe_unused]] const FrameFacts& facts) {
+    EndFrame();
+}
+
 bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replaces_target,
-                                    bool may_leave_out, const DrawTextureRows* texture_rows) {
+                                    bool may_leave_out, const DrawTextureRows* texture_rows,
+                                    bool overwrites_colour, bool overwrites_depth) {
     if (!active) {
         return true;
     }
@@ -443,22 +496,35 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     // bottom, and the bottom row is the last one in memory.
     step.first_row = 0;
     step.last_row = height;
+    // Whether those are the rows of the viewport exactly: only then does a draw that
+    // overwrites its viewport overwrite all of the rows it is taken to write
+    bool rows_exact = false;
     if (by_rows) {
         const auto& rasterizer = regs.rasterizer;
         f32 bottom = static_cast<f32>(rasterizer.viewport_corner.y);
         f32 top = bottom + Pica::f24::FromRaw(rasterizer.viewport_size_y).ToFloat32() * 2.f;
+        const f32 viewport_bottom = bottom;
+        const f32 viewport_top = top;
         if (rasterizer.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Include) {
             bottom = std::max(bottom, static_cast<f32>(rasterizer.scissor_test.y1));
             top = std::min(top, static_cast<f32>(rasterizer.scissor_test.y2) + 1.f);
         }
+        const bool whole_viewport = bottom == viewport_bottom && top == viewport_top;
         bottom = std::clamp(std::floor(bottom), 0.f, static_cast<f32>(height));
         top = std::clamp(std::ceil(top), 0.f, static_cast<f32>(height));
         if (top > bottom) {
-            step.first_row = Common::AlignDown(height - static_cast<u32>(top), TILE_ROWS);
-            step.last_row =
-                std::min(height, Common::AlignUp(height - static_cast<u32>(bottom), TILE_ROWS));
+            const u32 first = height - static_cast<u32>(top);
+            const u32 last = height - static_cast<u32>(bottom);
+            step.first_row = Common::AlignDown(first, TILE_ROWS);
+            step.last_row = std::min(height, Common::AlignUp(last, TILE_ROWS));
+            rows_exact = whole_viewport && step.first_row == first && step.last_row == last &&
+                         viewport_bottom >= 0.f && viewport_top <= static_cast<f32>(height) &&
+                         viewport_bottom == std::floor(viewport_bottom) &&
+                         viewport_top == std::floor(viewport_top);
         }
     }
+    overwrites_colour = overwrites_colour && rows_exact && !shadow;
+    overwrites_depth = overwrites_depth && rows_exact && !shadow;
 
     const PAddr colour = framebuffer.GetColorBufferPhysicalAddress();
     const bool writes_colour = colour != 0 && framebuffer.allow_color_write != 0 &&
@@ -473,8 +539,8 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
             MemoryLayout::Make(MemoryLayout::Colour, width, bytes_per_pixel * 8);
         colour_range = RowsOf(step, 0, step.first_row, step.last_row);
         step.writes[0] = colour_range;
-        step.replaces = replaces_target;
-        step.renews = replaces_target;
+        step.replaces = replaces_target || overwrites_colour;
+        step.renews = step.replaces;
         written.Add(MemoryRange{colour_range.start, colour_range.end});
     }
 
@@ -492,6 +558,10 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
         if (writes_depth) {
             step.writes[1] = depth_range;
             written.Add(MemoryRange{depth_range.start, depth_range.end});
+            // A clear done by drawing: games whose two eyes share a depth buffer clear it
+            // this way before each (Star Fox 64 3D), and what the other eye left in it is
+            // then no part of this one
+            step.replaces_depth = overwrites_depth;
         }
     }
 
@@ -501,7 +571,9 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     if (writes_colour && !step.replaces) {
         AddRead(step, colour_range, Link{.how = Link::How::Rows, .buffer = 0});
     }
-    AddRead(step, depth_range, Link{.how = Link::How::Rows, .buffer = 1});
+    if (!step.replaces_depth) {
+        AddRead(step, depth_range, Link{.how = Link::How::Rows, .buffer = 1});
+    }
     if (step.writes[0].Empty() && step.writes[1].Empty()) {
         // Nothing to go by rows with
         step.first_row = 0;
@@ -571,7 +643,14 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     key = Mix(key, (static_cast<u64>(colour_range.start) << 32) | colour_range.end);
     key = Mix(key, colour_range.layout);
     key = Mix(key, (static_cast<u64>(depth_range.start) << 1) | (writes_depth ? 1 : 0));
-    key = Mix(key, (step.replaces ? 1 : 0) | (may_leave_out ? 0 : 2));
+    // (With the stencil test on it is another kind of work: it writes what a draw without
+    // it does not, and what was learned of the one says nothing of the other)
+    key = Mix(key, (step.replaces ? 1 : 0) | (may_leave_out ? 0 : 2) |
+                       (step.replaces_depth ? 4 : 0) | (stencil ? 8 : 0));
+    if (stencil) {
+        stencil_seen = true;
+        stencil_last_frame = frame;
+    }
     for (const MemoryRange& read : step.reads) {
         key = Mix(key, read.start);
     }
@@ -622,10 +701,21 @@ bool FrameLiveness::ShouldAllowTransfer(const Pica::DisplayTransferConfig& confi
             height /= 2;
         }
         // A transfer reads rows of pixels, which is an image only as what was drawn with
-        // rows of that length
+        // rows of that length. It reads as many rows as it puts out (as many as its output
+        // has before it is halved), not as many as the game says the source has: a game
+        // takes a screen out of the upper part of a buffer by starting some rows in, and the
+        // rows it says the source has then reach as far beyond the end of the buffer, into
+        // what lies behind it. Taken as read, that made work on the buffer behind it needed
+        // that was not, and where that work had been left out, it made a wrong guess of what
+        // was none (Kid Icarus: Uprising in play, three times in ten minutes, each with all
+        // work carried out for longer).
         const u32 bytes_per_pixel = Pica::BytesPerPixel(config.input_format);
+        const u32 rows_read = config.output_height;
+        const u32 last_row_read = std::min<u32>(config.output_width, config.input_width);
+        const u32 pixels_read =
+            rows_read == 0 ? 0 : (rows_read - 1) * config.input_width + last_row_read;
         source = {
-            input, input + config.input_width * config.input_height * bytes_per_pixel,
+            input, input + pixels_read * bytes_per_pixel,
             MemoryLayout::Make(MemoryLayout::Colour, config.input_width, bytes_per_pixel * 8)};
         destination = {output, output + width * height * Pica::BytesPerPixel(config.output_format)};
         step.kind = Kind::Transfer;
@@ -707,11 +797,17 @@ bool FrameLiveness::Submit(Step& step) {
                 if (step.renews) {
                     stale.Remove(step.writes[0]);
                 }
+                if (step.replaces_depth) {
+                    stale.Remove(step.writes[1]);
+                }
             } else if (step.shown) {
                 Mispredicted(names[kind], *stale_for_rows);
             } else {
                 if (step.renews) {
                     stale.Remove(step.writes[0]);
+                }
+                if (step.replaces_depth) {
+                    stale.Remove(step.writes[1]);
                 }
                 for (u32 buffer = 0; buffer < 2; buffer++) {
                     if (!step.writes[buffer].Empty()) {
@@ -829,7 +925,18 @@ void FrameLiveness::NoteDisplay() {
 }
 
 void FrameLiveness::Mispredicted(const char* reader, const MemoryRange& range) {
-    distrust = DISTRUST_FRAMES << std::min(wrong_guesses, MAX_DISTRUST_DOUBLINGS);
+    // Wrong guesses that follow each other closely are a game doing now this, now that, and
+    // each is met with twice the time of the one before. One that comes long after the last
+    // (eight times the time that one was given) is a new situation, and starts from the
+    // beginning: a game played for an hour would otherwise end up with all its work carried
+    // out for minutes on end after every change of scene that goes wrong.
+    if (frames_since_wrong_guess >= u64{last_distrust} * 8) {
+        distrust_doublings = 0;
+    }
+    distrust = DISTRUST_FRAMES << std::min(distrust_doublings, MAX_DISTRUST_DOUBLINGS);
+    distrust_doublings++;
+    last_distrust = distrust;
+    frames_since_wrong_guess = 0;
     wrong_guesses++;
     LOG_WARNING(HW_GPU,
                 "Work that was left out turned out to be needed: {} reads {:08X}-{:08X}. "
@@ -880,6 +987,9 @@ void FrameLiveness::LookAtLastFrames() {
                 if (step.replaces) {
                     live.Remove(step.writes[0]);
                 }
+                if (step.replaces_depth) {
+                    live.Remove(step.writes[1]);
+                }
                 AddReadsFor(step, first, last, live);
                 continue;
             }
@@ -929,6 +1039,61 @@ void FrameLiveness::LookAtLastFrames() {
     }
 }
 
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+void FrameLiveness::LogOutline() const {
+    const std::size_t offset = previous.size();
+    if (needed.size() != offset + current.size()) {
+        return;
+    }
+    static constexpr std::array<const char*, static_cast<std::size_t>(Kind::Count)> names{
+        "draws", "copy", "transfer", "fill", "read by the game"};
+    const auto index = [](Kind kind) { return static_cast<std::size_t>(kind); };
+    LOG_INFO(HW_GPU,
+             "Unseen work, a frame in outline: a transfer is left out but none of the {} draws "
+             "({} fills, {} transfers, {} copies)",
+             seen[index(Kind::Draw)], seen[index(Kind::Fill)], seen[index(Kind::Transfer)],
+             seen[index(Kind::Copy)]);
+    u32 lines = 0;
+    for (std::size_t i = 0; i < current.size() && lines < 28; lines++) {
+        const Step& step = current[i];
+        if (step.kind == Kind::Draw) {
+            // Draws one after the other to the same buffers, as one line
+            std::size_t end = i;
+            u32 needed_ones = 0;
+            u32 replacing = 0;
+            u32 replacing_depth = 0;
+            while (end < current.size() && current[end].kind == Kind::Draw &&
+                   current[end].buffer_start == step.buffer_start) {
+                needed_ones += needed[offset + end] ? 1 : 0;
+                replacing += current[end].replaces ? 1 : 0;
+                replacing_depth += current[end].replaces_depth ? 1 : 0;
+                end++;
+            }
+            LOG_INFO(HW_GPU,
+                     "Unseen work, outline: {} kinds of draw to colour {:08X}, depth {:08X}: {} "
+                     "needed, {} replace the colour the target held and {} its depth, the first "
+                     "writes {:08X}-{:08X}",
+                     end - i, step.buffer_start[0], step.buffer_start[1], needed_ones, replacing,
+                     replacing_depth, step.writes[0].start, step.writes[0].end);
+            i = end;
+            continue;
+        }
+        const auto verdict = verdicts.find(step.key);
+        const bool out =
+            verdict != verdicts.end() && verdict->second.unneeded_streak >= REQUIRED_UNNEEDED;
+        const MemoryRange read = step.reads.empty() ? MemoryRange{} : step.reads[0];
+        LOG_INFO(HW_GPU, "Unseen work, outline: {} from {:08X}-{:08X} to {:08X}-{:08X}: {}{}",
+                 names[index(step.kind)], read.start, read.end, step.writes[0].start,
+                 step.writes[0].end,
+                 step.shown           ? "shown"
+                 : needed[offset + i] ? "needed"
+                                      : "not needed",
+                 out ? ", left out" : "");
+        i++;
+    }
+}
+#endif
+
 void FrameLiveness::EndFrame() {
     UpdateActive();
     if (!active) {
@@ -967,11 +1132,24 @@ void FrameLiveness::EndFrame() {
                  seen[index(Kind::GuestRead)], verdicts.size(), stale.Size(), distrust,
                  wrong_guesses);
     }
+    // A game whose image for one eye goes nowhere, the transfer of it is left out, and yet
+    // every draw is carried out: something after it reads what those draws leave behind.
+    // What a frame of it is made of is written down once it has been so for a while, and once
+    // more much later (play, after a menu), for a log that is sent in to tell which case it is.
+    const bool draws_kept = distrust == 0 && left_out[index(Kind::Transfer)] != 0 &&
+                            left_out[index(Kind::Draw)] == 0 && seen[index(Kind::Draw)] >= 20;
+    outline_streak = draws_kept ? outline_streak + 1 : std::min<s32>(outline_streak, 0);
+    if (outline_streak >= 120 && outlines_logged < 2) {
+        outlines_logged++;
+        outline_streak = -3600;
+        LogOutline();
+    }
 #endif
 
     if (distrust != 0) {
         distrust--;
     }
+    frames_since_wrong_guess = std::min<u64>(frames_since_wrong_guess + 1, u64{1} << 40);
     if (frame % 256 == 0) {
         std::erase_if(verdicts, [this](const auto& entry) {
             return frame - entry.second.last_frame > FORGET_AFTER;

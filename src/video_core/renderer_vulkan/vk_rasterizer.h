@@ -255,6 +255,12 @@ private:
     /// Whether a draw of two triangles at the most has to wait for its pipeline: leaving
     /// it out until the pipeline is built would show, or last
     bool SmallDrawMustShow(bool is_indexed);
+    /// The rectangle of its target, in the target's pixels, that the draw about to be made
+    /// can write to: the box around its triangles where they are few, with a console pixel to
+    /// spare, and the rectangle the draw is confined to otherwise
+    Common::Rectangle<u32> WrittenBy(bool accelerate, bool is_indexed,
+                                     const Common::Rectangle<u32>& draw_rect,
+                                     const VideoCore::ViewportInfo& viewport, u32 res_scale);
     /// What the draw that comes next overwrites of the area it is confined to
     bool next_draw_overwrites_color{};
     bool next_draw_overwrites_depth{};

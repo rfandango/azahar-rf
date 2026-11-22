@@ -211,6 +211,11 @@ public:
     std::chrono::microseconds LastIntervalWork() const {
         return last_interval_work;
     }
+    /// How much of LastIntervalWork the calling thread was running, the rest being waits.
+    /// Zero where the system does not tell.
+    std::chrono::microseconds LastIntervalCpu() const {
+        return last_interval_cpu;
+    }
 
     bool IsFrameAdvancing() const;
     /**
@@ -269,6 +274,8 @@ private:
     std::chrono::microseconds frame_limiting_delta_err{0};
     std::chrono::microseconds last_interval_emulated{0};
     std::chrono::microseconds last_interval_work{0};
+    std::chrono::microseconds last_interval_cpu{0};
+    std::chrono::microseconds previous_cpu_time{0};
 
     /// Whether to use frame advancing (i.e. frame by frame)
     std::atomic_bool frame_advancing_enabled;

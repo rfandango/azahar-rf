@@ -21,13 +21,13 @@
 #include "core/core.h"
 #include "core/memory.h"
 #include "video_core/debug_utils/debug_utils.h"
-#include "video_core/frame_liveness.h"
 #include "video_core/frame_state_dump.h"
 #include "video_core/pica/output_vertex.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader/shader.h"
+#include "video_core/work_rules.h"
 
 namespace Pica {
 
@@ -500,23 +500,6 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     FlushSoftwareBatch();
 }
 
-void PicaCore::NoteTargetCommand() {
-    TwinPass& twin = twin_pass;
-    if (twin.phase == TwinPass::Phase::Copied || twin.phase == TwinPass::Phase::Second) {
-        // Not the pattern: nothing but draws lies between the copy and the blending
-        if (twin.frames_alike >= TwinPass::FRAMES_ALIKE) {
-            LOG_INFO(HW_GPU,
-                     "The scene drawn twice at {:08X} is no longer: a fill or a transfer "
-                     "came within its second pass ({} draws of it were left out)",
-                     twin.target, twin.left_out_now);
-        }
-        twin.frames_alike = 0;
-    }
-    twin.phase = TwinPass::Phase::Idle;
-    twin.run_target = 0;
-    twin.run_draws = 0;
-}
-
 template <typename Func>
 void PicaCore::ForTwinRegisters(bool clears, Func&& func) const {
     const auto& texturing = regs.internal.texturing;
@@ -655,282 +638,6 @@ const PicaCore::UniformSet& PicaCore::FloatUniformsRead() {
         uniforms_read.clear();
     }
     return uniforms_read.emplace_back(key, set).second;
-}
-
-bool PicaCore::IsTwinOf(const TwinPass::Draw& first, bool clears, u64 state) {
-    if (first.clear != clears || first.state != state) {
-        return false;
-    }
-    if (clears) {
-        return true;
-    }
-    const auto& now = vs_setup.uniforms.f;
-    if (std::memcmp(now.data(), first.uniforms.data(), sizeof(first.uniforms)) == 0) {
-        return true;
-    }
-    // Only those the program reads: the others hold what earlier draws left there
-    const UniformSet& read = FloatUniformsRead();
-    u32 differing = 0;
-    for (u32 i = 0; i < now.size(); i++) {
-        if ((read[i / 64] >> (i % 64) & 1) == 0 ||
-            std::memcmp(&now[i], &first.uniforms[i], sizeof(now[i])) == 0) {
-            continue;
-        }
-        if (++differing > TwinPass::MAX_DIFFERING) {
-            return false;
-        }
-        // Against the size of what is around it: the rows of the matrix it is one of
-        float scale = 1e-4f;
-        for (u32 j = i >= 3 ? i - 3 : 0; j < std::min<u32>(i + 4, 96); j++) {
-            const auto& row = first.uniforms[j];
-            scale = std::max({scale, std::abs(row.x.ToFloat32()), std::abs(row.y.ToFloat32()),
-                              std::abs(row.z.ToFloat32()), std::abs(row.w.ToFloat32())});
-        }
-        const float shift =
-            std::max({std::abs(now[i].x.ToFloat32() - first.uniforms[i].x.ToFloat32()),
-                      std::abs(now[i].y.ToFloat32() - first.uniforms[i].y.ToFloat32()),
-                      std::abs(now[i].z.ToFloat32() - first.uniforms[i].z.ToFloat32()),
-                      std::abs(now[i].w.ToFloat32() - first.uniforms[i].w.ToFloat32())}) /
-            scale;
-        // (also false for a value that is not a number)
-        if (!(shift <= TwinPass::MAX_SHIFT)) {
-            return false;
-        }
-        twin_pass.largest_shift = std::max(twin_pass.largest_shift, shift);
-    }
-    twin_pass.most_differing = std::max(twin_pass.most_differing, differing);
-    return true;
-}
-
-void PicaCore::ExplainNoTwin(bool clears) {
-    TwinPass& twin = twin_pass;
-    if (twin.explained >= 12) {
-        return;
-    }
-    twin.explained++;
-    std::string why;
-    if (twin.at >= twin.first.size()) {
-        why = fmt::format("the first pass has only {} draws on record", twin.first.size());
-    } else {
-        const TwinPass::Draw& first = twin.first[twin.at];
-        if (first.clear != clears) {
-            why = fmt::format("it {} all of its viewport, its counterpart {}",
-                              clears ? "overwrites" : "does not overwrite",
-                              first.clear ? "does" : "does not");
-        } else if (first.state != TwinState(clears)) {
-            why = "registers differ:";
-            u32 listed = 0;
-            if (twin.at < twin.first_regs.size()) {
-                const auto& before = twin.first_regs[twin.at];
-                const auto& now = regs.internal.reg_array;
-                ForTwinRegisters(clears, [&](u32 from, u32 to) {
-                    for (u32 i = from; i < to && listed < 24; i++) {
-                        if (before[i] != now[i]) {
-                            why += fmt::format(" {:03X}: {:08X}->{:08X}", i, before[i], now[i]);
-                            listed++;
-                        }
-                    }
-                });
-            }
-            if (listed == 0) {
-                why += " none of those that are compared now, so the vertex shader's program "
-                       "or which registers are in use";
-            }
-        } else {
-            const auto& now = vs_setup.uniforms.f;
-            const UniformSet& read = FloatUniformsRead();
-            u32 differing = 0;
-            float largest = 0.f;
-            std::string which;
-            for (u32 i = 0; i < now.size(); i++) {
-                if ((read[i / 64] >> (i % 64) & 1) == 0 ||
-                    std::memcmp(&now[i], &first.uniforms[i], sizeof(now[i])) == 0) {
-                    continue;
-                }
-                differing++;
-                float scale = 1e-4f;
-                for (u32 j = i >= 3 ? i - 3 : 0; j < std::min<u32>(i + 4, 96); j++) {
-                    const auto& row = first.uniforms[j];
-                    scale =
-                        std::max({scale, std::abs(row.x.ToFloat32()), std::abs(row.y.ToFloat32()),
-                                  std::abs(row.z.ToFloat32()), std::abs(row.w.ToFloat32())});
-                }
-                const float shift =
-                    std::max({std::abs(now[i].x.ToFloat32() - first.uniforms[i].x.ToFloat32()),
-                              std::abs(now[i].y.ToFloat32() - first.uniforms[i].y.ToFloat32()),
-                              std::abs(now[i].z.ToFloat32() - first.uniforms[i].z.ToFloat32()),
-                              std::abs(now[i].w.ToFloat32() - first.uniforms[i].w.ToFloat32())}) /
-                    scale;
-                largest = std::max(largest, shift);
-                if (differing <= 6) {
-                    which += fmt::format(
-                        " c{} ({:.4f} {:.4f} {:.4f} {:.4f} -> {:.4f} {:.4f} {:.4f} {:.4f})", i,
-                        first.uniforms[i].x.ToFloat32(), first.uniforms[i].y.ToFloat32(),
-                        first.uniforms[i].z.ToFloat32(), first.uniforms[i].w.ToFloat32(),
-                        now[i].x.ToFloat32(), now[i].y.ToFloat32(), now[i].z.ToFloat32(),
-                        now[i].w.ToFloat32());
-                }
-            }
-            why = fmt::format("of the {} float uniforms its shader reads {} differ, by {:.4f} "
-                              "of what is around them at the most:{}",
-                              std::popcount(read[0]) + std::popcount(read[1]), differing, largest,
-                              which);
-        }
-    }
-    LOG_INFO(HW_GPU, "Second pass at {:08X}: draw {} of {} ({} vertices) is no twin: {}",
-             twin.target, twin.at, twin.first_draws, regs.internal.pipeline.num_vertices, why);
-}
-
-bool PicaCore::IsLeftOutTwin(bool clears) {
-    using Phase = TwinPass::Phase;
-    using BlendFactor = FramebufferRegs::BlendFactor;
-    TwinPass& twin = twin_pass;
-    const PAddr color = regs.internal.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
-    const auto& pipeline = regs.internal.pipeline;
-    const auto& texturing = regs.internal.texturing;
-    const auto& merger = regs.internal.framebuffer.output_merger;
-    // A quad that samples one texture: what copies an image, or blends one over another
-    const bool quad = pipeline.num_vertices == 4 && pipeline.use_gs == PipelineRegs::UseGS::No;
-    const PAddr sampled =
-        quad && texturing.main_config.texture0_enable ? texturing.texture0.GetPhysicalAddress() : 0;
-    const bool replaces =
-        !merger.alphablend_enable || (merger.alpha_blending.factor_source_rgb == BlendFactor::One &&
-                                      merger.alpha_blending.factor_dest_rgb == BlendFactor::Zero);
-
-    if (twin.phase == Phase::Copied) {
-        if (color == twin.target) {
-            twin.phase = Phase::Second;
-            twin.at = 0;
-            twin.left_out_now = 0;
-            twin.twins = twin.compared;
-            twin.leaving_out = twin.compared && twin.frames_alike >= TwinPass::FRAMES_ALIKE &&
-                               Settings::values.resolution_factor.GetValue() != 1 &&
-                               (Common::TraceMarkers::Experiments3() &
-                                Common::TraceMarkers::KeepSecondScenePass) == 0;
-        } else {
-            twin.phase = Phase::Idle;
-        }
-    }
-
-    if (twin.phase == Phase::Second) {
-        if (color == twin.target && quad && sampled == twin.keep && sampled != 0 && !replaces) {
-            // The quad that blends the first image over the second
-            const bool whole = twin.at == twin.first_draws;
-            const u32 apart = twin.at > twin.first_draws ? twin.at - twin.first_draws
-                                                         : twin.first_draws - twin.at;
-            if (apart <= twin.first_draws / 8) {
-                // The bare pattern: worth comparing draw by draw from the next frame on
-                if (twin.watched_target != twin.target) {
-                    LOG_INFO(HW_GPU,
-                             "A scene that may be drawn twice: runs of {} and {} draws to {:08X} "
-                             "with a copy to {:08X} between them and a blend of it after",
-                             twin.first_draws, twin.at, twin.target, twin.keep);
-                }
-                twin.watched_target = twin.target;
-            }
-            if (twin.compared) {
-                const bool alike = twin.twins && whole;
-                if (alike && ++twin.frames_alike == TwinPass::FRAMES_ALIKE) {
-                    LOG_INFO(HW_GPU,
-                             "The game draws its scene twice at {:08X} and blends the two images "
-                             "(kept at {:08X}): {} draws each, every one of the second pass like "
-                             "the one at its place in the first but for {} float uniforms at "
-                             "the most, off by {:.4f} of what is around them at the most. The "
-                             "second pass is left out from here on where the resolution is "
-                             "above the console's.",
-                             twin.target, twin.keep, twin.first_draws, twin.most_differing,
-                             twin.largest_shift);
-                } else if (!alike) {
-                    if (twin.frames_alike >= TwinPass::FRAMES_ALIKE) {
-                        LOG_INFO(HW_GPU,
-                                 "The scene drawn twice at {:08X}: the second pass was not like "
-                                 "the first this time ({} draws against {}, {} left out)",
-                                 twin.target, twin.at, twin.first_draws, twin.left_out_now);
-                    }
-                    twin.frames_alike = 0;
-                }
-                twin.frames_alike = std::min(twin.frames_alike, 1u << 20);
-            }
-            const bool leave_out = twin.leaving_out && whole && twin.left_out_now == twin.at;
-            twin.phase = Phase::Idle;
-            twin.run_target = color;
-            twin.run_draws = 1;
-            if (leave_out) {
-                twin.left_out.fetch_add(1, std::memory_order_relaxed);
-            }
-            return leave_out;
-        }
-        if (color == twin.target) {
-            // A draw of the second pass
-            bool is_twin = false;
-            if (twin.twins && twin.at < twin.first.size()) {
-                is_twin = IsTwinOf(twin.first[twin.at], clears, TwinState(clears));
-            }
-            if (!is_twin) {
-                if (twin.twins && (Common::TraceMarkers::Experiments3() &
-                                   Common::TraceMarkers::ExplainScenePasses) != 0) {
-                    ExplainNoTwin(clears);
-                }
-                twin.twins = false;
-                twin.leaving_out = false;
-            }
-            twin.at++;
-            if (is_twin && twin.leaving_out) {
-                twin.left_out_now++;
-                twin.left_out.fetch_add(1, std::memory_order_relaxed);
-                return true;
-            }
-            return false;
-        }
-        // The second run ended without the blending: not the pattern
-        if (twin.frames_alike >= TwinPass::FRAMES_ALIKE) {
-            LOG_INFO(HW_GPU,
-                     "The scene drawn twice at {:08X} is no longer: its second pass "
-                     "ended without the blending ({} draws of it were left out)",
-                     twin.target, twin.left_out_now);
-        }
-        twin.frames_alike = 0;
-        twin.phase = Phase::Idle;
-        twin.run_target = 0;
-    }
-
-    if (color != twin.run_target) {
-        if (twin.phase == Phase::First && quad && sampled == twin.run_target && sampled != 0 &&
-            replaces && twin.run_draws >= TwinPass::MIN_DRAWS) {
-            // The quad that copies what the run drew to somewhere else
-            twin.target = twin.run_target;
-            twin.keep = color;
-            twin.first_draws = twin.run_draws;
-            twin.compared = twin.first.size() == twin.run_draws;
-            twin.phase = Phase::Copied;
-            twin.run_target = color;
-            twin.run_draws = 1;
-            return false;
-        }
-        twin.phase = Phase::First;
-        twin.run_target = color;
-        twin.run_draws = 0;
-        twin.first.clear();
-        twin.first_regs.clear();
-    }
-    if (twin.phase == Phase::First) {
-        if (color == twin.watched_target && twin.first.size() == twin.run_draws &&
-            twin.run_draws < TwinPass::MAX_DRAWS) {
-            TwinPass::Draw& draw = twin.first.emplace_back();
-            draw.state = TwinState(clears);
-            draw.clear = clears;
-            if (!clears) {
-                std::memcpy(draw.uniforms.data(), vs_setup.uniforms.f.data(),
-                            sizeof(draw.uniforms));
-            }
-            if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) !=
-                0) {
-                twin.first_regs.push_back(regs.internal.reg_array);
-            }
-        }
-        twin.run_draws++;
-    }
-    return false;
 }
 
 void PicaCore::FlushSoftwareBatch() {
@@ -1640,9 +1347,7 @@ void PicaCore::DrawImmediate() {
 
     // Flush the immediate triangle. Its vertices are with the rasterizer already, so it is
     // carried out in any case.
-    if (draw_filter) {
-        draw_filter->ShouldAllowDraw(regs.internal, false, false);
-    }
+    TellRulesOfImmediateDraw();
     sw_batch_open = false;
     sw_batch_draws = 0;
     rasterizer->DrawTriangles();
@@ -1660,6 +1365,8 @@ namespace {
 struct Overwrites {
     bool color{};
     bool depth{};
+    /// Every pixel's depth there, whatever becomes of its stencil
+    bool depth_values{};
 };
 
 Overwrites MayOverwriteArea(const RegsInternal& regs) {
@@ -1668,9 +1375,10 @@ Overwrites MayOverwriteArea(const RegsInternal& regs) {
     const auto& merger = regs.framebuffer.output_merger;
     const auto& rasterizer = regs.rasterizer;
 
-    // Two triangles at the most, and no fragment of them is dropped. Whether they face the way
-    // that is drawn is looked at with their vertices, in CoversViewport.
-    if (regs.pipeline.num_vertices > 6 || merger.alpha_test.enable || rasterizer.clip_enable ||
+    // Few triangles, and no fragment of them is dropped. Whether they cover the viewport and
+    // face the way that is drawn is looked at with their vertices, in CoversViewport.
+    if (regs.pipeline.num_vertices > PicaCore::MAX_COVER_VERTICES_LARGE ||
+        merger.alpha_test.enable || rasterizer.clip_enable ||
         merger.fragment_operation_mode != FramebufferRegs::FragmentOperationMode::Default) {
         return {};
     }
@@ -1723,10 +1431,124 @@ Overwrites MayOverwriteArea(const RegsInternal& regs) {
                       (action == Action::Replace || action == Action::Zero);
     }
     result.depth = may_write && merger.depth_write_enable && new_stencil;
+    result.depth_values = may_write && merger.depth_write_enable;
     return result;
 }
 
 } // Anonymous namespace
+
+/// The draw about to be made, as the rules that leave work out get to ask about it. What
+/// costs something is worked out when first asked for and kept.
+class PicaCore::Facts final : public VideoCore::DrawFacts {
+public:
+    Facts(PicaCore& pica_, bool is_indexed_, bool immediate_)
+        : pica{pica_}, is_indexed{is_indexed_}, immediate{immediate_} {}
+
+    const RegsInternal& Regs() const override {
+        return pica.regs.internal;
+    }
+    bool IsImmediate() const override {
+        return immediate;
+    }
+    bool MayOverwriteColour() override {
+        return May().color;
+    }
+    bool MayOverwriteDepth() override {
+        return May().depth;
+    }
+    bool MayOverwriteDepthValues() override {
+        return May().depth_values;
+    }
+    bool CoversViewport() override {
+        if (!IsLarge()) {
+            Cover();
+            return covers;
+        }
+        // A mesh: looked at only where it would reset the depth buffer (a backdrop drawn
+        // with the depth test at always), which is what makes it worth shading hundreds
+        // of vertices here
+        if (!large_known) {
+            large_covers = !immediate && May().depth_values &&
+                           pica.LargeMeshCoversPixels(is_indexed, StateHash(false));
+            large_known = true;
+        }
+        return large_covers;
+    }
+    bool CoversViewportExactly() override {
+        if (IsLarge()) {
+            return false;
+        }
+        Cover();
+        return covers && exactly;
+    }
+    bool ViewportSpansTarget() override {
+        const auto& rasterizer = pica.regs.internal.rasterizer;
+        return rasterizer.viewport_corner.x <= 0 &&
+               static_cast<f32>(rasterizer.viewport_corner.x) +
+                       f24::FromRaw(rasterizer.viewport_size_x).ToFloat32() * 2.f >=
+                   static_cast<f32>(pica.regs.internal.framebuffer.framebuffer.GetWidth());
+    }
+    bool TextureRows(VideoCore::DrawTextureRows& rows) override {
+        return !immediate && pica.TextureRowsOfDraw(is_indexed, rows);
+    }
+    u64 StateHash(bool as_clear) override {
+        const std::size_t which = as_clear ? 1 : 0;
+        if (!hash_known[which]) {
+            hash[which] = pica.TwinState(as_clear);
+            hash_known[which] = true;
+        }
+        return hash[which];
+    }
+    void ForStateRegisters(bool as_clear,
+                           const std::function<void(u32, u32)>& stretch) const override {
+        pica.ForTwinRegisters(as_clear, stretch);
+    }
+    const FloatUniforms& Uniforms() const override {
+        return pica.vs_setup.uniforms.f;
+    }
+    const UniformSet& UniformsRead() override {
+        return pica.FloatUniformsRead();
+    }
+
+private:
+    const Overwrites& May() {
+        if (!may_known) {
+            // (Nothing is known of the triangles of an immediate draw)
+            may = immediate ? Overwrites{} : MayOverwriteArea(pica.regs.internal);
+            may_known = true;
+        }
+        return may;
+    }
+    bool IsLarge() const {
+        return pica.regs.internal.pipeline.num_vertices > MAX_COVER_VERTICES;
+    }
+    void Cover() {
+        if (!cover_known) {
+            covers = !immediate && pica.CoversViewport(is_indexed, &exactly);
+            cover_known = true;
+        }
+    }
+
+    PicaCore& pica;
+    bool is_indexed;
+    bool immediate;
+    bool may_known{};
+    bool cover_known{};
+    bool covers{};
+    bool exactly{};
+    bool large_known{};
+    bool large_covers{};
+    Overwrites may;
+    std::array<bool, 2> hash_known{};
+    std::array<u64, 2> hash{};
+};
+
+void PicaCore::TellRulesOfImmediateDraw() {
+    if (work_rules != nullptr) {
+        Facts facts{*this, false, true};
+        work_rules->LeavesOutDraw(facts);
+    }
+}
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
@@ -1736,40 +1558,13 @@ void PicaCore::DrawArrays(bool is_indexed) {
         MeasureDrawSite(cmd_list.addr, cmd_list.current_index, regs.internal.reg_array);
     }
 
-    // Whether the triangles of a draw cover the viewport is of use twice over: a draw that
-    // replaces all its target holds ends the life of what was drawn there before, and one that
-    // overwrites the area it is confined to lets the renderer begin without what that held.
-    const bool may_replace_target = draw_filter && draw_filter->MayReplaceTarget(regs.internal);
-    const Overwrites may_overwrite = MayOverwriteArea(regs.internal);
-    bool covers_viewport = false;
-    bool covers_exactly = false;
-    if (may_replace_target || may_overwrite.color || may_overwrite.depth) {
-        covers_viewport = CoversViewport(is_indexed, &covers_exactly);
-    }
-
-    // A draw that only repeats one already made, a part of a pixel apart, is left out
-    if (IsLeftOutTwin(covers_viewport && may_overwrite.color)) {
-        CITRA_FRAME_DUMP("draw left out: the twin of a draw of the scene's first pass");
+    // A draw that need not be made is left out: one whose result nobody sees, one that only
+    // makes over again what is there (VideoCore::WorkRules). The registers were written as
+    // usual.
+    Facts facts{*this, is_indexed, false};
+    if (work_rules != nullptr && work_rules->LeavesOutDraw(facts)) {
+        CITRA_FRAME_DUMP("draw left out: {}", work_rules->LastWhy());
         return;
-    }
-    // The quad that keeps the first image of a scene drawn twice is always drawn. While the
-    // second pass and the blending are left out nothing reads that image, and it would be
-    // taken for work nobody sees; the frame in which the second pass is not like the first
-    // after all blends it in, and must not get an old one.
-    const bool keeps_first_image =
-        twin_pass.phase == TwinPass::Phase::Copied && twin_pass.target == twin_pass.watched_target;
-
-    // A draw whose result nobody will see is left out. The registers were written as usual.
-    if (draw_filter) {
-        VideoCore::DrawTextureRows texture_rows;
-        const bool rows_known = draw_filter->WantsTextureRows(regs.internal) &&
-                                TextureRowsOfDraw(is_indexed, texture_rows);
-        if (!draw_filter->ShouldAllowDraw(regs.internal, may_replace_target && covers_viewport,
-                                          !keeps_first_image,
-                                          rows_known ? &texture_rows : nullptr)) {
-            CITRA_FRAME_DUMP("draw left out: nobody sees its result");
-            return;
-        }
     }
 
     // Track vertex in the debug recorder.
@@ -1832,15 +1627,18 @@ void PicaCore::DrawArrays(bool is_indexed) {
 
     // A pixel of the target is several of the host's, which are all overwritten only by
     // triangles that reach the edges of the viewport, not just the middle of its last pixels
-    const bool overwrites = covers_viewport && covers_exactly;
-    const bool tells_overwrite = overwrites && (may_overwrite.color || may_overwrite.depth);
+    const bool may_overwrite_color = facts.MayOverwriteColour();
+    const bool may_overwrite_depth = facts.MayOverwriteDepth();
+    const bool overwrites =
+        (may_overwrite_color || may_overwrite_depth) && facts.CoversViewportExactly();
+    const bool tells_overwrite = overwrites;
     // Draws shaded on the CPU that are waiting to be drawn together go first, before a draw
     // that is not added to them: one the host shades, or one the rasterizer is told about
     if (sw_batch_open && (accelerate_draw || tells_overwrite)) {
         FlushSoftwareBatch();
     }
-    rasterizer->NoteDrawOverwrites(overwrites && may_overwrite.color,
-                                   overwrites && may_overwrite.depth);
+    rasterizer->NoteDrawOverwrites(overwrites && may_overwrite_color,
+                                   overwrites && may_overwrite_depth);
 
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
@@ -1889,11 +1687,22 @@ ShaderEngine& PicaCore::EngineForFewVertices() {
 }
 
 float PicaCore::SmallDrawViewportShare(bool is_indexed) {
+    DrawBox box;
+    if (!SmallDrawBox(is_indexed, box)) {
+        return 1.f;
+    }
+    if (!(box.right > box.left && box.top > box.bottom)) {
+        return 0.f;
+    }
+    return (box.right - box.left) * (box.top - box.bottom) / 4.f;
+}
+
+bool PicaCore::SmallDrawBox(bool is_indexed, DrawBox& box) {
     const auto& pipeline = regs.internal.pipeline;
     const u32 count = pipeline.num_vertices;
     if (pipeline.use_gs != PipelineRegs::UseGS::No || !primitive_assembler.IsEmpty() ||
         count == 0 || count > 6) {
-        return 1.f;
+        return false;
     }
 
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
@@ -1901,7 +1710,7 @@ float PicaCore::SmallDrawViewportShare(bool is_indexed) {
     const u8* index_address_8 = memory.GpuRead(
         base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
     if (is_indexed && index_address_8 == nullptr) {
-        return 1.f;
+        return false;
     }
     const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
     const bool index_u16 = index_info.format != 0;
@@ -1932,17 +1741,15 @@ float PicaCore::SmallDrawViewportShare(bool is_indexed) {
         const f32 x = shaded.pos.x.ToFloat32() / w;
         const f32 y = shaded.pos.y.ToFloat32() / w;
         if (!(w > 0.f) || !std::isfinite(x) || !std::isfinite(y)) {
-            return 1.f;
+            return false;
         }
         left = std::min(left, std::clamp(x, -1.f, 1.f));
         right = std::max(right, std::clamp(x, -1.f, 1.f));
         bottom = std::min(bottom, std::clamp(y, -1.f, 1.f));
         top = std::max(top, std::clamp(y, -1.f, 1.f));
     }
-    if (!(right > left && top > bottom)) {
-        return 0.f;
-    }
-    return (right - left) * (top - bottom) / 4.f;
+    box = DrawBox{left, right, bottom, top};
+    return true;
 }
 
 bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
@@ -1955,7 +1762,7 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
     const u32 count = pipeline.num_vertices;
     const bool is_list = topology == Topology::List || topology == Topology::Shader;
     if (count != (is_list ? 6u : 4u)) {
-        return false;
+        return MeshCoversViewport(is_indexed, exactly);
     }
 
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
@@ -2081,6 +1888,433 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
         *exactly = at_corners;
     }
     return true;
+}
+
+namespace {
+
+using Point = Common::Vec2<f32>;
+/// A convex polygon
+using Polygon = boost::container::small_vector<Point, 10>;
+
+f32 Cross(const Point& a, const Point& b, const Point& c) {
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+/// The part of the polygon to the left of the line from a to b, or to its right
+Polygon SideOf(const Polygon& polygon, const Point& a, const Point& b, bool left) {
+    Polygon part;
+    const auto side = [&](const Point& point) {
+        const f32 cross = Cross(a, b, point);
+        return left ? cross : -cross;
+    };
+    for (std::size_t i = 0; i < polygon.size(); i++) {
+        const Point& from = polygon[i];
+        const Point& to = polygon[(i + 1) % polygon.size()];
+        const f32 from_side = side(from);
+        const f32 to_side = side(to);
+        if (from_side >= 0.f) {
+            part.push_back(from);
+        }
+        if ((from_side > 0.f && to_side < 0.f) || (from_side < 0.f && to_side > 0.f)) {
+            const f32 along = from_side / (from_side - to_side);
+            part.push_back(
+                Point{from.x + (to.x - from.x) * along, from.y + (to.y - from.y) * along});
+        }
+    }
+    return part;
+}
+
+f32 AreaOf(const Polygon& polygon) {
+    f32 twice = 0.f;
+    for (std::size_t i = 0; i < polygon.size(); i++) {
+        const Point& from = polygon[i];
+        const Point& to = polygon[(i + 1) % polygon.size()];
+        twice += from.x * to.y - to.x * from.y;
+    }
+    return std::abs(twice) / 2.f;
+}
+
+/// Pieces smaller than this, in pixels of the console, are what rounding leaves along the
+/// edges two triangles share
+constexpr f32 SLIVER = 1e-3f;
+
+f32 SignedAreaOf(const Polygon& polygon) {
+    f32 twice = 0.f;
+    for (std::size_t i = 0; i < polygon.size(); i++) {
+        const Point& from = polygon[i];
+        const Point& to = polygon[(i + 1) % polygon.size()];
+        twice += from.x * to.y - to.x * from.y;
+    }
+    return twice / 2.f;
+}
+
+/// Takes the convex shape away from the pieces
+void TakeAway(std::vector<Polygon>& pieces, Polygon shape) {
+    // Counter-clockwise, so that its inside is to the left of each of its edges
+    if (SignedAreaOf(shape) < 0.f) {
+        std::reverse(shape.begin(), shape.end());
+    }
+    std::vector<Polygon> left_over;
+    for (Polygon& piece : pieces) {
+        Polygon inside = std::move(piece);
+        for (std::size_t i = 0; i < shape.size() && inside.size() >= 3; i++) {
+            const Point& from = shape[i];
+            const Point& to = shape[(i + 1) % shape.size()];
+            // (Cutting leaves corners that fall together: no edge between those)
+            if (std::abs(to.x - from.x) + std::abs(to.y - from.y) < 1e-6f) {
+                continue;
+            }
+            Polygon outside = SideOf(inside, from, to, false);
+            if (outside.size() >= 3 && AreaOf(outside) > SLIVER) {
+                left_over.push_back(std::move(outside));
+            }
+            inside = SideOf(inside, from, to, true);
+        }
+    }
+    pieces = std::move(left_over);
+}
+
+/// A vertex as the vertex shader puts it out, and a convex polygon of such
+using ClipPoint = Common::Vec4<f32>;
+using ClipPolygon = boost::container::small_vector<ClipPoint, 8>;
+
+/// The part of the polygon where the value is not negative
+template <typename Value>
+ClipPolygon KeepWhere(const ClipPolygon& polygon, Value&& value) {
+    ClipPolygon part;
+    for (std::size_t i = 0; i < polygon.size(); i++) {
+        const ClipPoint& from = polygon[i];
+        const ClipPoint& to = polygon[(i + 1) % polygon.size()];
+        const f32 from_value = value(from);
+        const f32 to_value = value(to);
+        if (from_value >= 0.f) {
+            part.push_back(from);
+        }
+        if ((from_value > 0.f && to_value < 0.f) || (from_value < 0.f && to_value > 0.f)) {
+            const f32 along = from_value / (from_value - to_value);
+            part.push_back(
+                ClipPoint{from.x + (to.x - from.x) * along, from.y + (to.y - from.y) * along,
+                          from.z + (to.z - from.z) * along, from.w + (to.w - from.w) * along});
+        }
+    }
+    return part;
+}
+
+} // Anonymous namespace
+
+template <typename Sink>
+bool PicaCore::ForDrawnTriangles(bool is_indexed, u32 most_vertices, f32& width, f32& height,
+                                 Sink&& sink) {
+    using Topology = PipelineRegs::TriangleTopology;
+    const auto& pipeline = regs.internal.pipeline;
+    const Topology topology = pipeline.triangle_topology;
+    const u32 count = pipeline.num_vertices;
+    const bool is_list = topology == Topology::List || topology == Topology::Shader;
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || !primitive_assembler.IsEmpty() || count < 3 ||
+        count > most_vertices || (is_list && count % 3 != 0)) {
+        return false;
+    }
+
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const u8* index_address_8 = memory.GpuRead(
+        base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
+    if (is_indexed && index_address_8 == nullptr) {
+        return false;
+    }
+    const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+    const bool index_u16 = index_info.format != 0;
+
+    const VertexLoader loader(memory, pipeline);
+    ShaderUnit shader_unit;
+    // A mesh is shaded with the vertex shader made into host code, which is made for it here
+    // once if the host has not been shading on the CPU with it: hundreds of vertices with
+    // every frame are too many for the interpreter that a few vertices are given to
+    const bool mesh = count > MAX_COVER_VERTICES;
+    if (mesh) {
+        shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+    }
+    ShaderEngine& engine = mesh ? *shader_engine : EngineForFewVertices();
+
+    // In pixels of the console, from the corner of the viewport
+    width = f24::FromRaw(regs.internal.rasterizer.viewport_size_x).ToFloat32() * 2.f;
+    height = f24::FromRaw(regs.internal.rasterizer.viewport_size_y).ToFloat32() * 2.f;
+    if (!(width >= 1.f && height >= 1.f)) {
+        return false;
+    }
+    constexpr f32 DEPTH_TOLERANCE = 1e-4f;
+
+    boost::container::small_vector<ClipPoint, MAX_COVER_VERTICES> at(count);
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        shader_unit.LoadInput(regs.internal.vs, input);
+        engine.Run(vs_setup, shader_unit);
+        AttributeBuffer output;
+        shader_unit.WriteOutput(regs.internal.vs, output);
+        const OutputVertex shaded{regs.internal.rasterizer, output};
+        at[index] = ClipPoint{shaded.pos.x.ToFloat32(), shaded.pos.y.ToFloat32(),
+                              shaded.pos.z.ToFloat32(), shaded.pos.w.ToFloat32()};
+        if (!std::isfinite(at[index].x) || !std::isfinite(at[index].y) ||
+            !std::isfinite(at[index].z) || !std::isfinite(at[index].w)) {
+            return false;
+        }
+    }
+
+    using CullMode = RasterizerRegs::CullMode;
+    const CullMode cull_mode = regs.internal.rasterizer.cull_mode;
+    const bool culls =
+        cull_mode == CullMode::KeepClockWise || cull_mode == CullMode::KeepCounterClockWise;
+    const f32 kept = cull_mode == CullMode::KeepCounterClockWise ? 1.f : -1.f;
+    const u32 triangles = is_list ? count / 3 : count - 2;
+    for (u32 triangle = 0; triangle < triangles; triangle++) {
+        std::array<u32, 3> corner;
+        if (is_list) {
+            corner = {triangle * 3, triangle * 3 + 1, triangle * 3 + 2};
+        } else if (topology == Topology::Strip) {
+            // A strip takes the vertices of every other triangle the other way round
+            corner = triangle % 2 == 0 ? std::array<u32, 3>{triangle, triangle + 1, triangle + 2}
+                                       : std::array<u32, 3>{triangle + 1, triangle, triangle + 2};
+        } else {
+            corner = {0, triangle + 1, triangle + 2};
+        }
+        // What is in front of the depth range, behind it or behind the eye is cut off, as the
+        // console and the host do (a box around the scene, as a game may clear with, has faces
+        // that reach behind the range). As far outside of it as CoversViewport lets a vertex
+        // be still counts as inside.
+        ClipPolygon drawn{at[corner[0]], at[corner[1]], at[corner[2]]};
+        drawn = KeepWhere(drawn, [](const ClipPoint& p) { return p.w - 1e-6f; });
+        drawn = KeepWhere(drawn, [](const ClipPoint& p) { return p.w * DEPTH_TOLERANCE - p.z; });
+        drawn = KeepWhere(drawn,
+                          [](const ClipPoint& p) { return p.z + p.w * (1.f + DEPTH_TOLERANCE); });
+        if (drawn.size() < 3) {
+            continue;
+        }
+        Polygon shape;
+        // (A corner too far out to say where its edges pass to a part of a pixel: such a
+        // triangle is not counted on)
+        constexpr f32 FAR_OUT = 1e5f;
+        for (const ClipPoint& p : drawn) {
+            const Point point{(p.x / p.w + 1.f) * width / 2.f, (p.y / p.w + 1.f) * height / 2.f};
+            if (!(std::abs(point.x) < FAR_OUT && std::abs(point.y) < FAR_OUT)) {
+                shape.clear();
+                break;
+            }
+            shape.push_back(point);
+        }
+        if (shape.size() < 3) {
+            continue;
+        }
+        // Which way it faces, as in CoversViewport
+        const f32 area = SignedAreaOf(shape);
+        if (culls && !(area * kept > 0.f)) {
+            continue;
+        }
+        if (!(std::abs(area) > SLIVER)) {
+            continue;
+        }
+        if (!sink(std::move(shape))) {
+            break;
+        }
+    }
+    return true;
+}
+
+bool PicaCore::MeshCoversViewport(bool is_indexed, bool* exactly) {
+    // As in CoversViewport: every pixel is covered whose middle is, so the triangles may end
+    // up to nearly half a pixel inside of the viewport
+    constexpr f32 MAX_INSIDE = 0.45f;
+    constexpr f32 MAX_INSIDE_EXACTLY = 0.01f;
+    // What may be left uncovered in all, as rounding leaves it
+    constexpr f32 LEFT_BY_ROUNDING = 1e-2f;
+    constexpr std::size_t MOST_PIECES = 256;
+
+    // What of the viewport is not covered yet: all of it but a hair at its edges, from which
+    // what is drawn of each triangle is taken away
+    f32 width = 0.f;
+    f32 height = 0.f;
+    std::vector<Polygon> pieces;
+    bool begun = false;
+    bool too_many = false;
+    u32 triangles = 0;
+    const bool shaded =
+        ForDrawnTriangles(is_indexed, MAX_COVER_VERTICES, width, height, [&](Polygon&& shape) {
+            if (!begun) {
+                begun = true;
+                pieces.push_back(
+                    Polygon{Point{MAX_INSIDE_EXACTLY, MAX_INSIDE_EXACTLY},
+                            Point{width - MAX_INSIDE_EXACTLY, MAX_INSIDE_EXACTLY},
+                            Point{width - MAX_INSIDE_EXACTLY, height - MAX_INSIDE_EXACTLY},
+                            Point{MAX_INSIDE_EXACTLY, height - MAX_INSIDE_EXACTLY}});
+            }
+            triangles++;
+            TakeAway(pieces, std::move(shape));
+            too_many = pieces.size() > MOST_PIECES;
+            return !too_many && !pieces.empty();
+        });
+    if (!shaded || !begun || too_many) {
+        return false;
+    }
+    f32 left = 0.f;
+    for (const Polygon& piece : pieces) {
+        left += AreaOf(piece);
+    }
+    if (left <= LEFT_BY_ROUNDING) {
+        CITRA_FRAME_DUMP("  draw: its {} triangles cover the viewport", triangles);
+        if (exactly != nullptr) {
+            *exactly = true;
+        }
+        return true;
+    }
+    // Not up to the edges: whether at least to the middles of the pixels there
+    const Point low{MAX_INSIDE, MAX_INSIDE};
+    const Point high{width - MAX_INSIDE, height - MAX_INSIDE};
+    left = 0.f;
+    for (Polygon& piece : pieces) {
+        piece = SideOf(piece, low, Point{high.x, low.y}, true);
+        piece = SideOf(piece, Point{high.x, low.y}, high, true);
+        piece = SideOf(piece, high, Point{low.x, high.y}, true);
+        piece = SideOf(piece, Point{low.x, high.y}, low, true);
+        if (piece.size() >= 3) {
+            left += AreaOf(piece);
+        }
+    }
+    CITRA_FRAME_DUMP(
+        "  draw: its {} triangles leave {:.2f} square pixels of the viewport uncovered", triangles,
+        left);
+    if (left > LEFT_BY_ROUNDING) {
+        return false;
+    }
+    if (exactly != nullptr) {
+        *exactly = false;
+    }
+    return true;
+}
+
+bool PicaCore::LargeMeshCoversPixels(bool is_indexed, u64 state) {
+    // A mesh that was found not to cover its viewport a few times running is not looked at
+    // for a while: looking shades all its vertices, and one that covers nothing would cost
+    // that with every frame. (One that does cover is looked at every time: that it did the
+    // frame before says nothing of this one.)
+    constexpr u32 MISSES_BEFORE_REST = 3;
+    constexpr u32 REST = 512;
+    CoverMiss* known = nullptr;
+    for (CoverMiss& miss : cover_misses) {
+        if (miss.state == state) {
+            known = &miss;
+        }
+    }
+    if (known != nullptr && known->rest != 0) {
+        known->rest--;
+        return false;
+    }
+
+    // A pixel of the console for a bit, set where the middle of the pixel is within a
+    // triangle that is drawn, or a hair outside of it: where two triangles meet, the middle
+    // of a pixel on their edge belongs to one of them.
+    constexpr f32 HAIR = 1e-3f;
+    constexpr u32 MOST_ACROSS = 1024;
+    f32 width = 0.f;
+    f32 height = 0.f;
+    u32 columns = 0;
+    u32 rows = 0;
+    u32 words = 0;
+    bool usable = true;
+    u32 triangles = 0;
+    const bool shaded = ForDrawnTriangles(
+        is_indexed, MAX_COVER_VERTICES_LARGE, width, height, [&](Polygon&& shape) {
+            if (rows == 0) {
+                columns = static_cast<u32>(std::lround(width));
+                rows = static_cast<u32>(std::lround(height));
+                if (columns == 0 || rows == 0 || columns > MOST_ACROSS || rows > MOST_ACROSS ||
+                    std::abs(width - static_cast<f32>(columns)) > HAIR ||
+                    std::abs(height - static_cast<f32>(rows)) > HAIR) {
+                    usable = false;
+                    return false;
+                }
+                words = (columns + 63) / 64;
+                cover_bits.assign(std::size_t{rows} * words, 0);
+            }
+            triangles++;
+            f32 lowest = shape[0].y;
+            f32 highest = shape[0].y;
+            for (const Point& point : shape) {
+                lowest = std::min(lowest, point.y);
+                highest = std::max(highest, point.y);
+            }
+            const s32 first_row =
+                std::max<s32>(0, static_cast<s32>(std::ceil(lowest - 0.5f - HAIR)));
+            const s32 last_row = std::min<s32>(static_cast<s32>(rows) - 1,
+                                               static_cast<s32>(std::floor(highest - 0.5f + HAIR)));
+            for (s32 row = first_row; row <= last_row; row++) {
+                // Where the line through the middles of this row's pixels is inside the shape
+                const f32 y = static_cast<f32>(row) + 0.5f;
+                f32 left = std::numeric_limits<f32>::max();
+                f32 right = std::numeric_limits<f32>::lowest();
+                for (std::size_t i = 0; i < shape.size(); i++) {
+                    const Point& from = shape[i];
+                    const Point& to = shape[(i + 1) % shape.size()];
+                    if (!((from.y <= y && to.y >= y) || (to.y <= y && from.y >= y))) {
+                        continue;
+                    }
+                    if (from.y == to.y) {
+                        left = std::min({left, from.x, to.x});
+                        right = std::max({right, from.x, to.x});
+                    } else {
+                        const f32 x = from.x + (y - from.y) * (to.x - from.x) / (to.y - from.y);
+                        left = std::min(left, x);
+                        right = std::max(right, x);
+                    }
+                }
+                if (!(right >= left)) {
+                    continue;
+                }
+                const s32 first = std::max<s32>(0, static_cast<s32>(std::ceil(left - 0.5f - HAIR)));
+                const s32 last = std::min<s32>(static_cast<s32>(columns) - 1,
+                                               static_cast<s32>(std::floor(right - 0.5f + HAIR)));
+                u64* const line = &cover_bits[static_cast<std::size_t>(row) * words];
+                for (s32 word = first / 64; first <= last && word <= last / 64; word++) {
+                    const s32 from_bit = std::max(first, word * 64) - word * 64;
+                    const s32 to_bit = std::min(last, word * 64 + 63) - word * 64;
+                    const u64 upto = to_bit == 63 ? ~u64{0} : (u64{1} << (to_bit + 1)) - 1;
+                    line[word] |= upto & ~((u64{1} << from_bit) - 1);
+                }
+            }
+            return true;
+        });
+
+    bool covers = shaded && usable && rows != 0;
+    for (u32 row = 0; covers && row < rows; row++) {
+        for (u32 word = 0; word < words; word++) {
+            const u32 bits_here = std::min<u32>(64, columns - word * 64);
+            const u64 all = bits_here == 64 ? ~u64{0} : (u64{1} << bits_here) - 1;
+            if ((cover_bits[std::size_t{row} * words + word] & all) != all) {
+                covers = false;
+                break;
+            }
+        }
+    }
+    CITRA_FRAME_DUMP("  draw: a mesh of {} triangles drawn {} every pixel of its viewport",
+                     triangles, covers ? "covers" : "does not cover");
+
+    if (covers) {
+        if (known != nullptr) {
+            known->misses = 0;
+        }
+        return true;
+    }
+    if (known == nullptr) {
+        known = &cover_misses[cover_miss_next++ % cover_misses.size()];
+        *known = CoverMiss{.state = state};
+    }
+    if (++known->misses >= MISSES_BEFORE_REST) {
+        known->misses = 0;
+        known->rest = REST;
+    }
+    return false;
 }
 
 bool PicaCore::TextureRowsOfDraw(bool is_indexed, VideoCore::DrawTextureRows& rows) {
@@ -2256,9 +2490,11 @@ void PicaCore::DumpGeometryProgram() {
 void PicaCore::DumpSmallDraw(bool is_indexed) {
     const auto& pipeline = regs.internal.pipeline;
     const u32 count = pipeline.num_vertices;
-    if (pipeline.use_gs != PipelineRegs::UseGS::No || count == 0 || count > 6) {
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || count == 0 || count > MAX_COVER_VERTICES) {
         return;
     }
+    // Of a mesh only where its vertices end up
+    const bool whole = count <= 6;
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
     const auto& index_info = pipeline.index_array;
     const u8* index_address_8 = memory.GpuRead(
@@ -2277,7 +2513,8 @@ void PicaCore::DumpSmallDraw(bool is_indexed) {
     const f32 width = f24::FromRaw(rasterizer.viewport_size_x).ToFloat32() * 2.f;
     const f32 height = f24::FromRaw(rasterizer.viewport_size_y).ToFloat32() * 2.f;
     std::string text =
-        "  draw vertices (pixel in the target; texture coordinates 0, 1, 2; colour; depth):";
+        whole ? "  draw vertices (pixel in the target; texture coordinates 0, 1, 2; colour; depth):"
+              : "  draw vertices (pixel in the target; depth):";
     for (u32 index = 0; index < count; ++index) {
         const u32 vertex = is_indexed
                                ? (index_u16 ? index_address_16[index] : index_address_8[index])
@@ -2294,6 +2531,10 @@ void PicaCore::DumpSmallDraw(bool is_indexed) {
                       static_cast<f32>(rasterizer.viewport_corner.x);
         const f32 y = (shaded.pos.y.ToFloat32() / w + 1.f) * height / 2.f +
                       static_cast<f32>(rasterizer.viewport_corner.y);
+        if (!whole) {
+            text += fmt::format(" [{:.2f},{:.2f}; {:.4f}]", x, y, shaded.pos.z.ToFloat32() / w);
+            continue;
+        }
         text += fmt::format(
             " [{:.2f},{:.2f}; {:.4f},{:.4f}; {:.4f},{:.4f}; {:.4f},{:.4f}; "
             "{:.3f},{:.3f},{:.3f},{:.3f}; {:.6f}]",

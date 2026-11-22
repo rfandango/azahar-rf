@@ -240,6 +240,33 @@ enum Experiment3 : std::uint32_t {
     /// code that is kept (Core::JitCodeCache) is held for five seconds first, as a storage
     /// that stalls would.
     SlowCodeStorage = 16,
+    /// The depth buffer is made ready with what its memory holds, as before, also for a draw
+    /// that overwrites depth and stencil in all of its viewport: read back from the GPU where
+    /// another surface has the newest bytes (RasterizerCache::ValidateSurface).
+    LoadOverwrittenDepth = 32,
+    /// A title is never given less than the Old 3DS's processor clock, as before, also where
+    /// the host cannot run it in real time at that (Core::Timing::GovernProcessorClock).
+    ConsoleClockFloor = 64,
+    /// Vulkan: every draw copies its vertex and index data, as LegacyVertexCopies, but looked
+    /// at with every draw, so that it can be turned on and off while a game runs
+    /// (RasterizerVulkan::MayReadInPlace).
+    CopiedVertexData = 128,
+    /// Vulkan: a draw of a few vertices counts as writing all of the rectangle it is confined
+    /// to, as before, not just the box around its triangles, so that the second image of its
+    /// target is brought up to date in all of that rectangle (RasterizerVulkan::WrittenBy).
+    WholeAreaWritten = 256,
+    /// For seeing whether the model of the console's GPU is what sets a game's frame rate
+    /// (Pica::DelayGenerator): the time it lets pass before a command list is reported done
+    /// is a quarter of what it is otherwise.
+    FasterConsoleGpu = 512,
+    /// The second of two runs of draws that make the same image of the top screen, one for
+    /// each eye, is drawn as before (Pica::PicaCore::RepeatedPass). ExplainScenePasses also
+    /// has more lines written on why a second run was no repetition.
+    KeepRepeatedPass = 1024,
+    /// For seeing that neither the game nor the system log waits for the storage the log
+    /// file is on: every write of the file is held up as a storage that lets 12 KiB a second
+    /// through would hold it (Common::Log, the file backend's writer).
+    SlowLogStorage = 2048,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as
@@ -322,6 +349,10 @@ void Increment(Counter counter, std::uint64_t amount = 1);
 
 /// Marks the end of an emulated frame: emits and resets the per-frame counters.
 void EndFrame();
+
+/// Reads the experiment flags and the hold-up anew, as EndFrame() does: for what has changed
+/// them before the first frame (Common::Diagnostics::LoadControlFile).
+void RefreshSettings();
 
 class [[nodiscard]] ScopedSection {
 public:

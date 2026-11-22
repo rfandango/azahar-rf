@@ -7,6 +7,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/diagnostics.h"
 #include "common/settings.h"
 #include "core/frontend/emu_window.h"
 #include "video_core/custom_textures/custom_format.h"
@@ -462,9 +463,8 @@ bool Instance::CreateDevice() {
     u32 without = 0;
 #ifdef CITRA_ENABLE_TRACE_MARKERS
     {
-        char value[PROP_VALUE_MAX]{};
-        if (__system_property_get("debug.azahar.vk_without", value) > 0) {
-            without = static_cast<u32>(std::strtoul(value, nullptr, 0));
+        if (const auto value = Common::Diagnostics::Property("debug.azahar.vk_without")) {
+            without = static_cast<u32>(std::strtoul(value->c_str(), nullptr, 0));
         }
         if (without != 0) {
             LOG_WARNING(Render_Vulkan, "debug.azahar.vk_without = {}", without);
@@ -746,9 +746,6 @@ void Instance::CreateAllocator() {
 }
 
 void Instance::CollectToolingInfo() {
-    if (!tooling_info) {
-        return;
-    }
     const vk::StructureChain property_chain =
         physical_device
             .getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDriverProperties>();
@@ -767,6 +764,14 @@ void Instance::CollectToolingInfo() {
     LOG_INFO(Render_Vulkan, "VK_DRIVER: {}", driver_name);
     LOG_INFO(Render_Vulkan, "VK_DEVICE: {}", model_name);
     LOG_INFO(Render_Vulkan, "VK_VERSION: {}", api_version);
+    // What the driver says of its own build, which is what tells two logs apart that come from
+    // the same device with different drivers
+    LOG_INFO(Render_Vulkan, "VK_DRIVER_INFO: {}", driver.driverInfo.data());
+    if (!tooling_info) {
+        // The driver, its version and the device are in the log with every driver; the tools
+        // can only be asked for where the driver has the extension (Qualcomm's has not)
+        return;
+    }
     const auto tools = physical_device.getToolPropertiesEXT();
     for (const vk::PhysicalDeviceToolProperties& tool : tools) {
         const std::string_view name = tool.name;

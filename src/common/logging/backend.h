@@ -27,6 +27,11 @@ void Stop();
 
 void DisableLoggingInTests();
 
+/// Writes what the log file's buffer holds to the file, for a reader that is about to take the
+/// file while the logger goes on (sharing the log). Entries still waiting for the logger's
+/// thread are not in it yet.
+void Flush();
+
 /**
  * The global filter will prevent any messages from even being processed if they are filtered.
  */

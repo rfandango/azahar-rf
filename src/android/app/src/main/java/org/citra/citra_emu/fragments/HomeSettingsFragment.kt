@@ -254,6 +254,9 @@ class HomeSettingsFragment : Fragment() {
         }
 
     private fun shareLog() {
+        // The file is otherwise only as far as the last error line: the end of the session,
+        // which is what whoever reads the log wants, would stay behind in the buffer
+        Log.flush()
         val logDirectory = DocumentFile.fromTreeUri(
             requireContext(),
             PermissionsHandler.citraDirectory

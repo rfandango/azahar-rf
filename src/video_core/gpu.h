@@ -42,6 +42,7 @@ class GraphicsDebugger;
 class FrameLiveness;
 class RendererBase;
 class RightEyeDisabler;
+class WorkRules;
 
 /**
  * The GPU class is the high level interface to the video_core for core services.
@@ -198,7 +199,10 @@ private:
     void serialize(Archive& ar, const u32 file_version);
 
     std::unique_ptr<RightEyeDisabler> right_eye_disabler;
-    std::unique_ptr<FrameLiveness> frame_liveness;
+    /// The rules that find work that need not be done; the one of them that follows results
+    /// to the screen, which is also told of what is displayed and of what the game reads
+    std::unique_ptr<WorkRules> work_rules;
+    FrameLiveness* frame_liveness{};
 
     /// Pacing of a game whose render loop does not wait for the display, see MemoryTransfer.
     /// Not part of a save state: it settles again within a few frames, and what is held is let

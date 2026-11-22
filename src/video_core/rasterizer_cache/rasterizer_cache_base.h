@@ -126,8 +126,12 @@ public:
     /// Get a texture cube based on the texture configuration
     Surface& GetTextureCube(const TextureCubeConfig& config);
 
-    /// Get the color and depth surfaces based on the framebuffer configuration
-    FramebufferHelper<T> GetFramebufferSurfaces(bool using_color_fb, bool using_depth_fb);
+    /// Get the color and depth surfaces based on the framebuffer configuration. With
+    /// depth_overwritten the draw this is for replaces depth and stencil in every pixel of its
+    /// viewport, so the depth surface is made ready without what it held there being brought
+    /// (see ValidateSurface).
+    FramebufferHelper<T> GetFramebufferSurfaces(bool using_color_fb, bool using_depth_fb,
+                                                bool depth_overwritten = false);
 
     /// The framebuffer for the same surfaces as these parameters name, with the colour surface
     /// in the image it is in now
@@ -231,8 +235,11 @@ private:
 
     /// Update surface's texture for given region when necessary. With allow_download unset the
     /// validation stops, returning false, as soon as it would have to read another surface back
-    /// from the host GPU; whatever was validated up to that point stays valid.
-    bool ValidateSurface(SurfaceId surface, PAddr addr, u32 size, bool allow_download = true);
+    /// from the host GPU; whatever was validated up to that point stays valid. With
+    /// needs_contents unset the caller overwrites all of the range before anything reads it:
+    /// the range counts as valid from then on and nothing is brought to it.
+    bool ValidateSurface(SurfaceId surface, PAddr addr, u32 size, bool allow_download = true,
+                         bool needs_contents = true);
 
     /// Copies pixel data in interval from the guest VRAM to the host GPU surface
     void UploadSurface(Surface& surface, SurfaceInterval interval);

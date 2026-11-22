@@ -103,10 +103,22 @@ GuestMemory::GuestMemory(const Instance& instance, std::span<u8> pool_) {
     try {
         const vk::MemoryHostPointerPropertiesEXT properties =
             device.getMemoryHostPointerPropertiesEXT(handle_type, pool_.data());
-        const std::optional<u32> memory_type = FindMemoryType(
-            instance.GetPhysicalDevice().getMemoryProperties(),
+        const auto memory_properties = instance.GetPhysicalDevice().getMemoryProperties();
+        std::optional<u32> memory_type = FindMemoryType(
+            memory_properties,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
             properties.memoryTypeBits);
+        bool sees_cache = true;
+        if (!memory_type) {
+            // A device whose view of the memory is not kept coherent with the processor's
+            // cache names a kind of memory that is cached and not coherent. It is taken all
+            // the same: whoever lets the GPU read a page writes the cache out first.
+            memory_type = FindMemoryType(memory_properties,
+                                         vk::MemoryPropertyFlagBits::eHostVisible |
+                                             vk::MemoryPropertyFlagBits::eHostCached,
+                                         properties.memoryTypeBits);
+            sees_cache = false;
+        }
         if (!memory_type) {
             LOG_WARNING(Render_Vulkan, "The emulated memory is not a buffer of the host GPU: "
                                        "the device has no memory type for it");
@@ -137,9 +149,13 @@ GuestMemory::GuestMemory(const Instance& instance, std::span<u8> pool_) {
             std::chrono::steady_clock::now() - start;
         LOG_INFO(Render_Vulkan,
                  "The emulated memory, {} MiB, is a buffer of the host GPU as well (taken in "
-                 "{:.1f} ms)",
-                 pool_.size() >> 20, taken.count());
+                 "{:.1f} ms){}",
+                 pool_.size() >> 20, taken.count(),
+                 sees_cache ? ""
+                            : "; the GPU does not see through the processor's cache here, which "
+                              "is written out for each page before it is read in place");
 
+        coherent = sees_cache;
         pool = pool_;
         memory = std::move(imported);
         buffer = std::move(over_it);
@@ -166,7 +182,8 @@ GuestMemory::GuestMemory(const Instance& instance, std::span<u8> pool_) {
 
 GuestMemory::~GuestMemory() = default;
 
-InPlaceData::InPlaceData(Mark mark_, bool log_) : mark{std::move(mark_)}, log{log_} {}
+InPlaceData::InPlaceData(Mark mark_, Settle settle_, bool log_)
+    : mark{std::move(mark_)}, settle{std::move(settle_)}, log{log_} {}
 
 std::optional<std::pair<u32, u32>> InPlaceData::PagesOf(PAddr addr, u32 size) const {
     if (size == 0) {
@@ -246,6 +263,9 @@ bool InPlaceData::Use(PAddr addr, u32 size, u64 tick) {
                 if (++page.calm >= CALM_FRAMES) {
                     page.state = State::InPlace;
                     ++promoted;
+                    if (settle) {
+                        settle(AddressOf(index), Memory::CITRA_PAGE_SIZE);
+                    }
                 }
             }
         }

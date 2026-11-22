@@ -48,6 +48,15 @@ public:
         return *buffer;
     }
 
+    /// Whether the GPU sees what the processor has written as soon as it is written. Where
+    /// it does not (a system on a chip whose memory bus does not keep the two coherent, an
+    /// Adreno 610's), it sees what is in memory itself: what the processor's cache still
+    /// holds of a page has to be written out before the GPU reads the page
+    /// (Common::WriteOutDataCache, at the moment InPlaceData lets it be read in place).
+    [[nodiscard]] bool IsCoherent() const {
+        return coherent;
+    }
+
     /// Where in the buffer the `size` bytes at `data` are, if all of them are emulated memory
     /// the buffer covers
     [[nodiscard]] std::optional<u32> Offset(const u8* data, std::size_t size) const {
@@ -65,6 +74,7 @@ private:
     std::span<u8> pool;
     vk::UniqueDeviceMemory memory;
     vk::UniqueBuffer buffer;
+    bool coherent{true};
 };
 
 /**
@@ -80,7 +90,10 @@ private:
  *   (the rasterizer's InvalidateRegion), and while it is watched the data is still copied.
  *   Where the recompiled code reaches memory through the host's own address translation it
  *   still reads a watched page directly; elsewhere its reads go the long way as well.
- * - After CALM_FRAMES frames of use without a write the page is read in place.
+ * - After CALM_FRAMES frames of use without a write the page is read in place. At that moment
+ *   `settle` is called for it: where the GPU does not see through the processor's cache, that
+ *   is when the cache's part of the page is written out. Once is enough, as from then on a
+ *   write ends the reading in place before it happens.
  * - A write to a watched page ends that: its data is copied again, for a time that doubles
  *   with every such end, before it is tried anew. If a draw that is not through the GPU yet
  *   reads the page in place, the write has to wait for it first: OnWrite says for what.
@@ -94,8 +107,10 @@ public:
     /// Has a stretch of emulated memory watched or no longer, see
     /// Memory::MemorySystem::RasterizerMarkRegionWatched
     using Mark = std::function<void(PAddr addr, u32 size, bool watch)>;
+    /// Called for a page that is read in place from now on. May be empty.
+    using Settle = std::function<void(PAddr addr, u32 size)>;
 
-    InPlaceData(Mark mark, bool log);
+    InPlaceData(Mark mark, Settle settle, bool log);
 
     /// Whether a draw whose commands go to the GPU under `tick` may read the `size` bytes at
     /// `addr` in place
@@ -154,6 +169,7 @@ private:
     void GiveUp(u32 index);
 
     Mark mark;
+    Settle settle;
     bool log;
     std::vector<Page> pages;
     u32 frame{};

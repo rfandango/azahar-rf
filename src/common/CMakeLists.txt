@@ -39,6 +39,9 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     hacks/hack_list.cpp
     hacks/hack_manager.h
     hacks/hack_manager.cpp
+    data_cache.h
+    diagnostics.cpp
+    diagnostics.h
     hitch_tracker.cpp
     hitch_tracker.h
     literals.h

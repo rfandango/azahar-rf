@@ -62,6 +62,11 @@ void SaveFile(const std::string& name, const void* data, std::size_t size);
 /// Called once per emulated VBlank: finishes a dump in progress or starts a requested one.
 void OnVBlank();
 
+/// A game starts (or a state was loaded, which makes the emulated GPU anew): the dumps that are
+/// timed from a game's start, and the count of those taken unasked, begin again. Without it
+/// the second game of a session got its first dump a second in, and the third got none.
+void OnGameStart();
+
 } // namespace VideoCore::FrameStateDump
 
 #define CITRA_FRAME_DUMP(...)                                                                      \
@@ -72,6 +77,7 @@ void OnVBlank();
     } while (0)
 
 #define CITRA_FRAME_DUMP_VBLANK() ::VideoCore::FrameStateDump::OnVBlank()
+#define CITRA_FRAME_DUMP_GAME_START() ::VideoCore::FrameStateDump::OnGameStart()
 
 /// In a dump with GPU times: waits until the GPU is done with everything recorded so far and
 /// notes how long that took, under the description given.
@@ -94,6 +100,7 @@ void OnVBlank();
 
 #define CITRA_FRAME_DUMP(...) static_cast<void>(0)
 #define CITRA_FRAME_DUMP_VBLANK() static_cast<void>(0)
+#define CITRA_FRAME_DUMP_GAME_START() static_cast<void>(0)
 #define CITRA_FRAME_DUMP_GPU_TIME(scheduler, ...) static_cast<void>(0)
 #define CITRA_FRAME_DUMP_GPU_TIME_OF_DRAW(scheduler) static_cast<void>(0)
 

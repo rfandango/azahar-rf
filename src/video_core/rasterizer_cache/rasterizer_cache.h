@@ -823,7 +823,8 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
 
 template <class T>
 FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color_fb,
-                                                                bool using_depth_fb) {
+                                                                bool using_depth_fb,
+                                                                bool depth_overwritten) {
     const auto& config = regs.framebuffer.framebuffer;
 
     const s32 framebuffer_width = config.GetWidth();
@@ -974,7 +975,7 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
         depth_level = depth_surface.LevelOf(depth_params.addr);
         depth_surface.flags |= SurfaceFlagBits::RenderTarget;
         ValidateSurface(depth_id, boost::icl::first(depth_vp_interval),
-                        boost::icl::length(depth_vp_interval));
+                        boost::icl::length(depth_vp_interval), true, !depth_overwritten);
     }
 
     const FramebufferParams fb_params = {
@@ -1294,7 +1295,7 @@ SurfaceId RasterizerCache<T>::FindMatch(const SurfaceParams& params, ScaleMatch 
 
 template <class T>
 bool RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 size,
-                                         bool allow_download) {
+                                         bool allow_download, bool needs_contents) {
     if (size == 0) [[unlikely]] {
         return true;
     }
@@ -1314,6 +1315,27 @@ bool RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
 
         validate_regions = surface.invalid_regions & validate_interval;
         if (validate_regions.empty()) {
+            return true;
+        }
+        if (!needs_contents) {
+            // What the range holds is replaced before anything reads it: a draw that covers its
+            // viewport and writes depth and stencil anew in every pixel. So nothing is brought
+            // to it, not from another surface and not from guest memory, which would first have
+            // every surface that holds newer bytes of the range read back from the GPU, each
+            // time waiting for the GPU to be done. A game that renders small colour targets
+            // into the memory of its depth buffer between frames paid five such readbacks a
+            // frame, two thirds of the frame's time on a slow GPU, for depth values that no
+            // pixel ever saw. The draw then makes this surface the owner of the range, and the
+            // others lose it without being read.
+            //
+            // The range is whole rows. Of a viewport narrower than the surface, the pixels
+            // beside it keep what the image had there, where the long way round would have put
+            // what the range's bytes mean in this format. Nothing reads those either until a
+            // draw with a wider viewport comes, which finds old depth values there.
+            CITRA_FRAME_DUMP("cache takes {} @{:08X} +{:X} without what it held: all of it is "
+                             "about to be overwritten",
+                             PixelFormatAsString(surface.pixel_format), addr, size);
+            surface.MarkValid(validate_interval);
             return true;
         }
         level = surface.LevelOf(addr);

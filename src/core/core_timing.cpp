@@ -61,11 +61,9 @@ void Timing::SetProcessorClockMultiplier(u32 multiplier) {
 }
 
 void Timing::GovernProcessorClock(std::chrono::microseconds emulated,
-                                  std::chrono::microseconds host_work, double speed_limit,
+                                  std::chrono::microseconds host_work,
+                                  std::chrono::microseconds host_cpu, double speed_limit,
                                   bool reproducible) {
-    if (processor_clock_multiplier <= 1) {
-        return;
-    }
     const double asked = processor_clock_multiplier;
     double granted = processor_clock_granted;
     if (reproducible || (Common::TraceMarkers::Experiments2() &
@@ -84,6 +82,7 @@ void Timing::GovernProcessorClock(std::chrono::microseconds emulated,
         constexpr u32 STRETCH_VBLANKS = 10;
         clock_governor.emulated_us += emulated.count();
         clock_governor.work_us += host_work.count();
+        clock_governor.cpu_us += host_cpu.count();
         if (++clock_governor.vblanks < STRETCH_VBLANKS) {
             return;
         }
@@ -105,10 +104,15 @@ void Timing::GovernProcessorClock(std::chrono::microseconds emulated,
         // The host's work for the stretch against the real time the stretch may take
         const double load = static_cast<double>(clock_governor.work_us) * speed_limit /
                             static_cast<double>(clock_governor.emulated_us);
+        // The same of the time the thread itself ran, its waits left out. Not known where the
+        // system does not tell (zero), which then counts as no work at all.
+        const double own_load = static_cast<double>(clock_governor.cpu_us) * speed_limit /
+                                static_cast<double>(clock_governor.emulated_us);
         const bool measured = clock_governor.has_baseline;
         clock_governor.vblanks = 0;
         clock_governor.emulated_us = 0;
         clock_governor.work_us = 0;
+        clock_governor.cpu_us = 0;
         clock_governor.has_baseline = true;
         if (!measured) {
             return;
@@ -124,10 +128,44 @@ void Timing::GovernProcessorClock(std::chrono::microseconds emulated,
         constexpr double ROOM = 0.80;
         constexpr double ALL_OF_IT = 0.9;
         constexpr double STEP_UP = 1.1;
-        if (load > TOO_MUCH && busiest > ALL_OF_IT) {
-            granted = std::clamp(granted * AIM / load, 1.0, asked);
-        } else if (load < ROOM && granted < asked) {
-            granted = std::min(asked, granted * std::min(STEP_UP, AIM / std::max(load, 0.01)));
+        // The least a title is given, of the Old 3DS's clock
+        constexpr double LEAST = 0.4;
+        const double least =
+            (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ConsoleClockFloor)
+                ? 1.0
+                : LEAST;
+        if (granted < least) {
+            // The switch came on with the title below the console's clock
+            granted = least;
+        } else if (granted > 1.0) {
+            if (load > TOO_MUCH && busiest > ALL_OF_IT) {
+                granted = std::clamp(granted * AIM / load, 1.0, asked);
+            } else if (load < ROOM && granted < asked) {
+                granted = std::min(asked, granted * std::min(STEP_UP, AIM / std::max(load, 0.01)));
+            }
+        } else if (own_load > TOO_MUCH && busiest > ALL_OF_IT) {
+            // At the console's own clock the thread's work alone is more than real time
+            // allows: below it then, by what the thread ran and not by what it waited, which
+            // less of a clock would not shorten. Only when it has been so for a while, and a
+            // step at a time: a burst of the host's own work (code being recompiled as a game
+            // starts) looks the same for a moment and is not shortened by it either.
+            constexpr u32 FOR_A_WHILE = 3;
+            constexpr double STEP_DOWN = 0.75;
+            if (++clock_governor.overloaded >= FOR_A_WHILE) {
+                granted = std::clamp(std::max(granted * AIM / own_load, granted * STEP_DOWN), least,
+                                     granted);
+            }
+        } else if (granted < 1.0) {
+            clock_governor.overloaded = 0;
+            if (own_load < ROOM) {
+                granted =
+                    std::min(1.0, granted * std::min(STEP_UP, AIM / std::max(own_load, 0.01)));
+            }
+        } else {
+            clock_governor.overloaded = 0;
+            if (load < ROOM && granted < asked) {
+                granted = std::min(asked, granted * std::min(STEP_UP, AIM / std::max(load, 0.01)));
+            }
         }
     }
     if (granted == processor_clock_granted) {
@@ -136,7 +174,8 @@ void Timing::GovernProcessorClock(std::chrono::microseconds emulated,
     processor_clock_granted = granted;
     UpdateClockSpeed(clock_percentage);
     // Said when it has moved by a good part, and when it is back to all that was asked for
-    if (std::abs(granted - processor_clock_logged) >= 0.25 ||
+    if (std::abs(granted - processor_clock_logged) >=
+            std::min(0.25, 0.15 * processor_clock_logged) ||
         (granted == asked && processor_clock_logged != asked)) {
         processor_clock_logged = granted;
         LOG_INFO(Core_Timing,

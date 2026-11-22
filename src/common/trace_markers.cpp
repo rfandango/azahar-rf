@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <android/trace.h>
 #include <sys/system_properties.h>
+#include "common/diagnostics.h"
 
 namespace Common::TraceMarkers {
 
@@ -23,10 +24,8 @@ constexpr const char* EXPERIMENT2_PROPERTY = "debug.azahar.experiment2";
 constexpr const char* EXPERIMENT3_PROPERTY = "debug.azahar.experiment3";
 
 std::uint32_t ReadExperiments(const char* property = EXPERIMENT_PROPERTY) {
-    char value[PROP_VALUE_MAX]{};
-    return __system_property_get(property, value) > 0
-               ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 0))
-               : 0;
+    const auto value = Common::Diagnostics::Property(property);
+    return value ? static_cast<std::uint32_t>(std::strtoul(value->c_str(), nullptr, 0)) : 0;
 }
 
 // Read once when the library is loaded as well, for what is decided before the first VBlank
@@ -39,12 +38,12 @@ constexpr const char* STALL_PROPERTY = "debug.azahar.stall";
 
 /// "<milliseconds>/<every>" as one number: the milliseconds in the upper half
 std::uint64_t ReadStall() {
-    char value[PROP_VALUE_MAX]{};
-    if (__system_property_get(STALL_PROPERTY, value) <= 0) {
+    const auto value = Common::Diagnostics::Property(STALL_PROPERTY);
+    if (!value) {
         return 0;
     }
     char* rest = nullptr;
-    const std::uint64_t milliseconds = std::strtoul(value, &rest, 10);
+    const std::uint64_t milliseconds = std::strtoul(value->c_str(), &rest, 10);
     const std::uint64_t every = rest && *rest == '/' ? std::strtoul(rest + 1, nullptr, 10) : 0;
     return milliseconds == 0 || every == 0 ? 0 : (milliseconds << 32) | (every & 0xFFFFFFFF);
 }
@@ -137,11 +136,18 @@ InjectedStall Stall() {
     return {static_cast<std::uint32_t>(value >> 32), static_cast<std::uint32_t>(value)};
 }
 
-void EndFrame() {
+void RefreshSettings() {
     experiments.store(ReadExperiments(), std::memory_order_relaxed);
     experiments2.store(ReadExperiments(EXPERIMENT2_PROPERTY), std::memory_order_relaxed);
-    experiments3.store(ReadExperiments(EXPERIMENT3_PROPERTY), std::memory_order_relaxed);
+    // With what the build's own comparison has turned on for now
+    experiments3.store(ReadExperiments(EXPERIMENT3_PROPERTY) |
+                           Common::Diagnostics::ComparisonBits(),
+                       std::memory_order_relaxed);
     stall.store(ReadStall(), std::memory_order_relaxed);
+}
+
+void EndFrame() {
+    RefreshSettings();
 
     if (!IsEnabled(Level::Frame)) {
         return;

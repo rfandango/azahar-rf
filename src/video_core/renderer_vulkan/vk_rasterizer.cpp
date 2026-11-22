@@ -2,7 +2,9 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <cmath>
 #include "common/alignment.h"
+#include "common/data_cache.h"
 #include "common/hitch_tracker.h"
 #include "common/literals.h"
 #include "common/logging/log.h"
@@ -97,6 +99,16 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
       in_place_data{
           [this](PAddr addr, u32 size, bool watch) {
               this->memory.RasterizerMarkRegionWatched(addr, size, watch);
+          },
+          [this](PAddr addr, u32 size) {
+              // A page is read in place from now on. Where the GPU does not see through the
+              // processor's cache, what the cache holds of the page goes to memory first.
+              if (guest_memory.IsCoherent()) {
+                  return;
+              }
+              if (const u8* const data = this->memory.GetPhysicalPointer(addr)) {
+                  Common::WriteOutDataCache(data, size);
+              }
           },
           (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureVertexData) != 0},
       watch_data{(Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureVertexData) !=
@@ -742,6 +754,77 @@ bool RasterizerVulkan::SmallDrawMustShow(bool is_indexed) {
     return false;
 }
 
+Common::Rectangle<u32> RasterizerVulkan::WrittenBy(bool accelerate, bool is_indexed,
+                                                   const Common::Rectangle<u32>& draw_rect,
+                                                   const VideoCore::ViewportInfo& viewport,
+                                                   u32 res_scale) {
+    // A game that scales an image down step by step inside one target (the levels of a glow,
+    // side by side) draws a small quad at each step that samples what the step before drew.
+    // For each of them the target's second image is brought up to date where the target was
+    // written since the last time: with every draw counted as writing all of the rectangle it
+    // is confined to that was the whole screen each time, 25 times a frame in Metal Gear
+    // Solid: Snake Eater 3D, more pixels copied than drawn.
+    if (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::WholeAreaWritten) {
+        return draw_rect;
+    }
+    // The box around the triangles, in the coordinates of the viewport
+    Pica::PicaCore::DrawBox box{1.f, -1.f, 1.f, -1.f};
+    if (accelerate) {
+        if (!pica.SmallDrawBox(is_indexed, box)) {
+            return draw_rect;
+        }
+    } else {
+        // Shaded on the CPU, the vertices are here, of one draw or of several drawn together
+        constexpr std::size_t MOST_VERTICES = 384;
+        if (vertex_batch.empty() || vertex_batch.size() > MOST_VERTICES) {
+            return draw_rect;
+        }
+        for (const HardwareVertex& vertex : vertex_batch) {
+            const f32 w = vertex.position.w;
+            const f32 x = vertex.position.x / w;
+            const f32 y = vertex.position.y / w;
+            if (!(w > 0.f) || !std::isfinite(x) || !std::isfinite(y)) {
+                return draw_rect;
+            }
+            box.left = std::min(box.left, std::clamp(x, -1.f, 1.f));
+            box.right = std::max(box.right, std::clamp(x, -1.f, 1.f));
+            box.bottom = std::min(box.bottom, std::clamp(y, -1.f, 1.f));
+            box.top = std::max(box.top, std::clamp(y, -1.f, 1.f));
+        }
+    }
+    if (!(box.right >= box.left && box.top >= box.bottom)) {
+        return draw_rect;
+    }
+    // The viewport of the host puts -1 at its x and y and 1 at the far side, as the console's
+    // does. The host shades the vertices itself and may end up a fraction of a pixel away from
+    // where they were found here: a pixel of the console on every side covers that.
+    const auto along = [](f32 at, s32 start, s32 length) {
+        return static_cast<f32>(start) + (at + 1.f) * 0.5f * static_cast<f32>(length);
+    };
+    const s32 spare = static_cast<s32>(res_scale) + 1;
+    const s32 x0 =
+        static_cast<s32>(std::floor(along(box.left, viewport.x, viewport.width))) - spare;
+    const s32 x1 =
+        static_cast<s32>(std::ceil(along(box.right, viewport.x, viewport.width))) + spare;
+    const s32 y0 =
+        static_cast<s32>(std::floor(along(box.bottom, viewport.y, viewport.height))) - spare;
+    const s32 y1 = static_cast<s32>(std::ceil(along(box.top, viewport.y, viewport.height))) + spare;
+
+    const s32 rect_x0 = static_cast<s32>(std::min(draw_rect.left, draw_rect.right));
+    const s32 rect_x1 = static_cast<s32>(std::max(draw_rect.left, draw_rect.right));
+    const s32 rect_y0 = static_cast<s32>(std::min(draw_rect.bottom, draw_rect.top));
+    const s32 rect_y1 = static_cast<s32>(std::max(draw_rect.bottom, draw_rect.top));
+    const u32 left = static_cast<u32>(std::clamp(x0, rect_x0, rect_x1));
+    const u32 right = static_cast<u32>(std::clamp(x1, rect_x0, rect_x1));
+    const u32 bottom = static_cast<u32>(std::clamp(y0, rect_y0, rect_y1));
+    const u32 top = static_cast<u32>(std::clamp(y1, rect_y0, rect_y1));
+    if (right - left < draw_rect.GetWidth() || top - bottom < draw_rect.GetHeight()) {
+        CITRA_FRAME_DUMP("  vk draw writes only {}x{} at {},{} of its rectangle", right - left,
+                         top - bottom, left, bottom);
+    }
+    return Common::Rectangle<u32>{left, top, right, bottom};
+}
+
 void RasterizerVulkan::SetupIndexArray() {
     const bool index_u8 = regs.pipeline.index_array.format == 0;
     const bool native_u8 = index_u8 && instance.IsIndexTypeUint8Supported();
@@ -876,7 +959,13 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     // Getting the target ready brings to it what the game filled its memory with. That is
     // held back until the render pass begins, which can then clear instead of load.
     renderpass_cache.SetClearDeferral(true);
-    auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
+    // A draw that replaces depth and stencil in all of its viewport needs nothing of what the
+    // depth buffer held there, which can be costly to bring (RasterizerCache::ValidateSurface)
+    const bool depth_overwritten =
+        next_draw_overwrites_depth && write_depth_fb && !shadow_rendering &&
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::LoadOverwrittenDepth) == 0;
+    auto fb_helper =
+        res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb, depth_overwritten);
     fb_helper.SetWrittenAttachments(needs_color_fb, needs_depth_fb);
     const Framebuffer* framebuffer = fb_helper.Framebuffer();
     if (!framebuffer->Handle()) {
@@ -992,6 +1081,9 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         Surface& color_target = res_cache.GetSurface(framebuffer->color_id);
         if (shadow_rendering) {
             color_target.NoteAllWritten();
+        } else if (color_target.TracksWritten()) {
+            color_target.NoteWritten(WrittenBy(accelerate, is_indexed, draw_rect,
+                                               fb_helper.Viewport(), color_target.GetResScale()));
         } else {
             color_target.NoteWritten(draw_rect);
         }
@@ -1324,6 +1416,10 @@ void RasterizerVulkan::FlushRegion(PAddr addr, u32 size) {
 }
 
 bool RasterizerVulkan::MayReadInPlace(PAddr addr, u32 size) {
+    if (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::CopiedVertexData)
+        [[unlikely]] {
+        return false;
+    }
     return in_place_data.Use(addr, size, scheduler.CurrentTick());
 }
 

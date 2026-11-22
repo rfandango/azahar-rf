@@ -391,6 +391,11 @@ public:
         }
         copy_differs_all = true;
     }
+    /// Whether it makes a difference how small the rectangle given to NoteWritten is: not
+    /// while the second image differs everywhere, or is not there
+    bool TracksWritten() const noexcept {
+        return !copy_differs_all;
+    }
 
     /// Returns the framebuffer view of the surface image
     vk::ImageView FramebufferView() noexcept {

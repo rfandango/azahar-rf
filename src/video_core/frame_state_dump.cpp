@@ -7,14 +7,20 @@
 #ifdef CITRA_ENABLE_TRACE_MARKERS
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <android/log.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include "common/diagnostics.h"
+#include "common/logging/log.h"
 #include "video_core/pica/regs_internal.h"
 #include "video_core/pica_types.h"
 
@@ -37,7 +43,30 @@ constexpr std::string_view TIMED_DRAWS_PREFIX = "gpud";
 std::mutex mutex;
 std::string buffer;
 std::string request;
-bool request_initialized = false;
+/// What the trigger property held when it was last looked at
+std::string last_property;
+bool property_initialized = false;
+/// When the game's first VBlank was, and how many of the dumps asked for ahead of time are done
+std::optional<std::chrono::steady_clock::time_point> first_vblank;
+std::size_t next_scheduled = 0;
+
+// Dumps taken unasked when a game runs below its speed (Common::Diagnostics::
+// AutomaticFrameDumps): up to three a session, the first no sooner than 45 s into the game and
+// two minutes between them, each after ten seconds below 95% of the speed.
+constexpr u32 SPEED_WINDOW_VBLANKS = 120;
+/// 120 VBlanks take 2.0 s at full speed
+constexpr std::chrono::milliseconds SLOW_WINDOW{2105};
+constexpr u32 SLOW_STRETCHES = 5;
+constexpr u32 AUTOMATIC_DUMPS = 3;
+constexpr std::chrono::seconds AUTOMATIC_FIRST{45};
+constexpr std::chrono::seconds AUTOMATIC_APART{120};
+/// How soon after a dump that caught nothing the next may be taken
+constexpr std::chrono::seconds AUTOMATIC_AGAIN{20};
+std::chrono::steady_clock::time_point speed_window_start;
+u32 speed_vblanks = 0;
+u32 slow_stretches = 0;
+u32 automatic_dumps = 0;
+std::chrono::steady_clock::time_point last_automatic;
 u32 vblanks_left = 0;
 u32 draw_index = 0;
 
@@ -53,33 +82,43 @@ std::string PackageName() {
 }
 
 void Write() {
-    const std::string dir = fmt::format("/sdcard/Android/data/{}/files", PackageName());
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    const std::string path = fmt::format("{}/frame-dump-{}.txt", dir, request);
-    if (std::FILE* file = std::fopen(path.c_str(), "w")) {
-        std::fwrite(buffer.data(), 1, buffer.size(), file);
-        std::fclose(file);
-        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "wrote %s (%zu bytes)", path.c_str(),
-                            buffer.size());
-        return;
+    // A dump taken unasked that caught nothing being drawn (a game still starting, a menu that
+    // stands still) does not count as one of the session's few, and another may follow soon
+    if (request.starts_with("gpu-slow-") &&
+        buffer.find("vk renderpass begin") == std::string::npos && automatic_dumps > 0) {
+        automatic_dumps--;
+        last_automatic -= AUTOMATIC_APART - AUTOMATIC_AGAIN;
     }
 
-    // No file access: fall back to the log, slowly enough for logd to keep up.
-    __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "cannot write %s (%s), dumping to the log",
-                        path.c_str(), std::strerror(errno));
-    std::size_t start = 0;
-    while (start < buffer.size()) {
-        // Every line is newline-terminated; see Line().
-        const std::size_t end = buffer.find('\n', start);
-        if (end == std::string::npos) {
-            break;
+    // Written by a thread of its own: this one is the game's, the file goes to storage that
+    // may hold a write up for seconds, and the lines for the log are more than its queue
+    // takes at once (the thread that puts them in waits for room).
+    std::thread([text = std::move(buffer), name = request] {
+        const std::string dir = fmt::format("/sdcard/Android/data/{}/files", PackageName());
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const std::string path = fmt::format("{}/frame-dump-{}.txt", dir, name);
+        if (std::FILE* file = std::fopen(path.c_str(), "w")) {
+            std::fwrite(text.data(), 1, text.size(), file);
+            std::fclose(file);
+            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "wrote %s (%zu bytes)", path.c_str(),
+                                text.size());
+        } else {
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "cannot write %s (%s)", path.c_str(),
+                                std::strerror(errno));
         }
-        buffer[end] = '\0';
-        __android_log_write(ANDROID_LOG_INFO, LOG_TAG, buffer.c_str() + start);
-        usleep(300);
-        start = end + 1;
-    }
+
+        // And into the emulator's log, which is the one file a user shares. Every line ends
+        // in a newline; see Line().
+        LOG_INFO(HW_GPU, "FrameDump begin {}", name);
+        const std::string_view lines{text};
+        for (std::size_t start = 0, end; (end = lines.find('\n', start)) != std::string_view::npos;
+             start = end + 1) {
+            LOG_INFO(HW_GPU, "FrameDump: {}", lines.substr(start, end - start));
+        }
+        LOG_INFO(HW_GPU, "FrameDump end {}", name);
+    }).detach();
+    buffer.clear();
 }
 
 template <typename T>
@@ -208,7 +247,18 @@ void Draw(const Pica::RegsInternal& regs, bool hardware_shader, bool is_indexed,
     Line(std::move(out));
 }
 
+void OnGameStart() {
+    Common::Diagnostics::OnGameStart();
+    // When the last dump taken unasked was is kept: two are never close to each other
+    first_vblank.reset();
+    next_scheduled = 0;
+    speed_vblanks = 0;
+    slow_stretches = 0;
+    automatic_dumps = 0;
+}
+
 void OnVBlank() {
+    Common::Diagnostics::OnVBlank();
     if (IsActive()) {
         std::scoped_lock lock{mutex};
         if (--vblanks_left == 0) {
@@ -223,23 +273,61 @@ void OnVBlank() {
         return;
     }
 
-    char value[PROP_VALUE_MAX]{};
-    if (__system_property_get(TRIGGER_PROPERTY, value) <= 0) {
-        request_initialized = true;
-        return;
+    // A dump asked for ahead of time (dump_frames_at in diag.txt), by the time since the game's
+    // first VBlank; else one asked for now by changing the property
+    std::string wanted;
+    const auto now = std::chrono::steady_clock::now();
+    if (!first_vblank) {
+        first_vblank = now;
+        speed_window_start = now;
     }
-    if (!request_initialized) {
-        // Ignore a value left over from before this process started.
-        request_initialized = true;
-        request = value;
-        return;
+
+    // The pace of the emulation, a stretch of VBlanks at a time. A pause makes one stretch
+    // long and no more.
+    if (++speed_vblanks == SPEED_WINDOW_VBLANKS) {
+        slow_stretches = now - speed_window_start > SLOW_WINDOW ? slow_stretches + 1 : 0;
+        speed_vblanks = 0;
+        speed_window_start = now;
     }
-    if (request == value) {
-        return;
+
+    const auto& times = Common::Diagnostics::FrameDumpTimes();
+    if (next_scheduled < times.size() &&
+        now - *first_vblank >= std::chrono::seconds{times[next_scheduled]}) {
+        wanted = fmt::format("gpu-at-{}s", times[next_scheduled]);
+        next_scheduled++;
+    } else if (Common::Diagnostics::AutomaticFrameDumps() && automatic_dumps < AUTOMATIC_DUMPS &&
+               slow_stretches >= SLOW_STRETCHES && now - *first_vblank >= AUTOMATIC_FIRST &&
+               (automatic_dumps == 0 || now - last_automatic >= AUTOMATIC_APART)) {
+        // A game that has been running below its speed for a while: what a frame of it costs
+        // the GPU, pass by pass, is what whoever gets the log needs. A game at its speed is
+        // left alone, as a dump holds it up for a moment.
+        wanted = fmt::format(
+            "gpu-slow-{}s",
+            std::chrono::duration_cast<std::chrono::seconds>(now - *first_vblank).count());
+        automatic_dumps++;
+        last_automatic = now;
+        slow_stretches = 0;
+    } else {
+        const auto value = Common::Diagnostics::Property(TRIGGER_PROPERTY);
+        if (!value) {
+            property_initialized = true;
+            return;
+        }
+        if (!property_initialized) {
+            // Ignore a value left over from before this process started.
+            property_initialized = true;
+            last_property = *value;
+            return;
+        }
+        if (last_property == *value) {
+            return;
+        }
+        last_property = *value;
+        wanted = *value;
     }
 
     std::scoped_lock lock{mutex};
-    request = value;
+    request = wanted;
     buffer.clear();
     buffer += "=== vblank\n";
     draw_index = 0;
