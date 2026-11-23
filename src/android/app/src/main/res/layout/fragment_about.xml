@@ -192,17 +192,6 @@
 
                 <Button
                     style="?attr/materialIconButtonStyle"
-                    android:id="@+id/button_discord"
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    app:icon="@drawable/ic_discord"
-                    app:iconTint="?attr/colorOnSurface"
-                    app:iconSize="24dp"
-                    app:iconGravity="textEnd" />
-
-                <Button
-                    style="?attr/materialIconButtonStyle"
                     android:id="@+id/button_website"
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"

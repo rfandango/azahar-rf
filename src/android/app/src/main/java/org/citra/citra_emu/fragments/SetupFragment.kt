@@ -366,9 +366,7 @@ class SetupFragment : Fragment() {
                                 isUnskippable = true,
                                 hasWarning = false,
                                 R.string.cannot_skip,
-                                R.string.cannot_skip_directory_description,
-                                R.string.cannot_skip_directory_help
-
+                                R.string.cannot_skip_directory_description
                             )
                         )
                         add(

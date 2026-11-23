@@ -123,7 +123,7 @@
     <string name="setup_system_files">系统文件</string>
     <string name="setup_system_files_description">执行系统文件操作，如安装系统文件或启动 HOME 菜单</string>
     <string name="setup_tool_connect">连接到 Artic 设置工具</string>
-    <string name="setup_system_files_preamble"><![CDATA[Azahar 需要来自真实掌机的独有数据和固件文件才能使用其部分功能。此类文件和数据可通过 <a href=https://github.com/azahar-emu/ArticSetupTool>Azahar Artic 设置工具</a>进行设置。<br>注意：<ul><li><b>此操作会将掌机独有数据安装到 Azahar，执行设置过程后请勿共享您的用户或 nand 文件夹！</b></li><li>在执行设置过程时，Azahar 将关联到运行设置工具的掌机。您可以随时从模拟器配置菜单的“系统”选项卡中取消关联掌机。</li><li>设置系统文件后，请勿同时使用 Azahar 和 3DS 掌机联网，因为这可能会导致问题。</li><li>新 3DS 设置需要先进行老 3DS 设置才能运作（建议两种设置模式都执行）。</li><li>无论运行设置工具的掌机型号如何，两种设置模式均可运作。</li></ul>]]></string>
+    <string name="setup_system_files_preamble"><![CDATA[Azahar 需要来自真实掌机的独有数据和固件文件才能使用其部分功能。此类文件和数据可通过 Azahar Artic 设置工具进行设置。<br>注意：<ul><li><b>此操作会将掌机独有数据安装到 Azahar，执行设置过程后请勿共享您的用户或 nand 文件夹！</b></li><li>在执行设置过程时，Azahar 将关联到运行设置工具的掌机。您可以随时从模拟器配置菜单的“系统”选项卡中取消关联掌机。</li><li>设置系统文件后，请勿同时使用 Azahar 和 3DS 掌机联网，因为这可能会导致问题。</li><li>新 3DS 设置需要先进行老 3DS 设置才能运作（建议两种设置模式都执行）。</li><li>无论运行设置工具的掌机型号如何，两种设置模式均可运作。</li></ul>]]></string>
     <string name="setup_system_files_detect">正在获取当前系统文件状态，请稍候...</string>
     <string name="delete_system_files">取消关联掌机独有数据</string>
     <string name="delete_system_files_description"><![CDATA[此操作将取消您真实掌机与 Azahar 的关联，并产生以下后果：<br><ul><li>您的 OTP、SecureInfo 和 LocalFriendCodeSeed 文件将从 Azahar 中删除。</li><li>您的好友列表将被重置，并且注销 NNID/PNID 帐户。</li><li>通过 Azahar 获得的系统文件和 eshop 数字版应用将变得无法访问，直到再次关联同一掌机（保存的数据不会丢失）。</ul><br>是否继续？]]></string>

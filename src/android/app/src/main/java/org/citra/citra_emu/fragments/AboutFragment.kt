@@ -84,7 +84,6 @@ class AboutFragment : Fragment() {
             }
         }
 
-        binding.buttonDiscord.setOnClickListener { openLink(getString(R.string.support_link)) }
         binding.buttonWebsite.setOnClickListener { openLink(getString(R.string.website_link)) }
         binding.buttonGithub.setOnClickListener { openLink(getString(R.string.github_link)) }
 
