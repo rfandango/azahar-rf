@@ -417,7 +417,7 @@ void TextureRuntime::FreeRetired() {
             handle.Destroy();
         }
     }
-    std::erase_if(retired, [](const auto& entry) { return !entry.first; });
+    std::erase_if(retired, [free_tick](const auto& entry) { return free_tick > entry.second; });
 }
 
 void TextureRuntime::NoteStorageUse(PAddr addr, u32 width, u32 height) {
@@ -1313,7 +1313,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
         handles[Type::MultiSampled].Create(
             GetScaledWidth(), GetScaledHeight(), levels, texture_type, format,
             vk::SampleCountFlagBits(sample_count), traits.usage, flags, traits.aspect,
-            need_format_list, DebugName(true, false, sample_count), image_stencil_sampled);
+            need_format_list, DebugName(true, false, sample_count));
         raw_images.emplace_back(handles[Type::MultiSampled].image);
     }
 
@@ -1668,13 +1668,16 @@ void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
     if (res_scale_modified && new_scale > 1) {
         res_scale = new_scale;
 
+        // The surface moves to another image. What was recorded so far can be for the one it
+        // was in, and for the second one that goes with it.
+        RetireForNewImages(Type::Scaled);
+        RetireForNewImages(Type::Copy);
         handles[Type::Scaled].Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type,
                                      traits.native, vk::SampleCountFlagBits::e1, scaled_usage,
                                      flags, traits.aspect, format_list, DebugName(true),
                                      image_stencil_sampled);
         current = Type::Scaled;
-
-        handles[Type::Copy].Destroy();
+        image_generation++;
 
         runtime.renderpass_cache.EndRendering();
         scheduler.Record([raw_images = std::array{Image()}, aspect = traits.aspect,
@@ -1697,10 +1700,12 @@ void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
 
     if ((res_scale_modified || sample_count != new_sample_count) && new_sample_count > 1) {
         sample_count = new_sample_count;
+        RetireForNewImages(Type::MultiSampled);
+        image_generation++;
         handles[Type::MultiSampled].Create(
             GetScaledWidth(), GetScaledHeight(), levels, texture_type, traits.native,
             vk::SampleCountFlagBits(sample_count), traits.usage, flags, traits.aspect, false,
-            DebugName(res_scale != 1, false, sample_count), image_stencil_sampled);
+            DebugName(res_scale != 1, false, sample_count));
 
         // The multi-sampled image is just a transient image that is almost always immediately
         // resolved into the current image, and should not be representative of the entire surface!
@@ -1790,11 +1795,22 @@ bool Surface::MakeStencilSampleable() {
     return true;
 }
 
+void Surface::RetireForNewImages(Type type) {
+    // The framebuffer of the multisampled image is for the one it resolves into as well
+    Handle& multisampled = handles[Type::MultiSampled];
+    if (multisampled.framebuffer) {
+        Handle old{instance};
+        old.framebuffer = std::exchange(multisampled.framebuffer, VK_NULL_HANDLE);
+        runtime.Retire(std::move(old));
+    }
+    if (handles[type]) {
+        runtime.Retire(std::move(handles[type]));
+    }
+}
+
 void Surface::RemakeImages() {
     // The second image holds nothing that lasts: it is made again when it is needed
-    if (handles[Type::Copy]) {
-        runtime.Retire(std::move(handles[Type::Copy]));
-    }
+    RetireForNewImages(Type::Copy);
     for (const Type type : {Type::Base, Type::Scaled}) {
         Handle& handle = handles[type];
         if (!handle) {
@@ -1878,7 +1894,7 @@ void Surface::RemakeImages() {
         });
 
         // Commands recorded so far use the old image, and so may views handed out for it
-        runtime.Retire(std::move(handle));
+        RetireForNewImages(type);
         handle = std::move(fresh);
     }
     image_generation++;

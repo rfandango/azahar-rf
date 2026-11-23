@@ -133,8 +133,11 @@ public:
     FramebufferHelper<T> GetFramebufferSurfaces(bool using_color_fb, bool using_depth_fb,
                                                 bool depth_overwritten = false);
 
-    /// The framebuffer for the same surfaces as these parameters name, with the colour surface
-    /// in the image it is in now
+    /// These parameters with the images the surfaces they name are in now
+    FramebufferParams WithCurrentImages(FramebufferParams params) const;
+
+    /// The framebuffer for the same surfaces as these parameters name, with the images the
+    /// surfaces are in now
     Framebuffer* RefreshFramebuffer(FramebufferParams params);
 
     /// Get a surface that matches a "texture copy" display transfer config

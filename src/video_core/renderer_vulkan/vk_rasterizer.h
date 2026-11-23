@@ -79,9 +79,10 @@ private:
     void SyncAndUploadLUTsLF();
 
     /// Syncs all enabled PICA texture units
-    /// Returns whether the colour surface of the framebuffer moved to its other image, for a
-    /// draw that samples it and overwrites all of the rectangle it is confined to
-    bool SyncTextureUnits(const Framebuffer* framebuffer, const Common::Rectangle<u32>& draw_rect,
+    /// The surfaces of the framebuffer can change images: the colour surface moves to its other
+    /// one for a draw that samples it and overwrites all of the rectangle it is confined to,
+    /// and either is given new ones when a texture is made from it that its own do not do for.
+    void SyncTextureUnits(const Framebuffer* framebuffer, const Common::Rectangle<u32>& draw_rect,
                           bool overwrites_color);
 
     /// Syncs all utility textures in the fragment shader.

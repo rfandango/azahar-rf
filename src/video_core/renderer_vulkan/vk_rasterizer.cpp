@@ -998,9 +998,8 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     // Sync and bind the texture surfaces
     const bool overwrites_color = next_draw_overwrites_color && write_color_fb && !shadow_rendering;
     const bool overwrites_depth = next_draw_overwrites_depth && write_depth_fb && !shadow_rendering;
-    if (SyncTextureUnits(framebuffer, draw_rect, overwrites_color)) {
-        framebuffer = fb_helper.Refresh();
-    }
+    SyncTextureUnits(framebuffer, draw_rect, overwrites_color);
+    framebuffer = fb_helper.Refresh();
     SyncUtilityTextures(framebuffer);
 
     // Sync and bind the shader. With Z-buffering the viewport applies the PICA depth range, so
@@ -1138,7 +1137,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     return succeeded;
 }
 
-bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
+void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
                                         const Common::Rectangle<u32>& draw_rect,
                                         bool overwrites_color) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
@@ -1308,7 +1307,6 @@ bool RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
             last_texture_set = LastTextureSet{wanted, tick, reusable};
         }
     }
-    return static_cast<bool>(swapped_color_view);
 }
 
 void RasterizerVulkan::SyncUtilityTextures(const Framebuffer* framebuffer) {

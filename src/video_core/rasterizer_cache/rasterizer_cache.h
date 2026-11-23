@@ -1022,11 +1022,22 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
 }
 
 template <class T>
+FramebufferParams RasterizerCache<T>::WithCurrentImages(FramebufferParams fb_params) const {
+    if (fb_params.color_id) {
+        const Surface& color_surface = slot_surfaces[fb_params.color_id];
+        fb_params.color_swapped = color_surface.swapped;
+        fb_params.color_generation = color_surface.image_generation;
+    }
+    if (fb_params.depth_id) {
+        fb_params.depth_generation = slot_surfaces[fb_params.depth_id].image_generation;
+    }
+    return fb_params;
+}
+
+template <class T>
 typename RasterizerCache<T>::Framebuffer* RasterizerCache<T>::RefreshFramebuffer(
     FramebufferParams fb_params) {
-    fb_params.color_swapped = fb_params.color_id && slot_surfaces[fb_params.color_id].swapped;
-    fb_params.color_generation =
-        fb_params.color_id ? slot_surfaces[fb_params.color_id].image_generation : u8(0);
+    fb_params = WithCurrentImages(fb_params);
 
     auto [it, new_framebuffer] = framebuffers.try_emplace(fb_params);
     if (new_framebuffer) {
@@ -1658,7 +1669,9 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
             if (!replaced.IsCustom()) {
                 replaced.flags &= ~SurfaceFlagBits::Custom;
             }
-            sentenced.emplace_back(old_id, runtime.GetResourceTick());
+            Sentence(old_id);
+            // What was made for the image that goes is found under the id that stays
+            slot_surfaces[surface_id].image_generation++;
         }
 
         // swap_and_insert can grow slot_surfaces, so the reference above may be dangling

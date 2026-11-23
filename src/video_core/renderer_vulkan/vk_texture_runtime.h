@@ -513,6 +513,10 @@ public:
     /// Makes the images of the surface anew from image_usage, image_flags, image_format_list
     /// and image_stencil_sampled, with what they held copied over; the old ones are retired
     void RemakeImages();
+
+    /// Leaves one of the surface's images, and the framebuffers made for it, to be destroyed
+    /// once the GPU is done with what was recorded for them, so that another can take its place
+    void RetireForNewImages(Type type);
     /// Where the second image may differ from the one the surface is in: all of it (also
     /// while there is no second image), or within a rectangle, which is empty while
     /// differs_x0 >= differs_x1. See NoteWritten.

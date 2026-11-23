@@ -29,9 +29,10 @@ struct FramebufferParams {
     bool shadow_rendering;
     /// Which of its two images the colour surface is in, see SurfaceBase::swapped
     bool color_swapped;
-    /// The images of the colour surface the framebuffer is for, see SurfaceBase::image_generation
-    u8 color_generation;
-    INSERT_PADDING_BYTES(1);
+    INSERT_PADDING_BYTES(2);
+    /// The images of the two surfaces the framebuffer is for, see SurfaceBase::image_generation
+    u32 color_generation;
+    u32 depth_generation;
 
     bool operator==(const FramebufferParams& params) const noexcept {
         return std::memcmp(this, &params, sizeof(FramebufferParams)) == 0;
@@ -150,9 +151,13 @@ public:
         depth_written = depth;
     }
 
-    /// To be called after the colour surface changed images: the framebuffer to go on with
+    /// To be called after something that can have the surfaces change images, as the syncing
+    /// of the textures of a draw does: the framebuffer to go on with
     typename T::Framebuffer* Refresh() {
-        fb = res_cache->RefreshFramebuffer(static_cast<const FramebufferParams&>(*fb));
+        const FramebufferParams& held = *fb;
+        if (res_cache->WithCurrentImages(held) != held) {
+            fb = res_cache->RefreshFramebuffer(held);
+        }
         return fb;
     }
 
