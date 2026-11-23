@@ -17,6 +17,7 @@
 #include "common/assert.h"
 #include "common/atomic_ops.h"
 #include "common/common_types.h"
+#include "common/hash.h"
 #include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/memory_view.h"
@@ -393,9 +394,11 @@ public:
     /// hand-over instead of armed.
     struct VolatilePage {
         u32 page{};
-        /// Looks in a row, one at every 32nd copy of it, its contents were the same at
+        /// Looks in a row its contents were the same at, how many of those it takes for the
+        /// page to be armed again, and the VBlank (late_vblank) of the next look
         u32 same{};
-        u32 turn{};
+        u32 looks_needed{1};
+        u64 next_look{};
         u64 checksum{};
         /// While it is still armed: the command that has to be done before it need not be
         u64 disarm_after{~u64{0}};
@@ -501,9 +504,26 @@ public:
     std::deque<std::vector<u8>> stitched;
 
     static constexpr std::size_t MAX_VOLATILE_PAGES = 1024;
-    /// Looks with the same contents after which a volatile page is armed again: about two
-    /// thousand hand-overs
-    static constexpr u32 VOLATILE_DECAY = 64;
+    /// When a volatile page is armed again. Most are written once and never again: a game
+    /// that loads writes new data over what the decoder read from before, and a page that
+    /// was copied for a quarter of a minute after that (the rule before this one) was 1.9 MB
+    /// copied every VBlank after a change of rooms in Resident Evil: Revelations, up to 9 MB
+    /// while it loaded, and 15% of the emulation thread. So a page is looked at every
+    /// LOOK_EVERY VBlanks and armed as soon as one look finds it as the look before. One that
+    /// is written again soon after takes twice as many looks the next time, up to MOST_LOOKS
+    /// (a quarter of a minute); one that stood armed for CALM_AFTER VBlanks starts anew. What
+    /// a game writes every now and then is so waited for a few times, then copied.
+    static constexpr u64 LOOK_EVERY = 16;
+    static constexpr u32 MOST_LOOKS = 64;
+    static constexpr u64 CALM_AFTER = 900;
+    /// For each page the looks it took the last time, and the VBlank it was armed again at
+    /// (0: it was not)
+    std::vector<u8> looks_taken;
+    std::vector<u64> armed_again_at;
+    /// Since the figures were last asked for: pages armed again, and pages written (so
+    /// volatile again) that had been
+    u32 armed_again_count{};
+    u32 written_again_count{};
 
     /// A volatile page of which the decoder has read no copy for this many VBlanks (a quarter
     /// of a minute) is forgotten: neither copied nor armed any more, as if the decoder had
@@ -532,6 +552,15 @@ public:
         entry.page = static_cast<u32>(page);
         entry.read_turn = snapshot_last_read[page].load(std::memory_order_relaxed);
         entry.read_vblank = late_vblank;
+        // (Pages become volatile by the hundred, and are not all looked at at once)
+        entry.next_look = late_vblank + (page & 7);
+        if (armed_again_at[page] != 0) {
+            written_again_count++;
+            const bool calm = late_vblank - armed_again_at[page] > CALM_AFTER;
+            entry.looks_needed = calm ? 1 : std::min<u32>(looks_taken[page] * 2u, MOST_LOOKS);
+            armed_again_at[page] = 0;
+        }
+        looks_taken[page] = static_cast<u8>(entry.looks_needed);
         volatile_pages.insert(std::lower_bound(volatile_pages.begin(), volatile_pages.end(), entry,
                                                [](const VolatilePage& a, const VolatilePage& b) {
                                                    return a.page < b.page;
@@ -1162,6 +1191,8 @@ MemorySystem::Impl::Impl(Core::System& system_)
     reference_kind.resize(surface_cells.size());
     reference_cells.resize(surface_cells.size());
     reference_state.resize(surface_cells.size());
+    looks_taken.resize(surface_cells.size());
+    armed_again_at.resize(surface_cells.size());
     snapshot_slot.resize(surface_cells.size());
     snapshot_last_read = std::make_unique<std::atomic<u32>[]>(surface_cells.size());
     volatile_flag = std::make_unique<std::atomic<u8>[]>(surface_cells.size());
@@ -2084,6 +2115,42 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
     std::vector<Impl::VolatilePage>& volatile_pages = impl->volatile_pages;
     bool demoted = false;
     std::vector<u32> forgotten;
+    // Whether the decoder still reads the page (see FORGET_AFTER), and whether the game still
+    // writes it. Looked at now and then only.
+    const auto look = [&](Impl::VolatilePage& entry, const u8* bytes) {
+        if (impl->late_vblank < entry.next_look) {
+            return;
+        }
+        entry.next_look = impl->late_vblank + Impl::LOOK_EVERY;
+        u8& bits = state[entry.page];
+        const u32 read_turn = impl->snapshot_last_read[entry.page].load(std::memory_order_relaxed);
+        if (read_turn != entry.read_turn) {
+            entry.read_turn = read_turn;
+            entry.read_vblank = impl->late_vblank;
+        } else if ((bits & 2) == 0 && impl->late_vblank - entry.read_vblank > Impl::FORGET_AFTER) {
+            bits &= static_cast<u8>(~(1 | 16 | 32));
+            forgotten.push_back(entry.page);
+            demoted = true;
+            return;
+        }
+        const u64 checksum = Common::ComputeHash64(bytes, CITRA_PAGE_SIZE);
+        if (checksum != entry.checksum) {
+            entry.checksum = checksum;
+            entry.same = 0;
+        } else if (++entry.same >= entry.looks_needed && (bits & 2) == 0) {
+            // Left alone: armed again, below
+            bits &= static_cast<u8>(~32);
+            if ((bits & 1) != 0) {
+                impl->to_arm.push_back(entry.page);
+            }
+            if ((bits & 16) != 0) {
+                impl->to_arm_transfer.push_back(entry.page);
+            }
+            impl->armed_again_at[entry.page] = impl->late_vblank;
+            impl->armed_again_count++;
+            demoted = true;
+        }
+    };
     for (Impl::VolatilePage& entry : volatile_pages) {
         u8& bits = state[entry.page];
         if ((bits & 2) != 0) {
@@ -2110,19 +2177,7 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
                 if (impl->volatile_flag[entry.page].load(std::memory_order_relaxed) == 2) {
                     impl->volatile_flag[entry.page].store(1, std::memory_order_relaxed);
                 }
-                if ((entry.turn++ & 31) == 0) {
-                    const u32 read_turn =
-                        impl->snapshot_last_read[entry.page].load(std::memory_order_relaxed);
-                    if (read_turn != entry.read_turn) {
-                        entry.read_turn = read_turn;
-                        entry.read_vblank = impl->late_vblank;
-                    } else if ((bits & 2) == 0 &&
-                               impl->late_vblank - entry.read_vblank > Impl::FORGET_AFTER) {
-                        bits &= static_cast<u8>(~(1 | 16 | 32));
-                        forgotten.push_back(entry.page);
-                        demoted = true;
-                    }
-                }
+                look(entry, GetPhysicalPointer(Impl::CellPageAddress(entry.page)));
                 continue;
             }
         }
@@ -2141,45 +2196,7 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
             std::memcpy(copy, GetPhysicalPointer(Impl::CellPageAddress(entry->page)),
                         CITRA_PAGE_SIZE);
             snapshot_pages.push_back(entry->page);
-            // Whether the game still writes the page is looked at now and then only: the sum
-            // costs ten times the copy
-            if ((entry->turn++ & 31) == 0) {
-                u8& bits = state[entry->page];
-                // And first whether the decoder still reads it (see FORGET_AFTER)
-                const u32 read_turn =
-                    impl->snapshot_last_read[entry->page].load(std::memory_order_relaxed);
-                if (read_turn != entry->read_turn) {
-                    entry->read_turn = read_turn;
-                    entry->read_vblank = impl->late_vblank;
-                } else if ((bits & 2) == 0 &&
-                           impl->late_vblank - entry->read_vblank > Impl::FORGET_AFTER) {
-                    bits &= static_cast<u8>(~(1 | 16 | 32));
-                    forgotten.push_back(entry->page);
-                    demoted = true;
-                    copy += CITRA_PAGE_SIZE;
-                    continue;
-                }
-                u64 checksum = 0;
-                for (u32 i = 0; i < CITRA_PAGE_SIZE; i += sizeof(u64)) {
-                    u64 word;
-                    std::memcpy(&word, copy + i, sizeof(word));
-                    checksum = checksum * 31 + word;
-                }
-                if (checksum != entry->checksum) {
-                    entry->checksum = checksum;
-                    entry->same = 0;
-                } else if (++entry->same >= Impl::VOLATILE_DECAY && (bits & 2) == 0) {
-                    // Left alone for long: armed again, below
-                    bits &= static_cast<u8>(~32);
-                    if ((bits & 1) != 0) {
-                        impl->to_arm.push_back(entry->page);
-                    }
-                    if ((bits & 16) != 0) {
-                        impl->to_arm_transfer.push_back(entry->page);
-                    }
-                    demoted = true;
-                }
-            }
+            look(*entry, copy);
             copy += CITRA_PAGE_SIZE;
         }
         impl->snapshot_bytes_copied += count * CITRA_PAGE_SIZE;
@@ -2505,6 +2522,8 @@ std::pair<u64, u64> MemorySystem::TakeSnapshotReadFigures() {
 MemorySystem::VolatileAges MemorySystem::VolatileAgesNow() {
     VolatileAges ages{};
     ages.forgotten = std::exchange(impl->forgotten_count, 0);
+    ages.armed_again = std::exchange(impl->armed_again_count, 0);
+    ages.written_again = std::exchange(impl->written_again_count, 0);
     if (!impl->snapshot_last_read || impl->volatile_pages.empty()) {
         return ages;
     }

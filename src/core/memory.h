@@ -852,6 +852,9 @@ public:
         PAddr last{};
         u32 runs{};
         u32 forgotten{};
+        /// Pages armed again since they were left alone, and those of them written again
+        u32 armed_again{};
+        u32 written_again{};
     };
     VolatileAges VolatileAgesNow();
     void Disarm(PAddr addr, u32 size, bool written);

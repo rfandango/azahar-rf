@@ -836,7 +836,10 @@ void GPU::ReportDecoderWaits() {
                              static_cast<double>(left_uncopied) / REPORT_VBLANKS, unheld);
     }
     if (const auto ages = impl->memory.VolatileAgesNow();
-        volatile_pages != 0 || ages.forgotten != 0) {
+        volatile_pages != 0 || ages.forgotten != 0 || ages.armed_again != 0) {
+        waits +=
+            fmt::format("; {} left alone by the game and armed again, {} of those written again",
+                        ages.armed_again, ages.written_again);
         waits +=
             fmt::format(" (from {:08X} to {:08X} in {} runs; a copy of them was last read "
                         "within 256 commands: {}, within 2048: {}, longer ago: {}, never: "
