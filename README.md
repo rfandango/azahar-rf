@@ -1,3 +1,21 @@
+# Azahar RF
+
+**Azahar RF is an experimental fork of [Azahar](https://github.com/azahar-emu/azahar), the Nintendo 3DS emulator. It targets Adreno GPUs only.**
+
+- **Adreno only:** it is made for Android devices with a Qualcomm Adreno GPU. Other GPUs and other platforms are neither supported nor tested.
+- **Experimental:** expect bugs, and things that change from one build to the next.
+- **Not an official Azahar release:** please don't report problems with it to the Azahar project.
+
+Builds are on the [Releases](https://github.com/rfandango/azahar/releases) page. They come with a Vulkan driver for Adreno GPUs, based on Mesa's Turnip, and install next to Azahar.
+
+*Azahar RF is not affiliated with or endorsed by Nintendo or the Azahar project.*
+
+---
+
+The rest of this file is Azahar's own README. Its downloads, requirements and links are for Azahar, not for this fork.
+
+---
+
 ![Azahar Emulator](https://azahar-emu.org/resources/images/logo/azahar-name-and-logo.svg)
 
 ![Current Release](https://img.shields.io/github/v/release/azahar-emu/azahar?label=Current%20Release)
