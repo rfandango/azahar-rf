@@ -533,12 +533,6 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     config.conditional_instructions_in_blocks =
         (Common::TraceMarkers::Experiments3() &
          Common::TraceMarkers::ConditionalInstructionsSplitBlocks) == 0;
-    // Longer blocks are fewer host instructions and more time: off unless asked for (see the
-    // two switches)
-    config.side_exits =
-        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::SideExits) != 0;
-    config.follow_jumps =
-        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::FollowJumps) != 0;
     // Loads of constants next to the code are made as constants, unless the profiling switch
     // asks for them as loads
     fold_read_only_loads =

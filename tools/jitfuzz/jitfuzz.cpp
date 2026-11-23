@@ -384,12 +384,7 @@ void ApplySwitches(A32::UserConfig &config, u32 switches) {
   if (switches & 4096) {
     config.conditional_instructions_in_blocks = true;
   }
-  if (switches & 8192) {
-    config.side_exits = true;
-  }
-  if (switches & 16384) {
-    config.follow_jumps = true;
-  }
+  // (8192 and 16384 were the longer blocks, which are gone)
   if (switches & 32768) {
     config.fold_read_only_loads = true;
   }

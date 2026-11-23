@@ -325,21 +325,13 @@ enum Experiment3 : std::uint32_t {
     /// the copy of a page that came with the command; and a copy between two places of the
     /// game's memory (DMA) does not wait for the commands handed over before it.
     UnheldCommandRanges = 16777216,
-    /// A conditional branch ahead does not end its block: the block is left only where the
-    /// branch is taken (Dynarmic::A32::UserConfig::side_exits). Off unless asked for here:
-    /// it makes blocks longer and the host instructions fewer (Xenoblade Chronicles: 2.84 to
-    /// 2.79 for one of the guest's, counted), and the time in recompiled code longer in two
-    /// games of three (Kid Icarus +8%, Luigi's Mansion 2 +4%, Xenoblade -3%; 2026-11-23, the
-    /// same scenes on one build). What follows the branch is then there twice, as the rest
-    /// of this block and as a block of its own for whoever jumps there, and the host's branch
-    /// predictor and caches pay for the second copy.
-    SideExits = 33554432,
-    /// With SideExits: a jump whose target is known does not end its block either, the block
-    /// goes on at the target (Dynarmic::A32::UserConfig::follow_jumps). Off unless asked for
-    /// here, for the same reason and more of it: the code of a routine is then in the block
-    /// of each of its callers (2.79 to 2.68 host instructions counted, and the time in
-    /// recompiled code +17% in Kid Icarus, +5% in Luigi's Mansion 2, +0 to 9% in Xenoblade).
-    FollowJumps = 67108864,
+    // (33554432 and 67108864 switched longer blocks on until 2026-11-23: a conditional branch
+    // ahead that leaves its block only where it is taken, and a block that goes on at the
+    // target of a jump. Both ran fewer host instructions (2.84 to 2.79 to 2.68 for one of the
+    // guest's in Xenoblade Chronicles) and took more time in recompiled code (Kid Icarus +8%
+    // and +17%, Luigi's Mansion 2 +4% and +5%): the code behind a branch or inside a called
+    // routine is then there once for every block that reaches it, and the host's branch
+    // predictor and caches pay for the copies. The code was taken out.)
     /// For measuring: every instruction of the guest counts as one unit of emulated time, so
     /// that the time the emulated cores have run (GuestTicks) is the number of instructions
     /// they executed. Changes how fast the emulated processor is, and the recompiled code is
