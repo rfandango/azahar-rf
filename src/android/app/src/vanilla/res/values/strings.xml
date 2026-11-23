@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- This is a personal fork. Its name tells it apart from Azahar, next to which it installs
+         (the application id is the vanilla flavor's, in build.gradle.kts). It is here and not in
+         main so that merges from Azahar leave it alone. -->
+    <string name="app_name" translatable="false">Azahar RF</string>
+</resources>

@@ -55,6 +55,10 @@ freeline.py
 freeline/
 freeline_project_description.json
 
+# GPU driver packages to build the app with
+app/gpu_driver/*
+!app/gpu_driver/README.md
+
 # fastlane
 fastlane/report.xml
 fastlane/Preview.html

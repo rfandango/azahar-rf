@@ -9,6 +9,7 @@ import android.os.Build
 import androidx.documentfile.provider.DocumentFile
 import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.lang.IllegalStateException
@@ -23,6 +24,23 @@ import org.citra.citra_emu.utils.FileUtil.inputStream
 
 object GpuDriverHelper {
     private const val META_JSON_FILENAME = "meta.json"
+
+    // Where a build that comes with a driver describes it; the driver itself is one of the app's
+    // native libraries.
+    private const val BUILT_IN_DRIVER_META_ASSET = "gpu_driver/meta.json"
+
+    // In the driver installation directory: the system's driver was chosen. Without it, and
+    // without a driver installed there, the one the app comes with is used.
+    private const val SYSTEM_DRIVER_FILENAME = "use_system_driver"
+
+    // In the app's files: how the trial of the driver the app comes with went.
+    private const val BUILT_IN_DRIVER_TRIAL_FILENAME = "built_in_driver"
+
+    // In place of a driver package's location.
+    val SYSTEM_DRIVER: Uri = Uri.EMPTY
+    val BUILT_IN_DRIVER: Uri = Uri.parse("driver:built-in")
+
+    private var isBuiltInDriverUsed = false
     private var fileRedirectionPath: String? = null
     var driverInstallationPath: String? = null
     private var hookLibPath: String? = null
@@ -66,19 +84,73 @@ object GpuDriverHelper {
         // Initialize hook libraries directory.
         hookLibPath = CitraApplication.appContext.applicationInfo.nativeLibraryDir + "/"
 
-        // Initialize GPU driver.
-        NativeLibrary.initializeGpuDriver(
+        // Initialize GPU driver: the one that was installed, the one the app comes with, or the
+        // system's.
+        isBuiltInDriverUsed = initializeBuiltInDriver()
+        if (!isBuiltInDriverUsed) {
+            NativeLibrary.initializeGpuDriver(
+                hookLibPath,
+                driverInstallationPath,
+                customDriverData.libraryName,
+                fileRedirectionPath,
+                false
+            )
+        }
+    }
+
+    /**
+     * Uses the driver the app comes with, unless another was chosen or it does not work here. It
+     * has to show that it works once per build of the app and of the system, and the outcome is
+     * kept: a trial that is still noted as running when the app starts is one the app did not
+     * survive.
+     */
+    private fun initializeBuiltInDriver(): Boolean {
+        val driver = builtInDriverData ?: return false
+        if (customDriverData.name != null ||
+            File(driverInstallationPath + SYSTEM_DRIVER_FILENAME).exists()
+        ) {
+            return false
+        }
+
+        val build = "${BuildConfig.VERSION_CODE} ${Build.FINGERPRINT}"
+        val trial = File(CitraApplication.appContext.filesDir, BUILT_IN_DRIVER_TRIAL_FILENAME)
+        val outcome = try {
+            trial.readText()
+        } catch (_: IOException) {
+            ""
+        }
+        if (outcome == "fails $build" || outcome == "running $build") {
+            Log.warning("[GpuDriverHelper] ${driver.name} is not used, earlier trial: $outcome")
+            return false
+        }
+
+        val isProven = outcome == "works $build"
+        if (!isProven) {
+            // On the storage before the driver is touched, in case the device does not survive it
+            FileOutputStream(trial).use {
+                it.write("running $build".toByteArray())
+                it.fd.sync()
+            }
+        }
+        val works = NativeLibrary.initializeGpuDriver(
             hookLibPath,
-            driverInstallationPath,
-            customDriverData.libraryName,
-            fileRedirectionPath
+            hookLibPath,
+            driver.libraryName,
+            fileRedirectionPath,
+            !isProven
         )
+        if (!isProven) {
+            trial.writeText((if (works) "works " else "fails ") + build)
+        }
+        Log.info("[GpuDriverHelper] The app's own driver ${driver.name}: taken $works")
+        return works
     }
 
     /**
      * Installs test_driver.zip from the app's external files folder (where adb can put it:
      * /sdcard/Android/data/<package>/files) in place of the current driver, once: the file is
-     * removed afterwards. An empty file of that name goes back to the system driver.
+     * removed afterwards. An empty file of that name goes back to the system driver, one that is
+     * no package to the driver the app comes with, which gets another trial.
      */
     private fun installTestDriver() {
         val zip = File(CitraApplication.appContext.getExternalFilesDir(null), "test_driver.zip")
@@ -89,10 +161,16 @@ object GpuDriverHelper {
             val installation = File(driverInstallationPath!!)
             installation.deleteRecursively()
             installation.mkdirs()
+            File(CitraApplication.appContext.filesDir, BUILT_IN_DRIVER_TRIAL_FILENAME).delete()
             if (zip.length() > 0) {
-                FileUtil.unzipToInternalStorage(BufferedInputStream(zip.inputStream()), installation)
+                FileUtil.unzipToInternalStorage(
+                    BufferedInputStream(zip.inputStream()),
+                    installation
+                )
+            } else {
+                File(installation, SYSTEM_DRIVER_FILENAME).createNewFile()
             }
-            Log.info("[GpuDriverHelper] Test driver installed from ${zip.path} (${zip.length()} bytes)")
+            Log.info("[GpuDriverHelper] Test driver of ${zip.length()} bytes installed")
         } catch (e: Exception) {
             Log.error("[GpuDriverHelper] Test driver ${zip.path} not installed: $e")
         }
@@ -113,13 +191,33 @@ object GpuDriverHelper {
                 .toMutableList()
 
         // TODO: Get system driver information
-        drivers.add(0, Pair(Uri.EMPTY, GpuDriverMetadata()))
+        drivers.add(0, Pair(SYSTEM_DRIVER, GpuDriverMetadata()))
+        // The default comes first
+        builtInDriverData?.let { drivers.add(0, Pair(BUILT_IN_DRIVER, it)) }
         return drivers
     }
 
+    /**
+     * Goes back to the default: the driver the app comes with, if it works here, or the system's.
+     */
     fun installDefaultDriver() {
-        // Removing the installed driver will result in the backend using the default system driver.
         File(driverInstallationPath!!).deleteRecursively()
+        initializeDriverParameters()
+    }
+
+    /**
+     * The default, when it was asked for: a driver that did not work gets another trial.
+     */
+    fun installBuiltInDriver() {
+        File(CitraApplication.appContext.filesDir, BUILT_IN_DRIVER_TRIAL_FILENAME).delete()
+        installDefaultDriver()
+    }
+
+    fun installSystemDriver() {
+        val installation = File(driverInstallationPath!!)
+        installation.deleteRecursively()
+        installation.mkdirs()
+        File(installation, SYSTEM_DRIVER_FILENAME).createNewFile()
         initializeDriverParameters()
     }
 
@@ -150,7 +248,7 @@ object GpuDriverHelper {
      * other user data and also unzipped into the installation directory
      */
     fun installCustomDriverComplete(driverUri: Uri): Boolean {
-        // Revert to system default in the event the specified driver is bad.
+        // Revert to the default in the event the specified driver is bad.
         installDefaultDriver()
 
         // Ensure we have directories.
@@ -192,7 +290,7 @@ object GpuDriverHelper {
      * Unzips driver into private installation directory
      */
     fun installCustomDriverPartial(driver: Uri): Boolean {
-        // Revert to system default in the event the specified driver is bad.
+        // Revert to the default in the event the specified driver is bad.
         installDefaultDriver()
 
         // Ensure we have directories.
@@ -252,6 +350,42 @@ object GpuDriverHelper {
     // Parse the custom driver metadata to retrieve the name.
     val customDriverData: GpuDriverMetadata
         get() = GpuDriverMetadata(File(driverInstallationPath + META_JSON_FILENAME))
+
+    // The driver the app was built with, for whatever device; none if it was built without.
+    val packagedDriverData: GpuDriverMetadata? by lazy {
+        try {
+            CitraApplication.appContext.assets.open(BUILT_IN_DRIVER_META_ASSET)
+                .use { GpuDriverMetadata(it, 0) }
+                .takeIf { it.name != null && it.libraryName != null }
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    // That driver, if it is for this device.
+    val builtInDriverData: GpuDriverMetadata? by lazy {
+        packagedDriverData?.takeIf {
+            it.minApi <= Build.VERSION.SDK_INT &&
+                supportsCustomDriverLoading() &&
+                isAdrenoGpu() &&
+                File(
+                    CitraApplication.appContext.applicationInfo.nativeLibraryDir,
+                    it.libraryName!!
+                ).isFile
+        }
+    }
+
+    // The driver that is used; without a name it is the system's.
+    val currentDriverData: GpuDriverMetadata
+        get() = if (isBuiltInDriverUsed) builtInDriverData!! else customDriverData
+
+    /**
+     * Whether this entry of the list of drivers is the one that is used. The app can come with a
+     * driver whose package was also installed: the two have the same metadata.
+     */
+    fun isCurrentDriver(driver: Pair<Uri, GpuDriverMetadata>): Boolean =
+        isBuiltInDriverUsed == (driver.first == BUILT_IN_DRIVER) &&
+            driver.second == currentDriverData
 
     fun initializeDirectories() {
         // Ensure the file redirection directory exists.

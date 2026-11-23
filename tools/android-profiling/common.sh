@@ -2,7 +2,7 @@
 # Shared settings for the Android profiling scripts. Source this file; don't run it.
 #
 # Environment overrides:
-#   AZAHAR_PACKAGE   package to profile        (default: org.azahar_emu.azahar.profile)
+#   AZAHAR_PACKAGE   package to profile        (default: io.github.rfandango.azahar)
 #   AZAHAR_VARIANT   Gradle variant            (default: vanillaProfile)
 #   ANDROID_HOME     Android SDK               (default: sdk.dir from src/android/local.properties)
 #   ANDROID_NDK_HOME NDK, used for simpleperf  (default: the ndkVersion from build.gradle.kts)
@@ -15,7 +15,7 @@ TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$TOOLS_DIR/../.." && pwd)"
 ANDROID_DIR="$REPO_ROOT/src/android"
 
-PACKAGE="${AZAHAR_PACKAGE:-org.azahar_emu.azahar.profile}"
+PACKAGE="${AZAHAR_PACKAGE:-io.github.rfandango.azahar}"
 VARIANT="${AZAHAR_VARIANT:-vanillaProfile}"
 NATIVE_LIB="libcitra-android.so"
 EMU_THREAD="NativeEmulation"

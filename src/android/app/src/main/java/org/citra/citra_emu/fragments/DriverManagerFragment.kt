@@ -173,7 +173,9 @@ class DriverManagerFragment : Fragment() {
 
                 val driverData = GpuDriverHelper.getMetadataFromZip(driverFile.inputStream())
                 val driverInList =
-                    driverViewModel.driverList.value.firstOrNull { it.second == driverData }
+                    driverViewModel.driverList.value.firstOrNull {
+                        it.second == driverData && it.first != GpuDriverHelper.BUILT_IN_DRIVER
+                    }
                 if (driverInList != null) {
                     driverFile.delete()
                     return@newInstance getString(R.string.driver_already_installed)

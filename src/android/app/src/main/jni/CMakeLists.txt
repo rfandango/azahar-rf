@@ -17,6 +17,8 @@ add_library(citra-android SHARED
     config.cpp
     config.h
     default_ini.h
+    driver_probe.cpp
+    driver_probe.h
     emu_window/emu_window.cpp
     emu_window/emu_window.h
     game_info.cpp

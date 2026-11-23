@@ -25,6 +25,9 @@ val abiFilter = listOf("arm64-v8a", "x86_64")
 
 val downloadedJniLibsPath = "${layout.buildDirectory.get().asFile.path}/downloadedJniLibs"
 
+// Filled by gpu_driver.gradle.kts
+val gpuDriverPath = "${layout.buildDirectory.get().asFile.path}/generated/gpuDriver"
+
 android {
     namespace = "org.citra.citra_emu"
 
@@ -47,6 +50,8 @@ android {
     packaging {
         // This is necessary for libadrenotools custom driver loading
         jniLibs.useLegacyPackaging = true
+        // A GPU driver that is put in stays as it was built: profilers name its functions
+        jniLibs.keepDebugSymbols += "**/libvulkan*.so"
     }
 
     buildFeatures {
@@ -161,11 +166,11 @@ android {
         // Release-equivalent build for performance profiling (simpleperf, Perfetto, AGI).
         // Same optimization flags and R8 setup as release, but profileable from the shell and
         // built with frame pointers and trace markers (-DENABLE_PROFILING=ON).
-        // Attaches 'profile' suffix to version and package name, allowing installation alongside
-        // the release and debug builds. See tools/android-profiling/README.md.
+        // Attaches 'profile' suffix to the version. The package name is the release build's: the
+        // two are the same app and install over each other, with its data kept, when both are
+        // signed with the same key. See tools/android-profiling/README.md.
         register("profile") {
             initWith(getByName("release"))
-            applicationIdSuffix = ".profile"
             versionNameSuffix = "-profile"
             signingConfig = signingConfigs.getByName("debug")
             isDebuggable = false
@@ -179,8 +184,11 @@ android {
                     // pointers and trace markers: what the release build runs, for playing
                     // and for telling what the instrumentation costs.
                     arguments(
-                        if (project.hasProperty("leanProfile")) "-DENABLE_PROFILING=OFF"
-                        else "-DENABLE_PROFILING=ON"
+                        if (project.hasProperty("leanProfile")) {
+                            "-DENABLE_PROFILING=OFF"
+                        } else {
+                            "-DENABLE_PROFILING=ON"
+                        }
                     )
                 }
             }
@@ -204,6 +212,9 @@ android {
             isDefault = true
             dimension = "version"
             versionNameSuffix = "-vanilla"
+            // This is a personal fork: a package name of its own, so that it installs alongside
+            // Azahar (org.azahar_emu.azahar). Its name is in src/vanilla/res.
+            applicationId = "io.github.rfandango.azahar"
         }
         register("googlePlay") {
             dimension = "version"
@@ -223,6 +234,9 @@ android {
         named("main") {
             // Set up path for downloaded native libraries
             jniLibs.srcDir(downloadedJniLibsPath)
+            // And for the GPU driver that is put in, if there is one
+            jniLibs.srcDir("$gpuDriverPath/jniLibs")
+            assets.srcDir("$gpuDriverPath/assets")
         }
     }
 }
@@ -273,6 +287,8 @@ val unzipVulkanValidationLayers = tasks.register<Copy>("unzipVulkanValidationLay
 tasks.named("preBuild") {
     dependsOn(unzipVulkanValidationLayers)
 }
+
+apply(from = "gpu_driver.gradle.kts")
 
 ktlint {
     version = "1.8.0"

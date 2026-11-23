@@ -56,6 +56,7 @@
 #include "jni/camera/ndk_camera.h"
 #include "jni/camera/still_image_camera.h"
 #include "jni/config.h"
+#include "jni/driver_probe.h"
 #include "network/announce_multiplayer_session.h"
 
 #ifdef ENABLE_OPENGL
@@ -453,9 +454,13 @@ static Core::System::ResultStatus RunCitra(const std::string& filepath) {
     return Core::System::ResultStatus::Success;
 }
 
-void InitializeGpuDriver(const std::string& hook_lib_dir, const std::string& custom_driver_dir,
+/// Opens the Vulkan library, with the given driver in place of the system's if there is one.
+/// With probe_custom_driver that driver is made to prove that it works before it is taken.
+/// Returns whether the given driver was taken.
+bool InitializeGpuDriver(const std::string& hook_lib_dir, const std::string& custom_driver_dir,
                          const std::string& custom_driver_name,
-                         const std::string& file_redirect_dir) {
+                         const std::string& file_redirect_dir, bool probe_custom_driver) {
+    bool custom_driver_taken{};
 #if defined(ENABLE_VULKAN) && CITRA_ARCH(arm64)
     void* handle{};
     const char* file_redirect_dir_{};
@@ -483,6 +488,21 @@ void InitializeGpuDriver(const std::string& hook_lib_dir, const std::string& cus
         handle = adrenotools_open_libvulkan(
             RTLD_NOW, featureFlags | ADRENOTOOLS_DRIVER_CUSTOM, nullptr, hook_lib_dir.c_str(),
             custom_driver_dir.c_str(), custom_driver_name.c_str(), file_redirect_dir_, nullptr);
+        if (handle && probe_custom_driver) {
+            const auto start = std::chrono::steady_clock::now();
+            std::string description;
+            const bool works = ProbeTurnipDriver(handle, description);
+            LOG_INFO(
+                Frontend, "GPU driver {} {}: {} ({:.1f} ms)", custom_driver_name,
+                works ? "works" : "is not used", description,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                    .count());
+            if (!works) {
+                dlclose(handle);
+                handle = nullptr;
+            }
+        }
+        custom_driver_taken = handle != nullptr;
     }
 
     // Try to load the system driver.
@@ -493,6 +513,7 @@ void InitializeGpuDriver(const std::string& hook_lib_dir, const std::string& cus
 
     vulkan_library = std::make_shared<Common::DynamicLibrary>(handle);
 #endif
+    return custom_driver_taken;
 }
 
 extern "C" {
@@ -602,11 +623,12 @@ void Java_org_citra_citra_1emu_NativeLibrary_surfaceDestroyed([[maybe_unused]] J
     }
 }
 
-void JNICALL Java_org_citra_citra_1emu_NativeLibrary_initializeGpuDriver(
+jboolean JNICALL Java_org_citra_citra_1emu_NativeLibrary_initializeGpuDriver(
     JNIEnv* env, jobject obj, jstring hook_lib_dir, jstring custom_driver_dir,
-    jstring custom_driver_name, jstring file_redirect_dir) {
-    InitializeGpuDriver(GetJString(env, hook_lib_dir), GetJString(env, custom_driver_dir),
-                        GetJString(env, custom_driver_name), GetJString(env, file_redirect_dir));
+    jstring custom_driver_name, jstring file_redirect_dir, jboolean probe_custom_driver) {
+    return InitializeGpuDriver(GetJString(env, hook_lib_dir), GetJString(env, custom_driver_dir),
+                               GetJString(env, custom_driver_name),
+                               GetJString(env, file_redirect_dir), probe_custom_driver);
 }
 
 void Java_org_citra_citra_1emu_NativeLibrary_notifyOrientationChange([[maybe_unused]] JNIEnv* env,

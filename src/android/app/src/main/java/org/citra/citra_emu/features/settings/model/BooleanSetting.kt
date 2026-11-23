@@ -162,7 +162,9 @@ enum class BooleanSetting(
         CitraSettings.SECTION_RENDERER,
         false
     ),
-    CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), CitraSettings.SECTION_MISC, true);
+
+    // Off: the releases it looks for are those of Azahar, which installs as another app
+    CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), CitraSettings.SECTION_MISC, false);
 
     override fun valueFromString(string: String): Boolean? = when (string.trim().lowercase()) {
         "1", "true" -> true

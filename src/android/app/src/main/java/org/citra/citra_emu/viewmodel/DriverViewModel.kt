@@ -37,7 +37,7 @@ class DriverViewModel : ViewModel() {
 
     private val _selectedDriverMetadata =
         MutableStateFlow(
-            GpuDriverHelper.customDriverData.name
+            GpuDriverHelper.currentDriverData.name
                 ?: CitraApplication.appContext.getString(R.string.system_gpu_driver)
         )
     val selectedDriverMetadata: StateFlow<String> get() = _selectedDriverMetadata
@@ -55,9 +55,8 @@ class DriverViewModel : ViewModel() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
                 val drivers = GpuDriverHelper.getDrivers()
-                val currentDriverMetadata = GpuDriverHelper.customDriverData
                 for (i in drivers.indices) {
-                    if (drivers[i].second == currentDriverMetadata) {
+                    if (GpuDriverHelper.isCurrentDriver(drivers[i])) {
                         setSelectedDriverIndex(i)
                         break
                     }
@@ -111,20 +110,26 @@ class DriverViewModel : ViewModel() {
             }
         }
 
-        if (GpuDriverHelper.customDriverData == driverList.value[selectedDriver].second) {
+        val driver = driverList.value.getOrNull(selectedDriver) ?: return
+        if (GpuDriverHelper.isCurrentDriver(driver)) {
             return
         }
 
         _isDriverReady.value = false
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                if (selectedDriver == 0) {
-                    GpuDriverHelper.installDefaultDriver()
+                if (driver.first == GpuDriverHelper.SYSTEM_DRIVER) {
+                    GpuDriverHelper.installSystemDriver()
+                    setDriverReady()
+                    return@withContext
+                }
+                if (driver.first == GpuDriverHelper.BUILT_IN_DRIVER) {
+                    GpuDriverHelper.installBuiltInDriver()
                     setDriverReady()
                     return@withContext
                 }
 
-                val driverToInstall = driverList.value[selectedDriver].first.asDocumentFile()
+                val driverToInstall = driver.first.asDocumentFile()
                 if (driverToInstall == null) {
                     GpuDriverHelper.installDefaultDriver()
                     return@withContext
@@ -144,7 +149,12 @@ class DriverViewModel : ViewModel() {
 
     private fun setDriverReady() {
         _isDriverReady.value = true
-        _selectedDriverMetadata.value = GpuDriverHelper.customDriverData.name
+        _selectedDriverMetadata.value = GpuDriverHelper.currentDriverData.name
             ?: CitraApplication.appContext.getString(R.string.system_gpu_driver)
+        // The driver that was selected may not have worked here
+        val index = driverList.value.indexOfFirst { GpuDriverHelper.isCurrentDriver(it) }
+        if (index != -1 && index != selectedDriver) {
+            setSelectedDriverIndex(index)
+        }
     }
 }

@@ -361,6 +361,10 @@ freely, subject to the following restrictions:\n\n
    misrepresented as being the original software.\n
 3. This notice may not be removed or altered from any source distribution.
     </string>
+    <string name="license_mesa" translatable="false">Mesa</string>
+    <string name="license_mesa_description" translatable="false">Turnip, the Vulkan driver for Adreno GPUs the app comes with</string>
+    <string name="license_mesa_link" translatable="false">https://gitlab.freedesktop.org/mesa/mesa</string>
+    <string name="license_mesa_copyright" translatable="false">Copyright © 2016 Red Hat, © 2016 Bas Nieuwenhuizen, © 2015 Intel Corporation and the other Mesa authors</string>
     <string name="license_vma" translatable="false">Vulkan Memory Allocator</string>
     <string name="license_vma_description" translatable="false">Easy to integrate Vulkan memory allocation library</string>
     <string name="license_vma_link" translatable="false">https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator</string>

@@ -1,7 +1,7 @@
 # Profiling Azahar on Android
 
 Tools for finding out why a game runs slowly on a particular Android device: a profiling build
-that installs next to the release build, a system trace (Perfetto) with Azahar's own markers,
+that installs over the release build (one app, its data kept), a system trace (Perfetto) with Azahar's own markers,
 CPU sampling (simpleperf), and GPU counters.
 
 All scripts are bash and run from Linux, macOS or WSL. They need `adb`, Python 3 and the
@@ -14,8 +14,8 @@ not required.
 
 | | release | profile | relWithDebInfo / debug |
 |---|---|---|---|
-| Package | `org.azahar_emu.azahar` | `org.azahar_emu.azahar.profile` | `org.azahar_emu.azahar.debug` |
-| Launcher name | Azahar | Azahar Profile | Azahar |
+| Package | `io.github.rfandango.azahar` | `io.github.rfandango.azahar` | `io.github.rfandango.azahar.debug` |
+| Launcher name | Azahar RF | Azahar RF | Azahar RF |
 | Native code | `RelWithDebInfo` (-O2, LTO) | same, plus frame pointers | same (debug: -O0) |
 | Java/Kotlin | R8 | R8 | not optimized |
 | Debuggable | no | no, but `profileable` from the shell | yes |
@@ -59,7 +59,7 @@ this.
 
 ## Reading a system trace
 
-The threads that matter, all in the `org.azahar_emu.azahar.profile` process:
+The threads that matter, all in the `io.github.rfandango.azahar` process:
 
 | Thread | Does |
 |---|---|
@@ -192,7 +192,7 @@ Counters say how much work a frame is; a frame dump says what the work is. Chang
 two VBlanks as text to the app's external files directory:
 
     adb shell setprop debug.azahar.dump_frame $(date +%s)
-    adb pull /sdcard/Android/data/org.azahar_emu.azahar.profile/files/frame-dump-<value>.txt
+    adb pull /sdcard/Android/data/io.github.rfandango.azahar/files/frame-dump-<value>.txt
 
 The dump lists, in order, every PICA command list, draw (render target, viewport, depth,
 stencil, blend and lighting state, vertex shader, texture formats), memory fill, display
@@ -331,7 +331,7 @@ To look at the sound itself, any new value of `debug.azahar.record_audio` record
 twelve seconds of what is handed to the device:
 
     adb shell setprop debug.azahar.record_audio $(date +%s)
-    adb pull /sdcard/Android/data/org.azahar_emu.azahar.profile/files/audio-<value>.raw
+    adb pull /sdcard/Android/data/io.github.rfandango.azahar/files/audio-<value>.raw
 
 The file is raw 16 bit stereo at 32728 Hz. A stretch of identical samples in the middle of
 sound is a gap that was filled by repeating the last sample, which is heard as a crack; a

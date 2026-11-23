@@ -22,6 +22,7 @@ import org.citra.citra_emu.R
 import org.citra.citra_emu.adapters.LicenseAdapter
 import org.citra.citra_emu.databinding.FragmentLicensesBinding
 import org.citra.citra_emu.model.License
+import org.citra.citra_emu.utils.GpuDriverHelper
 import org.citra.citra_emu.viewmodel.HomeViewModel
 
 class LicensesFragment : Fragment() {
@@ -53,7 +54,7 @@ class LicensesFragment : Fragment() {
             binding.root.findNavController().popBackStack()
         }
 
-        val licenses = listOf(
+        val licenses = listOfNotNull(
             License(
                 R.string.license_adreno_tools,
                 R.string.license_adreno_tools_description,
@@ -136,6 +137,15 @@ class LicensesFragment : Fragment() {
                 linkId = R.string.license_glslang_link,
                 licenseLinkId = R.string.license_glslang_link_license
             ),
+            GpuDriverHelper.packagedDriverData?.let {
+                License(
+                    R.string.license_mesa,
+                    R.string.license_mesa_description,
+                    R.string.license_mesa_link,
+                    R.string.license_mesa_copyright,
+                    R.string.license_mit
+                )
+            },
             License(
                 R.string.license_openal,
                 R.string.license_openal_description,

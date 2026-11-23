@@ -321,7 +321,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("trace")
-    parser.add_argument("--package", default="org.azahar_emu.azahar.profile")
+    parser.add_argument("--package", default="io.github.rfandango.azahar")
     parser.add_argument("--shell", help="path to a local trace_processor_shell binary")
     args = parser.parse_args()
 

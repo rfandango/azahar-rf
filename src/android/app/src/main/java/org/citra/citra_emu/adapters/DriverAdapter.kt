@@ -44,7 +44,7 @@ class DriverAdapter(private val driverViewModel: DriverViewModel) :
         if (driverViewModel.selectedDriver > position) {
             driverViewModel.setSelectedDriverIndex(driverViewModel.selectedDriver - 1)
         }
-        if (GpuDriverHelper.customDriverData == driverData.second) {
+        if (GpuDriverHelper.isCurrentDriver(driverData)) {
             driverViewModel.setSelectedDriverIndex(0)
         }
         driverViewModel.driversToDelete.add(driverData.first)
@@ -95,7 +95,12 @@ class DriverAdapter(private val driverViewModel: DriverViewModel) :
                     description.text = driver.description
                     version.visibility = View.VISIBLE
                     description.visibility = View.VISIBLE
-                    buttonDelete.visibility = View.VISIBLE
+                    buttonDelete.visibility =
+                        if (driverData.first == GpuDriverHelper.BUILT_IN_DRIVER) {
+                            View.GONE
+                        } else {
+                            View.VISIBLE
+                        }
                 }
             }
         }

@@ -241,12 +241,18 @@ object NativeLibrary {
      */
     external fun swapScreens(swapScreens: Boolean, rotation: Int)
 
+    /**
+     * Opens Vulkan with the given driver in place of the system's, if there is one. With
+     * [probeCustomDriver] that driver has to show that it works on this device first.
+     * @return Whether the given driver was taken; the system's is used otherwise.
+     */
     external fun initializeGpuDriver(
         hookLibDir: String?,
         customDriverDir: String?,
         customDriverName: String?,
-        fileRedirectDir: String?
-    )
+        fileRedirectDir: String?,
+        probeCustomDriver: Boolean
+    ): Boolean
 
     external fun areKeysAvailable(): Boolean
 
