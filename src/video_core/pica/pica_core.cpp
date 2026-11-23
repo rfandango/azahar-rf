@@ -567,12 +567,85 @@ u64 PicaCore::TwinState(bool clears) {
     if (clears) {
         return state;
     }
-    state = Common::HashCombine(state, vs_setup.GetProgramCodeHash());
-    state = Common::HashCombine(state, vs_setup.GetSwizzleDataHash());
+    state = Common::HashCombine(state, RunnableHash(vs_setup, regs.internal.vs.main_offset));
     if (regs.internal.pipeline.use_gs != PipelineRegs::UseGS::No) {
-        state = Common::HashCombine(state, gs_setup.GetProgramCodeHash());
+        state = Common::HashCombine(state, RunnableHash(gs_setup, regs.internal.gs.main_offset));
     }
     return state;
+}
+
+u64 PicaCore::RunnableHash(ShaderSetup& setup, u32 main) {
+    const u64 key =
+        Common::HashCombine(setup.GetProgramCodeHash(), setup.GetSwizzleDataHash(), u64{main});
+    auto& [known, hash] = runnable_hashes[(key * 0x9E3779B97F4A7C15ull) >> 56];
+    if (known == key) {
+        return hash;
+    }
+    const auto& code = setup.GetProgramCode();
+    const auto& swizzles = setup.GetSwizzleData();
+    const u32 size = static_cast<u32>(code.size());
+    // Everything that can be reached, whichever way the branches go
+    std::vector<bool> seen(size);
+    std::vector<std::pair<u32, u32>> stretches{{main, size}};
+    while (!stretches.empty()) {
+        auto [at, end] = stretches.back();
+        stretches.pop_back();
+        for (; at < end && at < size; at++) {
+            const u32 word = code[at];
+            const u32 opcode = word >> 26;
+            const bool was_seen = seen[at];
+            seen[at] = true;
+            if (opcode == 0x22) {
+                // END
+                break;
+            }
+            if (was_seen) {
+                continue;
+            }
+            const u32 dest = (word >> 10) & 0xFFF;
+            const u32 count = word & 0xFF;
+            switch (opcode) {
+            case 0x24: // CALL
+            case 0x25: // CALLC
+            case 0x26: // CALLU
+                stretches.emplace_back(dest, dest + count);
+                break;
+            case 0x27: // IFU
+            case 0x28: // IFC
+                // The part for the other case, and what follows both, which the part gone
+                // through here may not come to
+                stretches.emplace_back(dest, dest + count);
+                stretches.emplace_back(dest + count, end);
+                break;
+            case 0x29: // LOOP
+                stretches.emplace_back(dest + 1, end);
+                break;
+            case 0x2C: // JMPC
+            case 0x2D: // JMPU
+                stretches.emplace_back(dest, size);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    u64 result = 0;
+    for (u32 at = 0; at < size; at++) {
+        if (!seen[at]) {
+            continue;
+        }
+        const u32 word = code[at];
+        const u32 opcode = word >> 26;
+        result = Common::HashCombine(result, (u64{at} << 32) | word);
+        if (opcode < 0x20 || opcode > 0x2D) {
+            // Not one that only controls the flow: it has operands
+            const u32 pattern = opcode >= 0x30 ? word & 0x1F : word & 0x7F;
+            result = Common::HashCombine(result, u64{swizzles[pattern]});
+        }
+    }
+    known = key;
+    hash = result;
+    return result;
 }
 
 const PicaCore::UniformSet& PicaCore::FloatUniformsRead() {
@@ -588,7 +661,7 @@ const PicaCore::UniformSet& PicaCore::FloatUniformsRead() {
         bools |= (vs_setup.uniforms.b[i] ? 1u : 0u) << i;
     }
     const u64 key =
-        Common::HashCombine(vs_setup.GetProgramCodeHash(), u64{main} | (u64{bools} << 32));
+        Common::HashCombine(RunnableHash(vs_setup, main), u64{main} | (u64{bools} << 32));
     for (const auto& [known, set] : uniforms_read) {
         if (known == key) {
             return set;
@@ -790,9 +863,8 @@ const PicaCore::UniformsThatMatter* PicaCore::FloatUniformsThatMatter() {
     // The program, where it begins, and what else decides its way besides float uniforms
     // (and what decides which of its outputs the fragments are made of, see the end)
     const u64 key = Common::HashCombine(
-        vs_setup.GetProgramCodeHash(), vs_setup.GetSwizzleDataHash(),
-        u64{main} | (u64{bools} << 32), Common::ComputeHash64(&uniforms.i, sizeof(uniforms.i)),
-        u64{regs.internal.vs.output_mask},
+        RunnableHash(vs_setup, main), u64{main} | (u64{bools} << 32),
+        Common::ComputeHash64(&uniforms.i, sizeof(uniforms.i)), u64{regs.internal.vs.output_mask},
         Common::ComputeHash64(&regs.internal.reg_array[0x4F], 8 * sizeof(u32)),
         u64{regs.internal.reg_array[0x80]} | (u64{regs.internal.lighting.disable} << 32));
     const auto values_of = [&](const UniformSet& set) {

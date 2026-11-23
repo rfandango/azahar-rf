@@ -277,6 +277,14 @@ private:
     /// What makes a draw the same draw as another: a hash over the registers it goes by
     /// and its vertex shader; for a clear done by drawing only over what the fragments go by
     u64 TwinState(bool clears);
+    /// A hash over what a shader can run from its entry point: the instructions that can be
+    /// reached, where they are, and their operand patterns. Not over the whole of the program
+    /// memory, as the hash of a program is: what a game uploads is written over what was
+    /// there, and behind a short program lie the remains of longer ones. Resident Evil:
+    /// Revelations draws its scene twice with the same programs, and before the second time
+    /// the remains behind them have changed. Worked out once for each program and entry.
+    u64 RunnableHash(ShaderSetup& setup, u32 main);
+    std::array<std::pair<u64, u64>, 256> runnable_hashes{};
     /// Calls back with each stretch of registers [from, to) that a draw goes by as the
     /// registers are now
     template <typename Func>
