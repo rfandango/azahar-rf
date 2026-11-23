@@ -267,6 +267,108 @@ enum Experiment3 : std::uint32_t {
     /// file is on: every write of the file is held up as a storage that lets 12 KiB a second
     /// through would hold it (Common::Log, the file backend's writer).
     SlowLogStorage = 2048,
+    /// The lists a command list jumps to are read by the decoder where they are in the
+    /// emulated memory, as before, and not from the bytes taken along when the list was handed
+    /// over (Pica::PicaCore::TakeCalledLists): a game that has been told the list is done may
+    /// have rewritten them by then.
+    LiveCalledLists = 4096,
+    /// Two draws are compared by all the float uniforms their vertex shader can read, as
+    /// before, and not only by those that can reach what it puts out or what it branches on
+    /// (Pica::PicaCore::FloatUniformsThatMatter).
+    AllUniformsRead = 8192,
+    /// The recompiled code keeps the guest's r0 to r14 in the state in memory, as before: every
+    /// block loads the ones it reads and stores the ones it writes. Without the switch they stay
+    /// in registers of the host from block to block (Dynarmic::A32::UserConfig::
+    /// pin_guest_registers; arm64 hosts).
+    GuestRegistersInMemory = 16384,
+    /// With the guest's registers in the host's: a value computed for a guest register is made
+    /// in a register of its own and then moved, as in the first form of it, and not made in
+    /// the guest register's host register (write_into_guest_registers).
+    GuestRegisterMoves = 32768,
+    /// A conditional branch of the guest is a block of recompiled code of its own, as before,
+    /// and does not end the block of the instructions in front of it
+    /// (Dynarmic::A32::UserConfig::fold_conditional_branches).
+    LoneConditionalBranches = 65536,
+    /// The recompiled code keeps the guest's N, Z, C and V in the state in memory, as before, and
+    /// not in the host's own flags from block to block
+    /// (Dynarmic::A32::UserConfig::guest_flags_in_host_flags).
+    GuestFlagsInMemory = 131072,
+    /// The recompiled code clears the host's floating point status before the floating point
+    /// instructions of a block and merges it into the state in memory after them, as before,
+    /// and does not keep the guest's cumulative flags in the host's register from block to
+    /// block (Dynarmic::A32::UserConfig::fp_status_in_host).
+    FpStatusInMemory = 262144,
+    /// A value that only passes between a floating point register of the guest and memory or
+    /// a core register goes through a floating point register of the host, as before
+    /// (Dynarmic::A32::UserConfig::fp_registers_through_general).
+    FpRegistersThroughFp = 524288,
+    /// Calls of the guest note where they will return to in a small list and returns check it,
+    /// as before, instead of a return looking its block up in the dispatcher's table where it
+    /// stands (Dynarmic::A32::UserConfig::look_up_blocks_in_place).
+    ReturnPredictionList = 1048576,
+    /// The recompiled code keeps the guest's floating point registers in the state in memory,
+    /// as before, and not S0 to S15 in registers of the host from block to block
+    /// (Dynarmic::A32::UserConfig::pin_guest_fp_registers).
+    GuestFpRegistersInMemory = 2097152,
+    /// A conditional instruction of the guest ends the block of recompiled code before it, as
+    /// before, and is not kept in that block with its code skipped where the condition does
+    /// not hold (Dynarmic::A32::UserConfig::conditional_instructions_in_blocks).
+    ConditionalInstructionsSplitBlocks = 4194304,
+    /// For testing: the decoder thread waits three milliseconds before it carries out a fill,
+    /// a transfer or a copy, so that the game, told it is done, is well ahead of it. Nothing
+    /// the game does in that time may reach the command, and nothing the command does may
+    /// come after what the game did later.
+    SlowTransfers = 8388608,
+    /// As before: what a fill, a transfer or a copy reads and writes is held for the decoder
+    /// only from the first time the decoder has been at those pages, not from the hand-over of
+    /// the command that names them; a copy done in software reads its source where it is, not
+    /// the copy of a page that came with the command; and a copy between two places of the
+    /// game's memory (DMA) does not wait for the commands handed over before it.
+    UnheldCommandRanges = 16777216,
+    /// A conditional branch ahead does not end its block: the block is left only where the
+    /// branch is taken (Dynarmic::A32::UserConfig::side_exits). Off unless asked for here:
+    /// it makes blocks longer and the host instructions fewer (Xenoblade Chronicles: 2.84 to
+    /// 2.79 for one of the guest's, counted), and the time in recompiled code longer in two
+    /// games of three (Kid Icarus +8%, Luigi's Mansion 2 +4%, Xenoblade -3%; 2026-11-23, the
+    /// same scenes on one build). What follows the branch is then there twice, as the rest
+    /// of this block and as a block of its own for whoever jumps there, and the host's branch
+    /// predictor and caches pay for the second copy.
+    SideExits = 33554432,
+    /// With SideExits: a jump whose target is known does not end its block either, the block
+    /// goes on at the target (Dynarmic::A32::UserConfig::follow_jumps). Off unless asked for
+    /// here, for the same reason and more of it: the code of a routine is then in the block
+    /// of each of its callers (2.79 to 2.68 host instructions counted, and the time in
+    /// recompiled code +17% in Kid Icarus, +5% in Luigi's Mansion 2, +0 to 9% in Xenoblade).
+    FollowJumps = 67108864,
+    /// For measuring: every instruction of the guest counts as one unit of emulated time, so
+    /// that the time the emulated cores have run (GuestTicks) is the number of instructions
+    /// they executed. Changes how fast the emulated processor is, and the recompiled code is
+    /// neither taken from nor put into the store on disk.
+    CountGuestInstructions = 134217728,
+    /// A read on a page a cached surface lies on is announced to the rasterizer (and waits
+    /// for the decoding thread) whatever it touches, as before, and not only where it
+    /// touches what a surface covers (Memory::MemorySystem::Impl::ReadTouchesSurface).
+    LegacyReadAnnouncements = 268435456,
+    /// A load of a word from an address fixed in the code (a constant the compiler put next
+    /// to it: 4% of the guest instructions that run), in the running process's own code
+    /// memory, is the word itself in recompiled code
+    /// (Dynarmic::A32::UserConfig::fold_read_only_loads). This switch has such loads made
+    /// as loads again, as they were before 2026-11-23. Time in recompiled code over the same
+    /// scenes with and without the constants: Xenoblade 3.39-3.48 s against 3.49-3.57 s,
+    /// Luigi's Mansion 2 2.23 s against 2.29-2.36 s, Kid Icarus 1.17 s against 1.17-1.21 s.
+    /// Read when a game's recompiler is made: set before the game starts.
+    LegacyLiteralLoads = 536870912,
+    /// Accesses of a block that go by the same value of a register at fixed distances (the
+    /// fields of a structure, the slots of the stack) share the host address of that value
+    /// and are one host instruction each (Dynarmic::A32::UserConfig::share_host_addresses):
+    /// 0.07 host instructions fewer for each guest instruction, by the count of what runs.
+    /// Built and checked for giving the same results (2026-11-23). Off unless asked for
+    /// here: it runs fewer instructions and takes the same time, on the fast cores of the
+    /// Retroid Pocket 5 (time in recompiled code with and without it: Kid Icarus 1.09 against
+    /// 1.10 s, Xenoblade 3.52 against 3.55 s, Luigi's Mansion 2 2.30 against 2.29 s) and on
+    /// its slow, in-order cores (Kid Icarus 2.78 against 2.77-2.79 s). Read when a game's
+    /// recompiler is made: set before the game starts.
+    ShareHostAddresses = 1073741824,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as
@@ -287,6 +389,9 @@ std::uint32_t Experiments2();
 std::uint32_t Experiments3();
 /// The hold-up currently asked for.
 InjectedStall Stall();
+/// Emulated time the recompiled code has run for, all cores, since the start
+void NoteGuestTicks(std::uint64_t ticks);
+std::uint64_t GuestTicks();
 #else
 constexpr std::uint32_t Experiments() {
     return 0;
@@ -299,6 +404,10 @@ constexpr std::uint32_t Experiments3() {
 }
 constexpr InjectedStall Stall() {
     return {};
+}
+constexpr void NoteGuestTicks(std::uint64_t) {}
+constexpr std::uint64_t GuestTicks() {
+    return 0;
 }
 #endif
 

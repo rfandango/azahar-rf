@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <algorithm>
 #include <string>
 #include <fmt/format.h>
 #include "common/logging/log.h"
@@ -74,10 +75,21 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
         if (to_target) {
             const bool known = at < first.size();
             const bool same_state = repeats && known && first[at].state == facts.StateHash(false);
-            u32 differing = 0;
+            UniformDifference uniforms;
+            // A draw that was given other uniforms may put out the same for all that. The
+            // first draw of a run does: its shader reads uniforms the game does not set for
+            // it, and they hold what the draw before left, which is another draw before each
+            // of the two runs (New Super Mario Bros. 2: the bottom screen's last draw before
+            // the first run, the scene's last before the second).
+            bool same_output = false;
             if (same_state) {
-                differing = CompareUniforms(first[at], facts, 0, 0.f).differing;
+                uniforms = CompareUniforms(first[at], facts, 0, 0.f);
+                if (uniforms.differing != 0 && first[at].has_output) {
+                    u64 output = 0;
+                    same_output = facts.OutputHash(output) && output == first[at].output;
+                }
             }
+            const u32 differing = same_output ? 0 : uniforms.differing;
             const bool same = same_state && differing == 0;
             if (!same) {
                 const u32 lines = (Common::TraceMarkers::Experiments3() &
@@ -92,7 +104,16 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
                              target, at, first.size(), static_cast<u32>(regs.pipeline.num_vertices),
                              !known ? std::string{"the first run had no more draws"}
                              : differing != 0
-                                 ? std::string{"float uniforms its shader reads differ"}
+                                 ? fmt::format("float uniform {} of those its shader reads "
+                                               "differs: {} {} {} {} in the first run, {} {} {} "
+                                               "{} now, a shift of {:.3g} of its matrix{}",
+                                               uniforms.first, uniforms.was[0], uniforms.was[1],
+                                               uniforms.was[2], uniforms.was[3], uniforms.is[0],
+                                               uniforms.is[1], uniforms.is[2], uniforms.is[3],
+                                               uniforms.largest_shift,
+                                               first[at].has_output
+                                                   ? ", and it does not put out the same either"
+                                                   : "")
                                  : std::string{"registers or the vertex shader differ"});
                 }
                 repeats = false;
@@ -108,8 +129,11 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
         EndPass("a draw to another target or viewport came within its second run");
     }
 
-    const auto record = [&] {
+    const auto record = [&](bool with_output) {
         first.emplace_back(facts, false);
+        if (with_output) {
+            first.back().has_output = facts.OutputHash(first.back().output);
+        }
         for (const auto& texture : regs.texturing.GetTextures()) {
             if (!texture.enabled) {
                 continue;
@@ -136,12 +160,13 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
         first.clear();
         sampled.clear();
         too_many_sampled = false;
-        record();
+        // (What the clear puts out is kept: see where the second run is compared)
+        record(true);
         return false;
     }
     if (phase == Phase::First) {
         if (to_target && first.size() < MAX_DRAWS) {
-            record();
+            record(false);
         } else {
             phase = Phase::Idle;
         }
@@ -175,10 +200,34 @@ Vote RepeatedEyeRule::OnTransfer(const TransferFacts& facts) {
     // The image is taken out of the target. The two runs that are the same image are those
     // of the two eyes: the first goes to a buffer the top screen shows to the left eye, the
     // second to one it shows to the right eye.
+    // (A buffer an eye is shown need not begin where the transfer writes: New Super Mario
+    // Bros. 2 has the screen read from sixteen rows into what its transfers fill)
     const PAddr dest = facts.dest;
-    const bool left_eyes = dest != 0 && std::ranges::find(left_shown, dest) != left_shown.end();
-    const bool right_eyes =
-        dest != 0 && !left_eyes && std::ranges::find(right_shown, dest) != right_shown.end();
+    const auto holds_one_of = [&](const std::array<PAddr, 8>& shown) {
+        return std::ranges::any_of(shown, [&](PAddr address) {
+            return address != 0 && address >= facts.dest && address < facts.dest_end;
+        });
+    };
+    const bool left_eyes = dest != 0 && holds_one_of(left_shown);
+    const bool right_eyes = dest != 0 && !left_eyes && holds_one_of(right_shown);
+    if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) != 0 &&
+        explained_eyes < 8 && !left_eyes && !right_eyes) {
+        explained_eyes++;
+        const auto list = [](const std::array<PAddr, 8>& shown) {
+            std::string text;
+            for (const PAddr address : shown) {
+                if (address != 0) {
+                    text += fmt::format(" {:08X}", address);
+                }
+            }
+            return text.empty() ? std::string{" none"} : text;
+        };
+        LOG_INFO(HW_GPU,
+                 "The image of a run of {} draws at {:08X} is taken to {:08X}-{:08X}, which is "
+                 "no buffer of either eye as the rule knows them: left{}; right{}",
+                 first.size(), target, facts.dest, facts.dest_end, list(left_shown),
+                 list(right_shown));
+    }
     switch (phase) {
     case Phase::First:
         if (left_eyes) {

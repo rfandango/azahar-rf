@@ -236,7 +236,7 @@ void GPU::DecoderLoop() {
             // Asked to stop, with nothing left
             return;
         }
-        const Impl::QueuedCommand next = std::move(impl->queued.front());
+        Impl::QueuedCommand next = std::move(impl->queued.front());
         impl->queued.pop_front();
         if (impl->queued.empty()) {
             impl->has_queued.store(false);
@@ -267,12 +267,22 @@ void GPU::DecoderLoop() {
         } else {
             if (!next.list_copy.empty()) {
                 impl->pica.UseCommandListCopy(next.list_copy.data());
+                impl->pica.UseCalledLists(next.has_called_lists ? &next.called_lists : nullptr,
+                                          next.called_bytes.data());
             }
             impl->memory.SetGpuReader(next.command.id != Service::GSP::CommandId::SubmitCmdList);
             if (!next.snapshot_pages.empty()) {
-                impl->memory.UseGpuSnapshot(next.snapshot_pages, next.snapshot_bytes.get());
+                impl->memory.UseGpuSnapshot(next.snapshot_pages, next.snapshot_bytes.data());
+            }
+            if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::SlowTransfers) != 0 &&
+                (next.command.id == Service::GSP::CommandId::DisplayTransfer ||
+                 next.command.id == Service::GSP::CommandId::TextureCopy ||
+                 next.command.id == Service::GSP::CommandId::MemoryFill)) [[unlikely]] {
+                std::this_thread::sleep_for(std::chrono::milliseconds{3});
             }
             Execute(next.command);
+            impl->pica.UseCommandListCopy(nullptr);
+            impl->pica.UseCalledLists(nullptr, nullptr);
             impl->memory.DropGpuSnapshot();
             if (impl->early_completion &&
                 next.command.id == Service::GSP::CommandId::SubmitCmdList) {
@@ -291,6 +301,17 @@ void GPU::DecoderLoop() {
             impl->decoder_commands.fetch_add(1, std::memory_order_relaxed);
         }
         impl->done_seq.store(next.seq);
+        if (next.list_copy.capacity() != 0 || next.called_lists.capacity() != 0 ||
+            next.called_bytes.capacity() != 0 || next.snapshot_pages.capacity() != 0 ||
+            next.snapshot_bytes.capacity() != 0) {
+            // Its buffers, for the commands to come (see Impl::SpareBuffers)
+            std::scoped_lock spare_lock{impl->spare_mutex};
+            Impl::GiveSpare(impl->spare.lists, next.list_copy, true);
+            Impl::GiveSpare(impl->spare.called_lists, next.called_lists, true);
+            Impl::GiveSpare(impl->spare.called_bytes, next.called_bytes, true);
+            Impl::GiveSpare(impl->spare.snapshot_pages, next.snapshot_pages, true);
+            Impl::GiveSpare(impl->spare.snapshot_bytes, next.snapshot_bytes, false);
+        }
         if (is_command && impl->early_completion) {
             if (!next.early && !impl->working_raised.empty()) {
                 impl->told_late.fetch_add(1, std::memory_order_relaxed);
@@ -367,7 +388,14 @@ Result GPU::Submit(const Service::GSP::Command& command) {
     if (!to_decoder) {
         // Where the decoder works behind the game's back, what is left touches nothing of the
         // emulated GPU itself: the memory system asks for the decoder page by page
-        if (!impl->early_completion || !uses_decoder) {
+        // A copy between two places of the game's memory is carried out here and now. What
+        // was handed over before it has to be done first: a fill that is still waiting would
+        // otherwise clear what this puts there (a game clears video memory, then copies its
+        // vertex data into it).
+        const bool ordered_copy =
+            command.id == CommandId::RequestDma &&
+            (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::UnheldCommandRanges) == 0;
+        if (!impl->early_completion || !uses_decoder || ordered_copy) {
             WaitIdle(WaitReason::Command);
         }
         return Execute(command);
@@ -385,10 +413,50 @@ Result GPU::Submit(const Service::GSP::Command& command) {
         // before the decoder has read it, and what it writes must not be looked at before it
         // is written: its own bytes are taken along, and the pages the decoder has read from
         // or written to before cannot be touched from here on without waiting for it.
-        impl->memory.ArmGpuReferences(
-            command.id == CommandId::SubmitCmdList,
-            command.id == CommandId::DisplayTransfer || command.id == CommandId::TextureCopy,
-            impl->queued_seq, impl->done_seq.load(), item.snapshot_pages, item.snapshot_bytes);
+        // What a transfer or copy reads is named by the command: held from here on. (It was
+        // held only once the decoder had read from those pages, which for data a game puts
+        // into video memory by a copy is one time too late: the game refilled its buffer the
+        // moment it was told the copy was done, and the copy carried what came after.)
+        // And so is what a fill, a transfer or a copy writes: closed to the game from here on,
+        // so that what the game puts there afterwards comes after it.
+        {
+            // In buffers that commands before it used (see Impl::SpareBuffers)
+            std::scoped_lock spare_lock{impl->spare_mutex};
+            Impl::TakeSpare(impl->spare.snapshot_pages, item.snapshot_pages);
+            Impl::TakeSpare(impl->spare.snapshot_bytes, item.snapshot_bytes);
+            if (command.id == CommandId::SubmitCmdList) {
+                Impl::TakeSpare(impl->spare.lists, item.list_copy);
+                Impl::TakeSpare(impl->spare.called_lists, item.called_lists);
+                Impl::TakeSpare(impl->spare.called_bytes, item.called_bytes);
+            }
+        }
+        PAddr source_addr = 0;
+        u32 source_size = 0;
+        std::array<std::pair<PAddr, u32>, 2> written{};
+        const bool is_transfer =
+            command.id == CommandId::DisplayTransfer || command.id == CommandId::TextureCopy;
+        if (command.id != CommandId::SubmitCmdList &&
+            (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::UnheldCommandRanges) == 0)
+            [[likely]] {
+            std::optional<std::pair<PAddr, u32>> source{std::in_place, PAddr{0}, u32{0}};
+            if (is_transfer) {
+                source = SourceOf(command);
+            }
+            const auto targets = TargetsOf(command);
+            if (source && targets) {
+                source_addr = source->first;
+                source_size = source->second;
+                written = *targets;
+            } else {
+                // Not known before the registers are as the lists before it leave them: the
+                // game goes on when it is done
+                may_tell_early = false;
+            }
+        }
+        impl->memory.ArmGpuReferences(command.id == CommandId::SubmitCmdList, is_transfer,
+                                      impl->queued_seq, impl->done_seq.load(), source_addr,
+                                      source_size, written, item.snapshot_pages,
+                                      item.snapshot_bytes);
         if (command.id == CommandId::SubmitCmdList) {
             const auto& list = command.submit_gpu_cmdlist;
             const auto address = VirtualToPhysicalAddress(list.address, list.size);
@@ -396,7 +464,46 @@ Result GPU::Submit(const Service::GSP::Command& command) {
             if (bytes && list.size != 0 &&
                 impl->memory.GetPhysicalPointer(*address + list.size - 1) ==
                     bytes + list.size - 1) {
-                item.list_copy.assign(bytes, bytes + list.size);
+                // With what follows it in memory, as far as its last command may read
+                const u32 list_size = list.size;
+                const u32 readable =
+                    std::max(list_size, std::min(impl->memory.PhysicalBytesFrom(*address),
+                                                 list_size + Pica::PicaCore::LIST_SLACK));
+                item.list_copy.assign(bytes, bytes + readable);
+                // (Nothing but zeroes where the memory ends before that)
+                item.list_copy.resize(list_size + Pica::PicaCore::LIST_SLACK);
+                if ((Common::TraceMarkers::Experiments3() &
+                     Common::TraceMarkers::LiveCalledLists) == 0) [[likely]] {
+                    // And the lists it jumps to. Where they are is in registers that the
+                    // lists before it may have written, which the decoder may not have got
+                    // to yet: followed here from list to list, and looked up whenever
+                    // nothing is left to decode.
+                    if (impl->done_seq.load() == impl->queued_seq) {
+                        impl->list_scan = impl->pica.ListScanStateNow();
+                    }
+                    item.has_called_lists = true;
+                    const auto take_start = std::chrono::steady_clock::now();
+                    item.called_lists.reserve(impl->called_lists_room);
+                    item.called_bytes.reserve(impl->called_bytes_room);
+                    if (!Pica::PicaCore::TakeCalledLists(impl->memory, item.list_copy.data(),
+                                                         list_size, readable, impl->list_scan,
+                                                         item.called_lists, item.called_bytes)) {
+                        // Too many to take along: the game goes on when they are decoded
+                        may_tell_early = false;
+                        impl->called_not_all++;
+                    }
+                    impl->called_take_ns +=
+                        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - take_start)
+                                             .count());
+                    impl->called_taken += item.called_lists.size();
+                    impl->called_taken_bytes += item.called_bytes.size();
+                    // (Shrinks slowly, so that one command with few does not undo it)
+                    impl->called_lists_room =
+                        std::max(item.called_lists.size(), impl->called_lists_room * 15 / 16);
+                    impl->called_bytes_room =
+                        std::max(item.called_bytes.size(), impl->called_bytes_room * 15 / 16);
+                }
             } else {
                 may_tell_early = false;
             }
@@ -510,6 +617,92 @@ PAddr GPU::PaceTargetOf(const Service::GSP::Command& command) {
     return target;
 }
 
+std::optional<std::pair<PAddr, u32>> GPU::SourceOf(const Service::GSP::Command& command) {
+    // As Execute fills the registers of the transfer engine and MemoryTransfer reads them
+    if (command.id == Service::GSP::CommandId::DisplayTransfer) {
+        const auto& params = command.display_transfer;
+        if ((params.flags & 8) != 0) {
+            return std::nullopt;
+        }
+        const PAddr start = VirtualToPhysicalAddress(params.in_buffer_address, 1).value_or(0) & ~7u;
+        // Rows as long as the source's are, as many as the taller of the two has
+        const u32 width = params.in_buffer_size & 0xFFFF;
+        const u32 rows = std::max(params.in_buffer_size >> 16, params.out_buffer_size >> 16);
+        const u32 size =
+            width * rows * BytesPerPixel(static_cast<Pica::PixelFormat>((params.flags >> 8) & 7));
+        return std::make_pair(start, start != 0 ? size : 0);
+    }
+    const auto& params = command.texture_copy;
+    if ((params.flags & 8) == 0) {
+        return std::nullopt;
+    }
+    const PAddr start =
+        VirtualToPhysicalAddress(params.in_buffer_address, params.size).value_or(0) & ~7u;
+    u32 extent = params.size;
+    const u32 row = (params.in_width_gap & 0xFFFF) * 16;
+    const u32 gap = (params.in_width_gap >> 16) * 16;
+    if (row != 0 && gap != 0 && params.size > row) {
+        extent = (params.size / row - 1) * (row + gap) + row;
+    }
+    return std::make_pair(start, start != 0 ? extent : 0);
+}
+
+std::optional<std::array<std::pair<PAddr, u32>, 2>> GPU::TargetsOf(
+    const Service::GSP::Command& command) {
+    using Service::GSP::CommandId;
+    std::array<std::pair<PAddr, u32>, 2> targets{};
+    if (command.id == CommandId::MemoryFill) {
+        const auto& params = command.memory_fill;
+        const auto place = [this](u32 start, u32 end) -> std::pair<PAddr, u32> {
+            if (start == 0 || start >= end) {
+                return {};
+            }
+            const PAddr address = VirtualToPhysicalAddress(start, end - start).value_or(0) & ~7u;
+            return {address, address != 0 ? end - start : 0};
+        };
+        targets[0] = place(params.start1, params.end1);
+        targets[1] = place(params.start2, params.end2);
+        return targets;
+    }
+    if (command.id == CommandId::DisplayTransfer) {
+        const auto& params = command.display_transfer;
+        if ((params.flags & 8) != 0) {
+            return std::nullopt;
+        }
+        const PAddr start =
+            VirtualToPhysicalAddress(params.out_buffer_address, 1).value_or(0) & ~7u;
+        const u32 pixel = BytesPerPixel(static_cast<Pica::PixelFormat>((params.flags >> 12) & 7));
+        const u32 out_width = params.out_buffer_size & 0xFFFF;
+        const u32 out_height = params.out_buffer_size >> 16;
+        const u32 in_width = params.in_buffer_size & 0xFFFF;
+        u32 size = out_width * out_height * pixel;
+        // Flipped and cropped at once, it is written further on (see the transfer itself)
+        if ((params.flags & 1) != 0 && (params.flags & 4) != 0 && in_width > out_width &&
+            out_height != 0) {
+            size += (in_width - out_width) * (out_height - 1) * pixel;
+        }
+        targets[0] = {start, start != 0 ? size : 0};
+        return targets;
+    }
+    if (command.id == CommandId::TextureCopy) {
+        const auto& params = command.texture_copy;
+        if ((params.flags & 8) == 0) {
+            return std::nullopt;
+        }
+        const PAddr start =
+            VirtualToPhysicalAddress(params.out_buffer_address, params.size).value_or(0) & ~7u;
+        u32 extent = params.size;
+        const u32 row = (params.out_width_gap & 0xFFFF) * 16;
+        const u32 gap = (params.out_width_gap >> 16) * 16;
+        if (row != 0 && gap != 0 && params.size > row) {
+            extent = (params.size / row - 1) * (row + gap) + row;
+        }
+        targets[0] = {start, start != 0 ? extent : 0};
+        return targets;
+    }
+    return targets;
+}
+
 void GPU::WaitForPresent() {
     const auto done = [this] { return impl->presents_done.load() >= impl->presents_queued; };
     if (done()) {
@@ -613,6 +806,36 @@ void GPU::ReportDecoderWaits() {
     const auto [volatile_pages, copied] = impl->memory.TakeSnapshotFigures();
     waits += fmt::format("; {} pages copied at hand-over, {:.0f} KiB a vblank", volatile_pages,
                          static_cast<double>(copied) / 1024.0 / REPORT_VBLANKS);
+    if (const auto ages = impl->memory.VolatileAgesNow();
+        volatile_pages != 0 || ages.forgotten != 0) {
+        waits +=
+            fmt::format(" (from {:08X} to {:08X} in {} runs; a copy of them was last read "
+                        "within 256 commands: {}, within 2048: {}, longer ago: {}, never: "
+                        "{}; {} forgotten for not being read; read as vertex data {} "
+                        "({} lately), index data {} ({}), texture {} ({}), called list {} "
+                        "({}), other {} ({}))",
+                        ages.first, ages.last, ages.runs, ages.read[0], ages.read[1], ages.read[2],
+                        ages.read[3], ages.forgotten, ages.kinds[1], ages.kinds_read[1],
+                        ages.kinds[2], ages.kinds_read[2], ages.kinds[3], ages.kinds_read[3],
+                        ages.kinds[4], ages.kinds_read[4], ages.kinds[0], ages.kinds_read[0]);
+    }
+    const auto called = impl->pica.TakeCalledListFigures();
+    const u64 called_taken = std::exchange(impl->called_taken, 0);
+    const u64 called_taken_bytes = std::exchange(impl->called_taken_bytes, 0);
+    const u64 called_not_all = std::exchange(impl->called_not_all, 0);
+    const u64 called_take_ns = std::exchange(impl->called_take_ns, 0);
+    waits += fmt::format("; following the lists' jumps at hand-over {:.3f} ms a vblank",
+                         static_cast<double>(called_take_ns) / 1e6 / REPORT_VBLANKS);
+    if (called_taken != 0 || called.past_the_copies != 0 || called.another_list != 0) {
+        waits += fmt::format(", {:.1f} lists jumped to taken along ({:.0f} KiB, {} times not "
+                             "all of them), {} of {} had been written to by the game before "
+                             "they were decoded, read from memory for want of a copy {} after "
+                             "the last copy and {} where another list was due",
+                             static_cast<double>(called_taken) / REPORT_VBLANKS,
+                             static_cast<double>(called_taken_bytes) / 1024.0 / REPORT_VBLANKS,
+                             called_not_all, called.rewritten, called.from_copy,
+                             called.past_the_copies, called.another_list);
+    }
     waits += work_rules->TakeLeftOutText(REPORT_VBLANKS);
     const auto [copies_given, copies_read] = impl->memory.TakeSnapshotReadFigures();
     if (copies_given != 0) {

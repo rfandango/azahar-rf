@@ -396,6 +396,17 @@ public:
         on_init_callback = init_callback;
     }
 
+    /// Has Load() leave the custom textures of the title unlooked for: the frontend does it
+    /// itself with FindCustomTextures() once Load() has returned. Looking for them lists the
+    /// whole texture pack, which takes seconds where the files are reached through a storage
+    /// service (7.6 s for 6763 files on Android), and a frontend may hold a lock around Load()
+    /// that its user interface waits for.
+    void LeaveCustomTexturesToFrontend() {
+        custom_textures_left_to_frontend = true;
+    }
+    /// Looks for the custom textures of the title, if they are in use
+    void FindCustomTextures();
+
     [[nodiscard]] bool HasMicPermission() {
         return !mic_permission_func || mic_permission_granted ||
                (mic_permission_granted = mic_permission_func());
@@ -541,6 +552,7 @@ private:
 
     /// Custom texture cache system
     std::unique_ptr<VideoCore::CustomTexManager> custom_tex_manager;
+    bool custom_textures_left_to_frontend{};
 
     /// Image interface
     std::shared_ptr<Frontend::ImageInterface> registered_image_interface;

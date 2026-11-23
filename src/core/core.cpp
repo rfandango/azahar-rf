@@ -565,8 +565,8 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     if (Settings::values.dump_textures) {
         custom_tex_manager->PrepareDumping(title_id);
     }
-    if (Settings::values.custom_textures) {
-        custom_tex_manager->FindCustomTextures();
+    if (!custom_textures_left_to_frontend) {
+        FindCustomTextures();
     }
 
     status = ResultStatus::Success;
@@ -578,6 +578,12 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     [[maybe_unused]] const PerfStats::Results result = GetAndResetPerfStats();
     perf_stats->BeginSystemFrame();
     return status;
+}
+
+void System::FindCustomTextures() {
+    if (Settings::values.custom_textures) {
+        custom_tex_manager->FindCustomTextures();
+    }
 }
 
 void System::PrepareReschedule() {

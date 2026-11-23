@@ -193,8 +193,15 @@ void FrameLiveness::Forget() {
     occurrences.clear();
     verdicts.clear();
     written.Clear();
+    written_coarse.fill(0);
     stale.Clear();
     shown_places.clear();
+    events++;
+    draw_memo = DrawMemo{};
+    for (KeptLook& kept : kept_looks) {
+        kept.valid = false;
+    }
+    previous_hash = 0;
     seen.fill(0);
     left_out.fill(0);
     leaving_out = false;
@@ -213,7 +220,7 @@ void FrameLiveness::AddRead(Step& step, const MemoryRange& range) const {
 
 void FrameLiveness::AddRead(Step& step, const MemoryRange& range, const Link& link) const {
     // Memory the GPU never wrote holds what the game put there, which is always as it should
-    if (range.Empty() || !written.Intersects(range)) {
+    if (range.Empty() || !WrittenIntersects(range)) {
         return;
     }
     ASSERT(step.reads.size() < step.reads.capacity());
@@ -417,11 +424,108 @@ bool FrameLiveness::WantsTextureRows(const Pica::RegsInternal& regs) const {
         const PAddr address = texture.config.GetPhysicalAddress();
         const u32 size =
             texture.config.width * texture.config.height * TextureBitsPerPixel(texture.format) / 8;
-        if (written.Intersects(MemoryRange{address, address + size})) {
+        if (WrittenIntersects(MemoryRange{address, address + size})) {
             return true;
         }
     }
     return false;
+}
+
+void FrameLiveness::NoteWritten(const MemoryRange& range) {
+    if (range.Empty()) {
+        return;
+    }
+    written.Add(range);
+    const u32 last = (range.end - 1) >> COARSE_SHIFT;
+    for (u32 piece = range.start >> COARSE_SHIFT; piece <= last; piece++) {
+        written_coarse[piece >> 6] |= u64{1} << (piece & 63);
+    }
+}
+
+bool FrameLiveness::WrittenNear(PAddr start, PAddr end) const {
+    if (start >= end) {
+        return false;
+    }
+    const u32 last = (end - 1) >> COARSE_SHIFT;
+    for (u32 piece = start >> COARSE_SHIFT; piece <= last; piece++) {
+        if ((written_coarse[piece >> 6] >> (piece & 63)) & 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FrameLiveness::SamplesWritten(const Pica::RegsInternal& regs) const {
+    // The same textures, places and sizes as ShouldAllowDraw enters as reads
+    using Pica::TexturingRegs;
+    const auto& texturing = regs.texturing;
+    const auto samples = [&](bool enabled, const TexturingRegs::TextureConfig& config,
+                             TexturingRegs::TextureFormat format, bool first_unit) {
+        if (!enabled) {
+            return false;
+        }
+        const auto type =
+            first_unit ? config.type.Value() : TexturingRegs::TextureConfig::Texture2D;
+        if (type == TexturingRegs::TextureConfig::Disabled) {
+            return false;
+        }
+        u32 size = config.width * config.height * TextureBitsPerPixel(format) / 8;
+        if (config.lod.max_level != 0) {
+            size += size / 3 + 1;
+        }
+        if (type == TexturingRegs::TextureConfig::TextureCube ||
+            type == TexturingRegs::TextureConfig::ShadowCube) {
+            for (u32 face = 0; face < 6; face++) {
+                const PAddr address =
+                    texturing.GetCubePhysicalAddress(static_cast<TexturingRegs::CubeFace>(face));
+                if (WrittenIntersects(MemoryRange{address, address + size})) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        const PAddr address = config.GetPhysicalAddress();
+        return WrittenIntersects(MemoryRange{address, address + size});
+    };
+    return samples(texturing.main_config.texture0_enable != 0, texturing.texture0,
+                   texturing.texture0_format, true) ||
+           samples(texturing.main_config.texture1_enable != 0, texturing.texture1,
+                   texturing.texture1_format, false) ||
+           samples(texturing.main_config.texture2_enable != 0, texturing.texture2,
+                   texturing.texture2_format, false);
+}
+
+FrameLiveness::DrawSignature FrameLiveness::SignatureOf(const Pica::RegsInternal& regs,
+                                                        bool replaces_target, bool may_leave_out,
+                                                        bool overwrites_colour,
+                                                        bool overwrites_depth, bool by_rows) {
+    // Everything ShouldAllowDraw reads that is not a texture. What is read there and missing
+    // here would make two different draws one: the comparison that is made now and then (see
+    // there) is what would show it.
+    const auto& framebuffer = regs.framebuffer.framebuffer;
+    const auto& merger = regs.framebuffer.output_merger;
+    const auto& rasterizer = regs.rasterizer;
+    DrawSignature signature;
+    signature.colour = framebuffer.GetColorBufferPhysicalAddress();
+    signature.depth = framebuffer.GetDepthBufferPhysicalAddress();
+    signature.width = framebuffer.GetWidth();
+    signature.height = framebuffer.GetHeight();
+    signature.formats = (static_cast<u32>(framebuffer.color_format.Value()) << 8) |
+                        static_cast<u32>(framebuffer.depth_format.Value());
+    signature.viewport_corner_y = rasterizer.viewport_corner.y;
+    signature.viewport_size_y = rasterizer.viewport_size_y;
+    signature.scissor = (static_cast<u32>(rasterizer.scissor_test.mode.Value()) << 20) |
+                        (rasterizer.scissor_test.y1 << 10) | rasterizer.scissor_test.y2;
+    signature.flags = (framebuffer.allow_color_write != 0 ? 1u : 0u) |
+                      (framebuffer.allow_depth_stencil_write != 0 ? 2u : 0u) |
+                      (regs.framebuffer.IsShadowRendering() ? 4u : 0u) |
+                      (merger.stencil_test.enable ? 8u : 0u) | (merger.red_enable ? 16u : 0u) |
+                      (merger.green_enable ? 32u : 0u) | (merger.blue_enable ? 64u : 0u) |
+                      (merger.alpha_enable ? 128u : 0u) | (merger.depth_write_enable ? 256u : 0u) |
+                      (merger.depth_test_enable ? 512u : 0u) | (replaces_target ? 1024u : 0u) |
+                      (may_leave_out ? 2048u : 0u) | (overwrites_colour ? 4096u : 0u) |
+                      (overwrites_depth ? 8192u : 0u) | (by_rows ? 16384u : 0u);
+    return signature;
 }
 
 Vote FrameLiveness::OnDraw(DrawFacts& facts) {
@@ -429,20 +533,27 @@ Vote FrameLiveness::OnDraw(DrawFacts& facts) {
         return Vote::Carry;
     }
     const Pica::RegsInternal& regs = facts.Regs();
+    const bool shared_depth = NoteDepthUse(regs);
     if (facts.IsImmediate()) {
         // Its vertices are with the rasterizer already: carried out in any case
         ShouldAllowDraw(regs, false, false);
         return Vote::Carry;
     }
     // What the registers alone tell is asked first: whether the triangles cover the viewport
-    // has their vertices shaded
-    const bool replaces_target = MayReplaceTarget(regs) && facts.CoversViewport();
+    // has their vertices shaded. Of a mesh that costs a few tenths of a millisecond, and has
+    // made a difference only where two colour buffers take turns with one depth buffer, the
+    // two eyes of a game, and a backdrop resets the depth before each: asked there only.
+    // (Kirby: Planet Robobot draws its flat layers as meshes of a few hundred vertices with
+    // the depth test off, twice a frame, for one eye.)
+    const bool may_ask = !facts.CoverTestIsCostly() || shared_depth;
+    const auto covers = [&] { return may_ask && facts.CoversViewport(); };
+    const bool replaces_target = MayReplaceTarget(regs) && covers();
     DrawTextureRows texture_rows;
     const bool rows_known = WantsTextureRows(regs) && facts.TextureRows(texture_rows);
     // A draw that covers its viewport writes every pixel of the rows it is confined to if
     // the viewport is as wide as the target
     const bool overwrites_colour =
-        facts.MayOverwriteColour() && facts.ViewportSpansTarget() && facts.CoversViewport();
+        facts.MayOverwriteColour() && facts.ViewportSpansTarget() && covers();
     // Depth and stencil are one buffer. A draw that renews the depth of every pixel but
     // leaves the stencil renews the buffer as far as anything goes that work left out could
     // have changed, as long as the game draws nothing with the stencil test on: only such
@@ -450,12 +561,39 @@ Vote FrameLiveness::OnDraw(DrawFacts& facts) {
     // backdrop before each eye, in a buffer whose stencil bits it never uses.)
     const bool renews_depth =
         facts.MayOverwriteDepth() || (facts.MayOverwriteDepthValues() && !StencilInUse());
-    const bool overwrites_depth =
-        renews_depth && facts.ViewportSpansTarget() && facts.CoversViewport();
+    const bool overwrites_depth = renews_depth && facts.ViewportSpansTarget() && covers();
     return ShouldAllowDraw(regs, replaces_target, true, rows_known ? &texture_rows : nullptr,
                            overwrites_colour, overwrites_depth)
                ? Vote::Carry
                : Vote::Unseen;
+}
+
+bool FrameLiveness::NoteDepthUse(const Pica::RegsInternal& regs) {
+    // How long after the last change of partner a depth buffer counts as shared
+    constexpr u32 SHARED_FOR = 8;
+    const auto& framebuffer = regs.framebuffer.framebuffer;
+    const PAddr depth = framebuffer.GetDepthBufferPhysicalAddress();
+    const PAddr colour = framebuffer.GetColorBufferPhysicalAddress();
+    if (depth == 0 || colour == 0) {
+        return false;
+    }
+    DepthUse* use = nullptr;
+    for (DepthUse& known : depth_uses) {
+        if (known.depth == depth) {
+            use = &known;
+        }
+    }
+    if (use == nullptr) {
+        use = &depth_uses[depth_use_next++ % depth_uses.size()];
+        *use = DepthUse{.depth = depth, .colour = colour};
+        return false;
+    }
+    if (use->colour != colour) {
+        use->colour = colour;
+        use->changed_frame = frame;
+        use->shared = true;
+    }
+    return use->shared && frame - use->changed_frame <= SHARED_FOR;
 }
 
 Vote FrameLiveness::OnFill(const FillFacts& facts) {
@@ -486,6 +624,41 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     const bool stencil = regs.framebuffer.HasStencil() && merger.stencil_test.enable;
     const bool by_rows =
         (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyWholeTargetWork) == 0;
+
+    // The draw before once more, as far as anything here goes (see DrawMemo): the same answer
+    const DrawSignature signature = SignatureOf(regs, replaces_target, may_leave_out,
+                                                overwrites_colour, overwrites_depth, by_rows);
+    const bool plain = !SamplesWritten(regs);
+    draws_asked++;
+    bool compare = false;
+    if (plain && draw_memo.valid && draw_memo.events == events &&
+        draw_memo.signature == signature) {
+        // One in 64 of them goes the long way all the same and is compared with the memo
+        compare = (++memo_checks & 63) == 0;
+        if (!compare) {
+            draws_repeated++;
+            seen[static_cast<std::size_t>(Kind::Draw)]++;
+            if (!draw_memo.carried_out) {
+                left_out[static_cast<std::size_t>(Kind::Draw)]++;
+            }
+            last_carried_out = draw_memo.carried_out;
+            return draw_memo.carried_out;
+        }
+    }
+    const DrawMemo memo_before = draw_memo;
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    if (!compare) {
+        if (!plain) {
+            memo_sampling++;
+        } else if (!draw_memo.valid) {
+            memo_after_sampling++;
+        } else if (draw_memo.events != events) {
+            memo_after_other++;
+        } else {
+            memo_other_signature++;
+        }
+    }
+#endif
 
     Step step;
     step.kind = Kind::Draw;
@@ -541,7 +714,7 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
         step.writes[0] = colour_range;
         step.replaces = replaces_target || overwrites_colour;
         step.renews = step.replaces;
-        written.Add(MemoryRange{colour_range.start, colour_range.end});
+        NoteWritten(MemoryRange{colour_range.start, colour_range.end});
     }
 
     const PAddr depth = framebuffer.GetDepthBufferPhysicalAddress();
@@ -557,7 +730,7 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
         depth_range = RowsOf(step, 1, step.first_row, step.last_row);
         if (writes_depth) {
             step.writes[1] = depth_range;
-            written.Add(MemoryRange{depth_range.start, depth_range.end});
+            NoteWritten(MemoryRange{depth_range.start, depth_range.end});
             // A clear done by drawing: games whose two eyes share a depth buffer clear it
             // this way before each (Star Fox 64 3D), and what the other eye left in it is
             // then no part of this one
@@ -662,7 +835,21 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
         }
     }
     step.key = key;
-    return Submit(step);
+    const bool carried_out = Submit(step);
+    if (compare && (key != memo_before.key || carried_out != memo_before.carried_out)) {
+        if (memo_differences++ == 0) {
+            LOG_ERROR(HW_GPU,
+                      "Unseen work: a draw taken for the one before it is another one (key "
+                      "{:016X} against {:016X}, carried out {} against {})",
+                      key, memo_before.key, carried_out, memo_before.carried_out);
+        }
+    }
+    draw_memo.valid = plain;
+    draw_memo.signature = signature;
+    draw_memo.events = events;
+    draw_memo.key = key;
+    draw_memo.carried_out = carried_out;
+    return carried_out;
 }
 
 bool FrameLiveness::ShouldAllowTransfer(const Pica::DisplayTransferConfig& config) {
@@ -725,7 +912,7 @@ bool FrameLiveness::ShouldAllowTransfer(const Pica::DisplayTransferConfig& confi
         return true;
     }
     step.writes[0] = destination;
-    written.Add(destination);
+    NoteWritten(destination);
     AddRead(step, source);
 
     u64 base = Mix(static_cast<u64>(step.kind), (static_cast<u64>(input) << 32) | output);
@@ -757,7 +944,7 @@ bool FrameLiveness::ShouldAllowFill(const Pica::MemoryFillConfig& config) {
     if (step.writes[0].Empty()) {
         return true;
     }
-    written.Add(step.writes[0]);
+    NoteWritten(step.writes[0]);
 
     const u64 base = Mix(static_cast<u64>(Kind::Fill),
                          (static_cast<u64>(step.writes[0].start) << 32) | step.writes[0].end);
@@ -767,6 +954,7 @@ bool FrameLiveness::ShouldAllowFill(const Pica::MemoryFillConfig& config) {
 }
 
 bool FrameLiveness::Submit(Step& step) {
+    events++;
     const auto kind = static_cast<std::size_t>(step.kind);
     step.shown = step.shown || IsShown(step.writes[0]);
 
@@ -855,7 +1043,7 @@ void FrameLiveness::GuestRead(const MemoryRange& range) {
     if (!stale.Empty() && stale.Intersects(range)) {
         Mispredicted("the game", range);
     }
-    if (!written.Intersects(range)) {
+    if (!WrittenIntersects(range)) {
         return;
     }
     if (!current.empty()) {
@@ -877,6 +1065,7 @@ void FrameLiveness::GuestRead(const MemoryRange& range) {
     step.key = Mix(static_cast<u64>(Kind::GuestRead), 0);
     step.reads.push_back(range);
     step.shown = true;
+    events++;
     seen[static_cast<std::size_t>(Kind::GuestRead)]++;
     if (current.size() < MAX_STEPS) {
         current.push_back(step);
@@ -889,6 +1078,7 @@ void FrameLiveness::NoteDisplay() {
     if (!active) {
         return;
     }
+    events++;
     const auto& screens = gpu.impl->pica.regs.framebuffer_config;
     const bool right_eye =
         Settings::values.mono_render_option.GetValue() == Settings::MonoRenderOption::RightEye;
@@ -943,6 +1133,7 @@ void FrameLiveness::Mispredicted(const char* reader, const MemoryRange& range) {
                 "Rendering everything for {} frames",
                 reader, range.start, range.end, distrust);
     stale.Clear();
+    events++;
     for (auto& [key, verdict] : verdicts) {
         verdict.unneeded_streak = 0;
     }
@@ -962,6 +1153,38 @@ void FrameLiveness::LookAtLastFrames() {
     if (total == 0) {
         return;
     }
+    // Frames repeat. What a look finds comes from the steps of the two frames alone, so two
+    // frames made of the steps of two frames looked at before give what that look gave, for
+    // each kind of work: entered again as it was found then.
+    const u64 current_hash = HashOf(current);
+    for (const KeptLook& kept : kept_looks) {
+        if (!kept.valid || kept.after_hash != current_hash || kept.before_hash != previous_hash ||
+            kept.before != previous || kept.after != current) {
+            continue;
+        }
+        looks_repeated++;
+        looks_in_a_row = 0;
+        needed = kept.needed;
+        for (const auto& [key, was_needed] : kept.outcome) {
+            Verdict& verdict = verdicts[key];
+            verdict.last_frame = frame;
+            if (was_needed) {
+                verdict.unneeded_streak = 0;
+            } else if (verdict.unneeded_streak < std::numeric_limits<u16>::max()) {
+                verdict.unneeded_streak++;
+            }
+        }
+        return;
+    }
+    looks_made++;
+    looks_in_a_row = std::min<u32>(looks_in_a_row + 1, 1u << 20);
+    const bool keep = previous.size() <= MOST_KEPT_STEPS && current.size() <= MOST_KEPT_STEPS &&
+                      (looks_in_a_row <= 32 || looks_in_a_row % 8 == 0);
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    if (current != previous) {
+        NoteDifference();
+    }
+#endif
     const auto step_at = [this](std::size_t index) -> const Step& {
         return index < previous.size() ? previous[index] : current[index - previous.size()];
     };
@@ -1037,9 +1260,68 @@ void FrameLiveness::LookAtLastFrames() {
             verdict.unneeded_streak++;
         }
     }
+    if (!keep) {
+        return;
+    }
+    KeptLook& kept = kept_looks[kept_next++ % KEPT_LOOKS];
+    kept.before = previous;
+    kept.after = current;
+    kept.before_hash = previous_hash;
+    kept.after_hash = current_hash;
+    kept.needed = needed;
+    kept.outcome.clear();
+    // (Each kind of work once: the look number marks the ones entered)
+    look++;
+    for (std::size_t index = 0; index < total; index++) {
+        const u64 key = step_at(index).key;
+        Verdict& verdict = verdicts[key];
+        if (verdict.look != look) {
+            verdict.look = look;
+            kept.outcome.emplace_back(key, verdict.needed_in_look);
+        }
+    }
+    kept.valid = true;
+}
+
+u64 FrameLiveness::HashOf(const std::vector<Step>& steps) {
+    u64 hash = steps.size();
+    for (const Step& step : steps) {
+        hash = Mix(hash, step.key ^ (step.shown ? 1 : 0));
+        hash = Mix(hash, (static_cast<u64>(step.writes[0].start) << 32) | step.writes[0].end);
+    }
+    return hash;
 }
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS
+void FrameLiveness::NoteDifference() {
+    difference_steps = {static_cast<u32>(previous.size()), static_cast<u32>(current.size())};
+    difference_index = 0;
+    difference_kind = Kind::Count;
+    difference_what = "the number of steps";
+    const std::size_t both = std::min(previous.size(), current.size());
+    for (std::size_t index = 0; index < both; index++) {
+        const Step& a = previous[index];
+        const Step& b = current[index];
+        if (a == b) {
+            continue;
+        }
+        difference_index = static_cast<u32>(index);
+        difference_kind = b.kind;
+        difference_what = a.kind != b.kind ? "the kind of work"
+                          : a.key != b.key
+                              ? (a.writes == b.writes && a.reads == b.reads ? "the key alone"
+                                 : a.writes != b.writes ? "the key and what is written"
+                                                        : "the key and what is read")
+                          : a.shown != b.shown   ? "whether it is shown"
+                          : a.reads != b.reads   ? "what it reads"
+                          : a.links != b.links   ? "how its reads go with its rows"
+                          : a.writes != b.writes ? "what it writes"
+                          : (a.first_row != b.first_row || a.last_row != b.last_row) ? "its rows"
+                                                                                     : "its flags";
+        return;
+    }
+}
+
 void FrameLiveness::LogOutline() const {
     const std::size_t offset = previous.size();
     if (needed.size() != offset + current.size()) {
@@ -1100,6 +1382,7 @@ void FrameLiveness::EndFrame() {
         return;
     }
     frame++;
+    events++;
     LookAtLastFrames();
 
     constexpr auto index = [](Kind kind) { return static_cast<std::size_t>(kind); };
@@ -1125,12 +1408,33 @@ void FrameLiveness::EndFrame() {
         LOG_INFO(HW_GPU,
                  "Unseen work: left out {} of {} draws, {} of {} copies, {} of {} transfers, "
                  "{} of {} fills; {} reads by the game, {} kinds of work known, {} stale "
-                 "places, {} frames of distrust left, {} wrong guesses",
+                 "places, {} frames of distrust left, {} wrong guesses; in the last 300 frames "
+                 "{} of {} draws were the draw before again ({} compared, {} of them another "
+                 "one after all), {} of {} looks at the last frames were the look before again",
                  left_out[index(Kind::Draw)], seen[index(Kind::Draw)], left_out[index(Kind::Copy)],
                  seen[index(Kind::Copy)], left_out[index(Kind::Transfer)],
                  seen[index(Kind::Transfer)], left_out[index(Kind::Fill)], seen[index(Kind::Fill)],
                  seen[index(Kind::GuestRead)], verdicts.size(), stale.Size(), distrust,
-                 wrong_guesses);
+                 wrong_guesses, draws_repeated, draws_asked, memo_checks / 64, memo_differences,
+                 looks_repeated, looks_repeated + looks_made);
+        static constexpr std::array<const char*, static_cast<std::size_t>(Kind::Count) + 1> kinds{
+            "a draw", "a copy", "a transfer", "a fill", "a read by the game", "no step"};
+        LOG_INFO(HW_GPU,
+                 "Unseen work, draws not taken for the one before: {} sample what the GPU "
+                 "wrote, {} follow one that does, {} follow other work, {} are other draws. "
+                 "The last frame unlike the one before it: {} steps after {}, unlike from "
+                 "step {} ({}) in {}",
+                 memo_sampling, memo_after_sampling, memo_after_other, memo_other_signature,
+                 difference_steps[1], difference_steps[0], difference_index,
+                 kinds[static_cast<std::size_t>(difference_kind)], difference_what);
+        memo_sampling = 0;
+        memo_after_sampling = 0;
+        memo_after_other = 0;
+        memo_other_signature = 0;
+        draws_repeated = 0;
+        draws_asked = 0;
+        looks_repeated = 0;
+        looks_made = 0;
     }
     // A game whose image for one eye goes nowhere, the transfer of it is left out, and yet
     // every draw is carried out: something after it reads what those draws leave behind.
@@ -1161,6 +1465,7 @@ void FrameLiveness::EndFrame() {
                            shown_places.end());
     }
 
+    previous_hash = HashOf(current);
     previous.swap(current);
     current.clear();
     previous_too_many_steps = too_many_steps;

@@ -316,7 +316,9 @@ public:
         return process_list;
     }
 
-    std::shared_ptr<Process> GetCurrentProcess() const;
+    /// (By reference: nearly every kernel call asks for it, mostly to reach its handle table,
+    /// and a copy is two atomic operations on its counter. Whoever keeps it copies it.)
+    const std::shared_ptr<Process>& GetCurrentProcess() const;
     void SetCurrentProcess(const std::shared_ptr<Process>& process);
     void SetCurrentProcessForCPU(std::shared_ptr<Process> process, u32 core_id);
 

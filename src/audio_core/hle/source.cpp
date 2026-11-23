@@ -90,6 +90,30 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
     }
 
     const bool ramp_active = state.gain_ramp_active.at(intermediate_mix_id);
+    if (!ramp_active) {
+        // Every source is mixed into three mixes of four channels, and most of those get
+        // nothing of it: the two mixes for effects in a game that has none, the two rear
+        // channels of anything in stereo. A gain of nothing adds nothing, so those are left
+        // alone (the sums are the same to the bit), and the two loops that remain are plain
+        // enough to be done several samples at a time.
+        const float gain0 = gains[0];
+        const float gain1 = gains[1];
+        const float gain2 = gains[2];
+        const float gain3 = gains[3];
+        if (gain0 != 0.0f || gain1 != 0.0f) {
+            for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
+                dest[samplei][0] += static_cast<s32>(gain0 * current_frame[samplei][0]);
+                dest[samplei][1] += static_cast<s32>(gain1 * current_frame[samplei][1]);
+            }
+        }
+        if (gain2 != 0.0f || gain3 != 0.0f) {
+            for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
+                dest[samplei][2] += static_cast<s32>(gain2 * current_frame[samplei][0]);
+                dest[samplei][3] += static_cast<s32>(gain3 * current_frame[samplei][1]);
+            }
+        }
+        return;
+    }
     const std::array<float, 4>& ramp_start = state.gain_ramp_start.at(intermediate_mix_id);
     constexpr float ramp_scale = 1.0f / static_cast<float>(samples_per_frame - 1);
 

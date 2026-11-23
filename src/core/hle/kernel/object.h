@@ -7,6 +7,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <utility>
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
 #include "common/serialization/atomic.h"
@@ -88,7 +89,9 @@ std::shared_ptr<T> SharedFrom(T* raw) {
 template <typename T>
 inline std::shared_ptr<T> DynamicObjectCast(std::shared_ptr<Object> object) {
     if (object != nullptr && object->GetHandleType() == T::HANDLE_TYPE) {
-        return std::static_pointer_cast<T>(object);
+        // The hold the argument has becomes the result's: no second count taken and given back
+        T* const derived = static_cast<T*>(object.get());
+        return std::shared_ptr<T>(std::move(object), derived);
     }
     return nullptr;
 }

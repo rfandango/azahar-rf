@@ -146,7 +146,14 @@ void Thread::Stop() {
 
 void ThreadManager::SwitchContext(Thread* new_thread) {
     Thread* previous_thread = GetCurrentThread();
-    std::shared_ptr<Process> previous_process = nullptr;
+    // Whether the thread that ran and the one to run are of one process is asked of the two
+    // threads' weak pointers themselves (they share their bookkeeping then). Making a shared
+    // pointer of each to compare them, three times over, was eight counted steps on a shared
+    // counter for every switch between two threads of a game.
+    const auto same_process = [](const std::weak_ptr<Process>& one,
+                                 const std::weak_ptr<Process>& other) {
+        return !one.owner_before(other) && !other.owner_before(one);
+    };
 
     Core::Timing& timing = kernel.timing;
 
@@ -160,7 +167,6 @@ void ThreadManager::SwitchContext(Thread* new_thread) {
 
     // Save context for previous thread
     if (previous_thread) {
-        previous_process = previous_thread->owner_process.lock();
         previous_thread->last_running_ticks = cpu->GetTimer().GetTicks();
         cpu->SaveContext(previous_thread->context);
 
@@ -185,13 +191,19 @@ void ThreadManager::SwitchContext(Thread* new_thread) {
         // Cancel any outstanding wakeup events for this thread
         timing.UnscheduleEvent(ThreadWakeupEventType, new_thread->thread_id);
 
+        // (Looked at before current_thread is given the new thread: that may let go of the
+        // last hold on the previous one)
+        const bool process_stays =
+            previous_thread != nullptr && !previous_thread->owner_process.expired() &&
+            same_process(previous_thread->owner_process, new_thread->owner_process);
+
         current_thread = SharedFrom(new_thread);
 
         ready_queue.remove(new_thread->current_priority, new_thread);
         new_thread->status = ThreadStatus::Running;
 
-        ASSERT(current_thread->owner_process.lock());
-        if (previous_process != current_thread->owner_process.lock()) {
+        ASSERT(!current_thread->owner_process.expired());
+        if (!process_stays) {
             kernel.SetCurrentProcessForCPU(current_thread->owner_process.lock(), cpu->GetID());
         }
 

@@ -6,6 +6,7 @@
 
 #include <array>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -210,6 +211,7 @@ private:
         f32 offset{};
         u32 row_bytes{};
         u32 rows{};
+        bool operator==(const Link&) const = default;
     };
 
     /// A piece of work
@@ -243,6 +245,35 @@ private:
         bool renews{};
         /// Its result is on display or goes to the game
         bool shown{};
+        bool operator==(const Step&) const = default;
+    };
+
+    /// What the step of a draw is made from, short of its textures: the registers its target,
+    /// its rows and what it writes are read from, and what the caller found out about it
+    struct DrawSignature {
+        PAddr colour{};
+        PAddr depth{};
+        u32 width{};
+        u32 height{};
+        u32 formats{};
+        s32 viewport_corner_y{};
+        u32 viewport_size_y{};
+        u32 scissor{};
+        u32 flags{};
+        bool operator==(const DrawSignature&) const = default;
+    };
+    /// The last draw that went the long way, if it sampled nothing the GPU wrote: a draw with
+    /// the same signature that samples nothing of that either, with nothing else noted in
+    /// between (`events` as it was), is the same step once more. Noting the same step twice
+    /// changes nothing but the counts (see Submit), so such a draw gets the same answer
+    /// without being made into a step. Games draw dozens of things one after the other into
+    /// one target with textures of their own, which is all that differs between them here.
+    struct DrawMemo {
+        DrawSignature signature;
+        u64 events{};
+        u64 key{};
+        bool valid{};
+        bool carried_out{};
     };
 
     struct Verdict {
@@ -263,6 +294,20 @@ private:
 
     void UpdateActive();
     void Forget();
+    static DrawSignature SignatureOf(const Pica::RegsInternal& regs, bool replaces_target,
+                                     bool may_leave_out, bool overwrites_colour,
+                                     bool overwrites_depth, bool by_rows);
+    /// Enters memory the GPU writes
+    void NoteWritten(const MemoryRange& range);
+    /// Whether the GPU wrote anything in the 64 KiB pieces of memory the range touches (two
+    /// words looked at for most textures); whether it wrote any of the range itself
+    bool WrittenNear(PAddr start, PAddr end) const;
+    bool WrittenIntersects(const MemoryRange& range) const {
+        return WrittenNear(range.start, range.end) && written.Intersects(range);
+    }
+    /// Whether a draw with these registers samples memory the GPU wrote: exactly when its
+    /// step gets a read for a texture
+    bool SamplesWritten(const Pica::RegsInternal& regs) const;
     bool IsShown(const MemoryRange& range) const;
     /// Finishes a step, decides whether it is carried out and notes it
     bool Submit(Step& step);
@@ -295,6 +340,18 @@ private:
     static constexpr u32 STENCIL_FORGOTTEN_AFTER = 600;
     bool stencil_seen = false;
     u32 stencil_last_frame = 0;
+    /// Which colour buffer a depth buffer was last drawn with, and when that last changed
+    struct DepthUse {
+        PAddr depth = 0;
+        PAddr colour = 0;
+        u32 changed_frame = 0;
+        bool shared = false;
+    };
+    std::array<DepthUse, 4> depth_uses{};
+    u32 depth_use_next = 0;
+    /// Notes which buffers the draw is made with, and tells whether its depth buffer has been
+    /// drawn with more than one colour buffer lately (see OnDraw)
+    bool NoteDepthUse(const Pica::RegsInternal& regs);
     /// Frames in a row with a transfer left out and every draw carried out, below zero
     /// while the outline was written lately; how often it was written
     s32 outline_streak = 0;
@@ -338,8 +395,69 @@ private:
     std::unordered_map<u64, Verdict> verdicts;
     u32 look = 0;
 
-    /// All memory the GPU was seen writing
+    /// All memory the GPU was seen writing, and a bit for each 64 KiB of memory that any of
+    /// it is in
     MemoryRanges written;
+    static constexpr u32 COARSE_SHIFT = 16;
+    std::array<u64, (u64{1} << (32 - COARSE_SHIFT)) / 64> written_coarse{};
+
+    /// Counts everything that changes what a step is made into or what is made of it: a
+    /// step noted, a frame ended, a display seen, a wrong guess
+    u64 events = 0;
+    DrawMemo draw_memo;
+    /// Draws answered from the memo and draws in all since the last status line; how often
+    /// a draw that the memo would have answered went the long way to compare, and how often
+    /// that came out differently (never, unless something is missing from the signature)
+    u32 draws_repeated = 0;
+    u32 draws_asked = 0;
+    u32 memo_checks = 0;
+    u32 memo_differences = 0;
+    /// Why the other draws were not, since the last status line: the draw samples something
+    /// the GPU wrote; the draw before it did; something else was noted between the two;
+    /// its signature is another
+    u32 memo_sampling = 0;
+    u32 memo_after_sampling = 0;
+    u32 memo_after_other = 0;
+    u32 memo_other_signature = 0;
+
+    /// What a look at two frames found, kept with the steps of the two: a look finds the same
+    /// again whenever two frames are made of those steps, and is then not gone through
+    /// (LookAtLastFrames). Frames repeat, but mostly not one like the one before it: a game
+    /// that swaps between two buffers for a screen names in every other frame what it named
+    /// two frames earlier, so the looks at the last few different pairs of frames are kept.
+    struct KeptLook {
+        std::vector<Step> before;
+        std::vector<Step> after;
+        u64 before_hash{};
+        u64 after_hash{};
+        /// For each kind of work in the two frames: whether any of its steps was needed
+        std::vector<std::pair<u64, bool>> outcome;
+        std::vector<bool> needed;
+        bool valid{};
+    };
+    static constexpr std::size_t KEPT_LOOKS = 4;
+    /// Frames of more steps than this are looked at every time: keeping them costs more
+    /// memory than the look costs time
+    static constexpr std::size_t MOST_KEPT_STEPS = 1024;
+    std::array<KeptLook, KEPT_LOOKS> kept_looks;
+    u32 kept_next = 0;
+    /// A hash over the steps of the frame under way as far as a quick comparison goes, and
+    /// that of the frame before
+    static u64 HashOf(const std::vector<Step>& steps);
+    u64 previous_hash = 0;
+    /// Looks gone through in a row without one being found among the kept ones: past a
+    /// number of them only one look in eight is kept, so that a game whose frames do not
+    /// repeat does not pay for the copies
+    u32 looks_in_a_row = 0;
+    u32 looks_repeated = 0;
+    u32 looks_made = 0;
+    /// Where the last frame that was not made of the steps of the one before first differed
+    /// from it (for the status line)
+    void NoteDifference();
+    std::array<u32, 2> difference_steps{};
+    u32 difference_index = 0;
+    Kind difference_kind{};
+    const char* difference_what = "none yet";
     /// Memory that does not hold what it should: what work left out would have written, and
     /// what was made from that
     MemoryRanges stale;

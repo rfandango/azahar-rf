@@ -4,6 +4,7 @@
 
 #include "common/alignment.h"
 #include "common/color.h"
+#include "common/trace_markers.h"
 #include "common/vector_math.h"
 #include "core/memory.h"
 #include "video_core/pica/regs_external.h"
@@ -51,7 +52,7 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
         return;
     }
 
-    u8* src_pointer = memory.GetPhysicalPointer(src_addr);
+    const u8* src_pointer = memory.GetPhysicalPointer(src_addr);
     u8* dst_pointer = memory.GetPhysicalPointer(dst_addr);
 
     u32 remaining_size = Common::AlignDown(config.texture_copy.size, 16);
@@ -82,6 +83,18 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
         config.texture_copy.size / input_width * (input_width + input_gap);
     rasterizer->FlushRegion(config.GetPhysicalInputAddress(),
                             static_cast<u32>(contiguous_input_size));
+
+    // What is read, as the decoder is given it: where the game keeps writing a page, the copy
+    // of the page that came with the command and not the page as it is by now
+    if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::UnheldCommandRanges) == 0) {
+        const u32 rows = remaining_size / input_width;
+        const u32 extent =
+            rows != 0 ? (rows - 1) * (input_width + input_gap) + input_width : remaining_size;
+        memory.NoteGpuReference(src_addr, extent);
+        if (const u8* const given = memory.GpuRead(src_addr, extent)) {
+            src_pointer = given;
+        }
+    }
 
     const std::size_t contiguous_output_size =
         config.texture_copy.size / output_width * (output_width + output_gap);
@@ -159,7 +172,7 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
                     BytesPerPixel(config.output_format);
     }
 
-    u8* src_pointer = memory.GetPhysicalPointer(src_addr);
+    const u8* src_pointer = memory.GetPhysicalPointer(src_addr);
     u8* dst_pointer = memory.GetPhysicalPointer(dst_addr);
 
     if (config.scaling > config.ScaleXY) {
@@ -186,6 +199,13 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
     const u32 output_size = output_width * output_height * BytesPerPixel(config.output_format);
 
     rasterizer->FlushRegion(config.GetPhysicalInputAddress(), input_size);
+    // As for a copy: what the decoder is given of it
+    if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::UnheldCommandRanges) == 0) {
+        memory.NoteGpuReference(src_addr, input_size);
+        if (const u8* const given = memory.GpuRead(src_addr, input_size)) {
+            src_pointer = given;
+        }
+    }
     rasterizer->InvalidateRegion(config.GetPhysicalOutputAddress(), output_size);
 
     for (u32 y = 0; y < output_height; ++y) {

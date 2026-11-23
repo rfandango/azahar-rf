@@ -101,6 +101,8 @@ private:
     bool completed{};
     /// Lines written to say why a second run was no repetition
     u32 explained{};
+    /// And to say where an image went that is no buffer of an eye
+    u32 explained_eyes{};
 };
 
 } // namespace VideoCore

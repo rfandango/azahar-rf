@@ -174,7 +174,7 @@ private:
 
     /// One system call in this many is timed and stands for the others, see
     /// BeginSVCProcessing
-    static constexpr u32 SVC_SAMPLE_INTERVAL = 16;
+    static constexpr u32 SVC_SAMPLE_INTERVAL = 64;
     u32 svc_count = 0;
     u32 svc_sample_interval = SVC_SAMPLE_INTERVAL;
     bool svc_timed = false;

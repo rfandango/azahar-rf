@@ -184,6 +184,13 @@ private:
     void WaitForPresent();
     /// The buffer of the top screen a transfer or copy fills, or 0: for the pacing rule
     PAddr PaceTargetOf(const Service::GSP::Command& command);
+    /// Where a transfer or copy command reads from the emulated memory and how far, as far as
+    /// the command says (not for a copy by way of the transfer command, whose size is what the
+    /// registers hold when it is carried out)
+    std::optional<std::pair<PAddr, u32>> SourceOf(const Service::GSP::Command& command);
+    /// And where a fill, a transfer or a copy writes (a fill has two places)
+    std::optional<std::array<std::pair<PAddr, u32>, 2>> TargetsOf(
+        const Service::GSP::Command& command);
 
     void SubmitCmdList(u32 index);
 

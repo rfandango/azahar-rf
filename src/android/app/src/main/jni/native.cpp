@@ -376,6 +376,12 @@ static Core::System::ResultStatus RunCitra(const std::string& filepath) {
 
     window->MakeCurrent();
 
+    // The texture pack is listed below, when the surfaces are no longer held: every surface
+    // and display callback of the user interface waits for surface_mutex, and listing a large
+    // pack takes longer than the five seconds after which the system offers to close the app
+    // (Dragon Quest VIII with a pack of 6763 files: 7.6 s, and the dialog at every start).
+    system.LeaveCustomTexturesToFrontend();
+
     const Core::System::ResultStatus load_result{
         system.Load(*window, filepath, secondary_window.get())};
 
@@ -385,6 +391,8 @@ static Core::System::ResultStatus RunCitra(const std::string& filepath) {
     if (load_result != Core::System::ResultStatus::Success) {
         return load_result;
     }
+
+    system.FindCustomTextures();
 
     stop_run = false;
     pause_emulation = false;

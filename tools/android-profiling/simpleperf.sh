@@ -61,7 +61,10 @@ write_device_info "$out"
 info "Recording $PACKAGE (pid $pid) for ${duration}s -> $out"
 
 # cpu-clock samples on-CPU time in both user space and the kernel (driver ioctls, futexes, ...).
-record_opts="-e cpu-clock -f $freq $cg_opts --duration $duration"
+# SIMPLEPERF_RECORD, if set, says what is sampled in its place (as in "-c 1000 -e branch-misses":
+# a sample every thousand mispredicted branches, to see where they are; the period goes
+# before the event it is for).
+record_opts="${SIMPLEPERF_RECORD:--e cpu-clock -f $freq} $cg_opts --duration $duration"
 (
     cd "$out"
     # -nb: don't collect binaries now. Collecting with -lib would also push the ~0.5 GB

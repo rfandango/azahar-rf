@@ -68,6 +68,7 @@ public:
 
     void MarkValid(SurfaceInterval interval) {
         invalid_regions.erase(interval);
+        given_regions.insert(interval);
         modification_tick++;
         validity_epoch++;
     }
@@ -80,6 +81,7 @@ public:
 
     void MarkValid(const SurfaceRegions& regions) {
         invalid_regions -= regions;
+        given_regions += regions;
         modification_tick++;
         validity_epoch++;
     }
@@ -115,6 +117,12 @@ public:
     u8 image_generation{};
     const Material* material = nullptr;
     SurfaceRegions invalid_regions;
+    /// What of the surface was valid at some time: the part its image on the host has been
+    /// given contents for, by a load, a copy, a clear or a draw. The rest of the image is as
+    /// it was made, with nothing ever written to it, and must not be handed to the GPU to
+    /// read or to draw into like that (see RasterizerCache::ValidateSurface). Whoever takes
+    /// from invalid_regions by hand adds here as well.
+    SurfaceRegions given_regions;
     u32 fill_size = 0;
     std::array<u8, 4> fill_data{};
     u64 modification_tick = 1;

@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <nihstro/shader_bytecode.h>
 #include "common/arch.h"
 #include "common/archives.h"
 #include "common/hash.h"
@@ -26,7 +27,9 @@
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/shader/debug_data.h"
 #include "video_core/shader/shader.h"
+#include "video_core/shader/shader_interpreter.h"
 #include "video_core/work_rules.h"
 
 namespace Pica {
@@ -377,6 +380,7 @@ static constexpr std::array<u32, 16> ExpandBitsToBytes = {
  */
 void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     if (ignore_list) {
+        list_copy = nullptr;
         signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
         return;
     }
@@ -527,6 +531,8 @@ void PicaCore::ForTwinRegisters(bool clears, Func&& func) const {
     // Blending, the tests and the masks; the target
     func(0x100, 0x108);
     func(0x116, 0x11F);
+    // Whether the fragments are lit at all
+    func(PICA_REG_INDEX(lighting.disable), PICA_REG_INDEX(lighting.disable) + 1);
     if (clears) {
         // A clear done with a quad: which program of the vertex shader's memory it runs does
         // not matter, and what else that memory holds changes between the two
@@ -569,75 +575,785 @@ u64 PicaCore::TwinState(bool clears) {
 
 const PicaCore::UniformSet& PicaCore::FloatUniformsRead() {
     const u32 main = regs.internal.vs.main_offset;
-    const u64 key = Common::HashCombine(vs_setup.GetProgramCodeHash(), u64{main});
+    // The shader's bool uniforms decide which of its branches run: a game has one program
+    // serve many kinds of draw, and switches parts of it on and off with them. The part that
+    // is off may read uniforms the game does not set for this kind of draw at all, which hold
+    // what another draw left there (New Super Mario Bros. 2: the first draws of each eye's run
+    // would read uniform 14 on a branch they do not take, and it is not the same before the
+    // two runs). So what is read is found for the bool uniforms as they are.
+    u32 bools = 0;
+    for (u32 i = 0; i < vs_setup.uniforms.b.size(); i++) {
+        bools |= (vs_setup.uniforms.b[i] ? 1u : 0u) << i;
+    }
+    const u64 key =
+        Common::HashCombine(vs_setup.GetProgramCodeHash(), u64{main} | (u64{bools} << 32));
     for (const auto& [known, set] : uniforms_read) {
         if (known == key) {
             return set;
         }
     }
     const auto& code = vs_setup.GetProgramCode();
-    UniformSet set{};
-    std::vector<bool> seen(code.size());
-    // Stretches of the program still to go through: from, up to
-    std::vector<std::pair<u32, u32>> stretches{{main, static_cast<u32>(code.size())}};
-    while (!stretches.empty()) {
-        auto [at, end] = stretches.back();
-        stretches.pop_back();
-        for (; at < end && at < code.size(); at++) {
-            const u32 word = code[at];
-            const u32 opcode = word >> 26;
-            if (opcode == 0x22) {
-                // END
-                break;
-            }
-            if (seen[at]) {
-                continue;
-            }
-            seen[at] = true;
-            // The operand that can be a float uniform, and whether it is indexed
-            u32 reg = 0;
-            u32 indexed = 0;
-            if (opcode >= 0x38) {
-                // MAD
-                reg = (word >> 10) & 0x7F;
-                indexed = (word >> 22) & 3;
-            } else if (opcode >= 0x30) {
-                // MADI
-                reg = (word >> 5) & 0x7F;
-                indexed = (word >> 22) & 3;
-            } else if (opcode >= 0x20 && opcode <= 0x2D) {
-                // Flow: what a call or a jump leads to is gone through as well. What an IF or
-                // a LOOP covers follows it and is gone through anyway.
-                const u32 dest = (word >> 10) & 0xFFF;
-                const u32 count = word & 0xFF;
-                if (opcode >= 0x24 && opcode <= 0x26) {
-                    stretches.emplace_back(dest, dest + count);
-                } else if (opcode == 0x2C || opcode == 0x2D) {
-                    stretches.emplace_back(dest, static_cast<u32>(code.size()));
+    const u32 size = static_cast<u32>(code.size());
+    // Goes through what the program can run from its entry. `by_bools`: a branch on a bool
+    // uniform is followed the way it goes; otherwise both ways, as a branch on what the
+    // program worked out always is. False if that did not come to an end in good time.
+    const auto walk = [&](bool by_bools, UniformSet& set) {
+        set = {};
+        std::vector<bool> seen(size);
+        u64 steps = 0;
+        // Stretches of the program still to go through: from, up to
+        std::vector<std::pair<u32, u32>> stretches{{main, size}};
+        while (!stretches.empty()) {
+            auto [at, end] = stretches.back();
+            stretches.pop_back();
+            for (; at < end && at < size; at++) {
+                if (++steps > u64{size} * 64) {
+                    return false;
                 }
-                continue;
-            } else if (opcode >= 0x18 && opcode <= 0x1B) {
-                // The instructions with the operands the other way round
-                reg = (word >> 7) & 0x7F;
-                indexed = (word >> 19) & 3;
-            } else {
-                reg = (word >> 12) & 0x7F;
-                indexed = (word >> 19) & 3;
+                const u32 word = code[at];
+                const u32 opcode = word >> 26;
+                if (opcode == 0x22) {
+                    // END
+                    break;
+                }
+                const bool was_seen = seen[at];
+                seen[at] = true;
+                if (opcode >= 0x20 && opcode <= 0x2D) {
+                    // Flow. What a call or a jump leads to is gone through as well; what an
+                    // IF or a LOOP covers follows it and is gone through anyway, but for an
+                    // IF on a bool uniform, of which only one part runs.
+                    const u32 dest = (word >> 10) & 0xFFF;
+                    const u32 count = word & 0xFF;
+                    const bool on = ((bools >> ((word >> 22) & 0xF)) & 1) != 0;
+                    bool leaves = false;
+                    switch (opcode) {
+                    case 0x24: // CALL
+                    case 0x25: // CALLC
+                        if (!was_seen) {
+                            stretches.emplace_back(dest, dest + count);
+                        }
+                        break;
+                    case 0x26: // CALLU
+                        if ((on || !by_bools) && !was_seen) {
+                            stretches.emplace_back(dest, dest + count);
+                        }
+                        break;
+                    case 0x27: // IFU: from here to dest if it is on, the count from dest if not
+                        if (by_bools && dest > at) {
+                            if (on) {
+                                stretches.emplace_back(dest + count, end);
+                                end = dest;
+                            } else {
+                                at = dest - 1;
+                            }
+                        }
+                        break;
+                    case 0x2C: // JMPC
+                        if (!was_seen) {
+                            stretches.emplace_back(dest, size);
+                        }
+                        break;
+                    case 0x2D: { // JMPU: taken if the bool is what the count's lowest bit asks
+                        const bool taken = on == ((count & 1) == 0);
+                        if ((taken || !by_bools) && !was_seen) {
+                            stretches.emplace_back(dest, size);
+                        }
+                        leaves = by_bools && taken;
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                    if (leaves) {
+                        break;
+                    }
+                    continue;
+                }
+                if (was_seen) {
+                    continue;
+                }
+                // The operand that can be a float uniform, and whether it is indexed
+                u32 reg = 0;
+                u32 indexed = 0;
+                if (opcode >= 0x38) {
+                    // MAD
+                    reg = (word >> 10) & 0x7F;
+                    indexed = (word >> 22) & 3;
+                } else if (opcode >= 0x30) {
+                    // MADI
+                    reg = (word >> 5) & 0x7F;
+                    indexed = (word >> 22) & 3;
+                } else if (opcode >= 0x18 && opcode <= 0x1B) {
+                    // The instructions with the operands the other way round
+                    reg = (word >> 7) & 0x7F;
+                    indexed = (word >> 19) & 3;
+                } else {
+                    reg = (word >> 12) & 0x7F;
+                    indexed = (word >> 19) & 3;
+                }
+                // An indexed read picks from a table (the bones of a skinned model). How far
+                // into it is not known here, and what lies beyond a model's own bones is what
+                // other models left there: tables are not compared.
+                if (reg < 0x20 || indexed != 0) {
+                    continue;
+                }
+                const u32 i = reg - 0x20;
+                set[i / 64] |= u64{1} << (i % 64);
             }
-            // An indexed read picks from a table (the bones of a skinned model). How far into
-            // it is not known here, and what lies beyond a model's own bones is what other
-            // models left there: tables are not compared.
-            if (reg < 0x20 || indexed != 0) {
-                continue;
-            }
-            const u32 i = reg - 0x20;
-            set[i / 64] |= u64{1} << (i % 64);
         }
+        return true;
+    };
+    UniformSet set{};
+    if (!walk(true, set)) {
+        walk(false, set);
     }
     if (uniforms_read.size() >= 256) {
         uniforms_read.clear();
     }
     return uniforms_read.emplace_back(key, set).second;
+}
+
+namespace {
+
+/// What a value in a shader register depends on: which float uniforms, and whether the
+/// vertex's own data
+struct Taint {
+    static constexpr u64 VERTEX = u64{1} << 63;
+    u64 low{};
+    /// Uniforms 64 to 95 in the low bits, the vertex in the top one
+    u64 high{};
+
+    static Taint Uniform(u32 index) {
+        Taint taint;
+        (index < 64 ? taint.low : taint.high) = u64{1} << (index % 64);
+        return taint;
+    }
+    static Taint Vertex() {
+        Taint taint;
+        taint.high = VERTEX;
+        return taint;
+    }
+    bool OfVertex() const {
+        return (high & VERTEX) != 0;
+    }
+    Taint& operator|=(const Taint& other) {
+        low |= other.low;
+        high |= other.high;
+        return *this;
+    }
+    friend Taint operator|(Taint a, const Taint& b) {
+        return a |= b;
+    }
+};
+using Taint4 = std::array<Taint, 4>;
+
+/// What every register of a vertex shader depends on at one point of its run
+struct TaintState {
+    std::array<Taint4, 16> temporary{};
+    std::array<Taint4, 16> output{};
+    std::array<Taint, 2> condition{};
+    std::array<Taint, 2> address{};
+
+    /// Either this or the other: a register depends on what it depends on in one of them
+    void Join(const TaintState& other) {
+        for (std::size_t reg = 0; reg < temporary.size(); reg++) {
+            for (std::size_t i = 0; i < 4; i++) {
+                temporary[reg][i] |= other.temporary[reg][i];
+                output[reg][i] |= other.output[reg][i];
+            }
+        }
+        for (std::size_t i = 0; i < 2; i++) {
+            condition[i] |= other.condition[i];
+            address[i] |= other.address[i];
+        }
+    }
+};
+
+} // Anonymous namespace
+
+const PicaCore::UniformsThatMatter* PicaCore::FloatUniformsThatMatter() {
+    using nihstro::Instruction;
+    using nihstro::OpCode;
+    using nihstro::RegisterType;
+    using nihstro::SourceRegister;
+    using nihstro::SwizzlePattern;
+    using Record = Shader::DebugDataRecord;
+
+    const u32 main = regs.internal.vs.main_offset;
+    const auto& uniforms = vs_setup.uniforms;
+    u32 bools = 0;
+    for (u32 i = 0; i < uniforms.b.size(); i++) {
+        bools |= (uniforms.b[i] ? 1u : 0u) << i;
+    }
+    // The program, where it begins, and what else decides its way besides float uniforms
+    // (and what decides which of its outputs the fragments are made of, see the end)
+    const u64 key = Common::HashCombine(
+        vs_setup.GetProgramCodeHash(), vs_setup.GetSwizzleDataHash(),
+        u64{main} | (u64{bools} << 32), Common::ComputeHash64(&uniforms.i, sizeof(uniforms.i)),
+        u64{regs.internal.vs.output_mask},
+        Common::ComputeHash64(&regs.internal.reg_array[0x4F], 8 * sizeof(u32)),
+        u64{regs.internal.reg_array[0x80]} | (u64{regs.internal.lighting.disable} << 32));
+    const auto values_of = [&](const UniformSet& set) {
+        u64 hash = 0;
+        for (u32 i = 0; i < uniforms.f.size(); i++) {
+            if ((set[i / 64] >> (i % 64) & 1) != 0) {
+                hash = Common::HashCombine(
+                    hash, Common::ComputeHash64(&uniforms.f[i], sizeof(uniforms.f[i])));
+            }
+        }
+        return hash;
+    };
+    // A program has a result for each set of values of the uniforms its way depends on (a
+    // few: what a game has differ from model to model). Most results of one program go by
+    // the same uniforms, so their values are hashed once.
+    {
+        const UniformSet* hashed = nullptr;
+        u64 hash = 0;
+        for (const UniformsThatMatter& entry : uniforms_that_matter) {
+            if (entry.key != key) {
+                continue;
+            }
+            if (hashed == nullptr || *hashed != entry.control) {
+                hashed = &entry.control;
+                hash = values_of(entry.control);
+            }
+            if (entry.control_values == hash) {
+                return entry.known ? &entry : nullptr;
+            }
+        }
+    }
+
+    // One run of the program, on a vertex of nothing but zeroes, with every instruction it
+    // came by noted. What each register depends on is then followed along that run.
+    //
+    // A branch that depends only on uniforms goes the same way for every vertex, and for
+    // other values of the other uniforms: those it depends on are kept with what they held
+    // and count among those that matter. A branch that depends on the vertex goes the other
+    // way for other vertices: the side this run did not take is gone through as well, if it
+    // is plain arithmetic, and where the two sides meet a register depends on what it
+    // depends on in either. Anything else that depends on the vertex, and nothing is told.
+    //
+    // A product with a uniform that holds zero is zero whatever the other factor is (on the
+    // console also for an infinite one; not for one that is not a number, which a shader
+    // gets from nothing a game gives it), and so depends on that uniform being zero and on
+    // nothing else. That is how a game switches a part of its shader off: New Super Mario
+    // Bros. 2 moves every vertex sideways for its eye by a term that ends in a product with
+    // the depth of the 3D effect, and with that at nothing the uniform the term begins with
+    // is not even set for the left eye.
+    //
+    // A table read at a place the vertex picks (the bones of a skinned model) is not
+    // followed into, as in FloatUniformsRead.
+    few_vertices_engine->SetupBatch(vs_setup, main);
+    AttributeBuffer nothing;
+    nothing.fill(Common::Vec4<f24>::AssignToAll(f24::Zero()));
+    const auto trace = static_cast<const Shader::InterpreterEngine&>(*few_vertices_engine)
+                           .ProduceDebugInfo(vs_setup, nothing, regs.internal.vs);
+    const auto& code = vs_setup.GetProgramCode();
+    const auto& swizzles = vs_setup.GetSwizzleData();
+
+    TaintState state;
+    std::array<s32, 2> address_value{};
+    Common::Vec4<u8> loop{};
+    // The uniforms that pin the way this run went and what it found (the branches that depend
+    // on uniforms alone, the factors that are zero, where tables are read): with other values
+    // in them another run has to be followed. And those a branch depends on together with
+    // the vertex: both of its sides are followed, so they pin nothing, but which side a
+    // vertex takes depends on them.
+    Taint control;
+    Taint influence;
+    // What a reciprocal is taken of: there the sign of a zero is the sign of an infinity
+    Taint reciprocal;
+    bool known = true;
+    // While the side of a branch that the run did not take is gone through: an address
+    // register that is set there holds a value this run does not have. That is no matter
+    // where the vertex picks it (what is read through it is a table that is not followed
+    // into); anything else read through it cannot be told.
+    bool other_side = false;
+    std::array<bool, 2> address_unknown{};
+
+    struct Source {
+        Taint4 taints{};
+        /// A float uniform read at its own place, and which
+        bool uniform{};
+        u32 index{};
+    };
+    const auto is_zero = [&](const Source& from, u32 component) {
+        return from.uniform && uniforms.f[from.index][component].ToFloat32() == 0.f;
+    };
+    // What one arithmetic instruction makes of what the registers depend on
+    const auto apply = [&](const Instruction& instr, TaintState& on) {
+        const auto source = [&](const SourceRegister& reg, u32 address_index) {
+            Source from;
+            const u32 index = static_cast<u32>(reg.GetIndex());
+            switch (reg.GetRegisterType()) {
+            case RegisterType::Input:
+                from.taints.fill(Taint::Vertex());
+                break;
+            case RegisterType::Temporary:
+                from.taints = on.temporary[index % on.temporary.size()];
+                break;
+            case RegisterType::FloatUniform: {
+                Taint whole;
+                if (address_index == 0) {
+                    if (index < 96) {
+                        whole = Taint::Uniform(index);
+                        from.uniform = true;
+                        from.index = index;
+                    }
+                } else if (address_index == 3) {
+                    // By the loop's counter: one of the registers the loop goes through
+                    for (u32 turn = 0; turn <= loop.x; turn++) {
+                        s32 offset = static_cast<s32>(loop.y) + static_cast<s32>(turn * loop.z);
+                        if (offset > 127) {
+                            offset = 0;
+                        }
+                        const u32 at = (index + static_cast<u32>(offset)) & 0x7F;
+                        if (at < 96) {
+                            whole |= Taint::Uniform(at);
+                        }
+                    }
+                } else if (!on.address[address_index - 1].OfVertex()) {
+                    if (address_unknown[address_index - 1]) {
+                        known = false;
+                    }
+                    s32 offset = address_value[address_index - 1];
+                    if (offset < -128 || offset > 127) {
+                        offset = 0;
+                    }
+                    const u32 at = (index + static_cast<u32>(offset)) & 0x7F;
+                    if (at < 96) {
+                        whole = Taint::Uniform(at);
+                    }
+                    // (Where it reads depends on what the address was worked out from)
+                    whole |= on.address[address_index - 1];
+                    control |= on.address[address_index - 1];
+                }
+                from.taints.fill(whole);
+                break;
+            }
+            default:
+                break;
+            }
+            return from;
+        };
+        const auto destination = [&](const nihstro::DestRegister& reg) -> Taint4* {
+            if (reg < 0x10) {
+                return &on.output[reg.GetIndex() % on.output.size()];
+            }
+            if (reg < 0x20) {
+                return &on.temporary[reg.GetIndex() % on.temporary.size()];
+            }
+            return nullptr;
+        };
+        const OpCode opcode = instr.opcode.Value();
+        if (opcode.GetInfo().type == OpCode::Type::MultiplyAdd) {
+            const SwizzlePattern swizzle = {swizzles[instr.mad.operand_desc_id]};
+            const bool inverted = opcode.EffectiveOpCode() == OpCode::Id::MADI;
+            const Source s1 = source(instr.mad.GetSrc1(inverted), 0);
+            const Source s2 = source(instr.mad.GetSrc2(inverted),
+                                     inverted ? 0 : instr.mad.address_register_index);
+            const Source s3 = source(instr.mad.GetSrc3(inverted),
+                                     inverted ? instr.mad.address_register_index : 0);
+            const std::array<u32, 4> pick1 = {static_cast<u32>(swizzle.src1_selector_0.Value()),
+                                              static_cast<u32>(swizzle.src1_selector_1.Value()),
+                                              static_cast<u32>(swizzle.src1_selector_2.Value()),
+                                              static_cast<u32>(swizzle.src1_selector_3.Value())};
+            const std::array<u32, 4> pick2 = {static_cast<u32>(swizzle.src2_selector_0.Value()),
+                                              static_cast<u32>(swizzle.src2_selector_1.Value()),
+                                              static_cast<u32>(swizzle.src2_selector_2.Value()),
+                                              static_cast<u32>(swizzle.src2_selector_3.Value())};
+            const std::array<u32, 4> pick3 = {static_cast<u32>(swizzle.src3_selector_0.Value()),
+                                              static_cast<u32>(swizzle.src3_selector_1.Value()),
+                                              static_cast<u32>(swizzle.src3_selector_2.Value()),
+                                              static_cast<u32>(swizzle.src3_selector_3.Value())};
+            if (Taint4* const into = destination(instr.mad.dest.Value())) {
+                for (u32 i = 0; i < 4; i++) {
+                    if (!swizzle.DestComponentEnabled(i)) {
+                        continue;
+                    }
+                    Taint product = s1.taints[pick1[i]] | s2.taints[pick2[i]];
+                    for (const auto& [factor, component] :
+                         {std::pair{&s1, pick1[i]}, std::pair{&s2, pick2[i]}}) {
+                        if (is_zero(*factor, component)) {
+                            product = Taint::Uniform(factor->index);
+                            control |= product;
+                        }
+                    }
+                    (*into)[i] = product | s3.taints[pick3[i]];
+                }
+            }
+            return;
+        }
+        const SwizzlePattern swizzle = {swizzles[instr.common.operand_desc_id]};
+        const bool inverted = (opcode.GetInfo().subtype & OpCode::Info::SrcInversed) != 0;
+        const Source s1 = source(instr.common.GetSrc1(inverted),
+                                 inverted ? 0 : instr.common.address_register_index);
+        const Source s2 = source(instr.common.GetSrc2(inverted),
+                                 inverted ? instr.common.address_register_index : 0);
+        const std::array<u32, 4> pick1 = {static_cast<u32>(swizzle.src1_selector_0.Value()),
+                                          static_cast<u32>(swizzle.src1_selector_1.Value()),
+                                          static_cast<u32>(swizzle.src1_selector_2.Value()),
+                                          static_cast<u32>(swizzle.src1_selector_3.Value())};
+        const std::array<u32, 4> pick2 = {static_cast<u32>(swizzle.src2_selector_0.Value()),
+                                          static_cast<u32>(swizzle.src2_selector_1.Value()),
+                                          static_cast<u32>(swizzle.src2_selector_2.Value()),
+                                          static_cast<u32>(swizzle.src2_selector_3.Value())};
+        Taint4 a{};
+        Taint4 b{};
+        for (u32 i = 0; i < 4; i++) {
+            a[i] = s1.taints[pick1[i]];
+            b[i] = s2.taints[pick2[i]];
+        }
+        Taint4 result{};
+        switch (opcode.EffectiveOpCode()) {
+        case OpCode::Id::CMP:
+            on.condition[0] = a[0] | b[0];
+            on.condition[1] = a[1] | b[1];
+            return;
+        case OpCode::Id::MOVA:
+            for (u32 i = 0; i < 2; i++) {
+                if (swizzle.DestComponentEnabled(i)) {
+                    on.address[i] = a[i];
+                    address_unknown[i] = other_side;
+                }
+            }
+            return;
+        case OpCode::Id::MUL:
+            for (u32 i = 0; i < 4; i++) {
+                result[i] = a[i] | b[i];
+                for (const auto& [factor, component] :
+                     {std::pair{&s1, pick1[i]}, std::pair{&s2, pick2[i]}}) {
+                    if (is_zero(*factor, component)) {
+                        result[i] = Taint::Uniform(factor->index);
+                        control |= result[i];
+                    }
+                }
+            }
+            break;
+        case OpCode::Id::ADD:
+        case OpCode::Id::MAX:
+        case OpCode::Id::MIN:
+        case OpCode::Id::SGE:
+        case OpCode::Id::SGEI:
+        case OpCode::Id::SLT:
+        case OpCode::Id::SLTI:
+            for (u32 i = 0; i < 4; i++) {
+                result[i] = a[i] | b[i];
+            }
+            break;
+        case OpCode::Id::MOV:
+        case OpCode::Id::FLR:
+            result = a;
+            break;
+        case OpCode::Id::RCP:
+        case OpCode::Id::RSQ:
+            reciprocal |= a[0];
+            result.fill(a[0]);
+            break;
+        case OpCode::Id::EX2:
+        case OpCode::Id::LG2:
+            result.fill(a[0]);
+            break;
+        case OpCode::Id::DP3:
+            result.fill(a[0] | a[1] | a[2] | b[0] | b[1] | b[2]);
+            break;
+        default:
+            // DP4, DPH and whatever else: by all of both
+            result.fill(a[0] | a[1] | a[2] | a[3] | b[0] | b[1] | b[2] | b[3]);
+            break;
+        }
+        if (Taint4* const into = destination(instr.common.dest.Value())) {
+            for (u32 i = 0; i < 4; i++) {
+                if (swizzle.DestComponentEnabled(i)) {
+                    (*into)[i] = result[i];
+                }
+            }
+        }
+    };
+    const auto is_arithmetic = [](const Instruction& instr) {
+        const auto type = instr.opcode.Value().GetInfo().type;
+        return type == OpCode::Type::Arithmetic || type == OpCode::Type::MultiplyAdd;
+    };
+
+    // Where the two sides of a branch that depends on the vertex meet again, and what the
+    // registers depend on if the side this run did not take is taken
+    struct Meeting {
+        u32 at;
+        TaintState other;
+    };
+    std::vector<Meeting> meetings;
+
+    for (const Record& record : trace.records) {
+        if (!known) {
+            break;
+        }
+        if ((record.mask & Record::CUR_INSTR) == 0 || record.instruction_offset >= code.size()) {
+            continue;
+        }
+        const u32 pc = record.instruction_offset;
+        std::erase_if(meetings, [&](const Meeting& meeting) {
+            if (meeting.at != pc) {
+                return false;
+            }
+            state.Join(meeting.other);
+            return true;
+        });
+        Instruction instr{};
+        instr.hex = code[pc];
+        const OpCode opcode = instr.opcode.Value();
+        if (is_arithmetic(instr)) {
+            apply(instr, state);
+            if (opcode.EffectiveOpCode() == OpCode::Id::MOVA &&
+                (record.mask & Record::ADDR_REG_OUT) != 0) {
+                address_value = {record.address_registers[0], record.address_registers[1]};
+            }
+            continue;
+        }
+        switch (opcode.EffectiveOpCode()) {
+        case OpCode::Id::IFC:
+        case OpCode::Id::JMPC:
+        case OpCode::Id::CALLC:
+        case OpCode::Id::BREAKC: {
+            using Op = Instruction::FlowControlType::Op;
+            const auto& flow = instr.flow_control;
+            const Taint by = flow.op == Op::JustX   ? state.condition[0]
+                             : flow.op == Op::JustY ? state.condition[1]
+                                                    : state.condition[0] | state.condition[1];
+            if (!by.OfVertex()) {
+                control |= by;
+                break;
+            }
+            influence |= by;
+            if ((record.mask & Record::COND_CMP_IN) == 0) {
+                known = false;
+                break;
+            }
+            const bool x = flow.refx.Value() == record.cond_cmp[0];
+            const bool y = flow.refy.Value() == record.cond_cmp[1];
+            const bool taken = flow.op == Op::Or      ? x || y
+                               : flow.op == Op::And   ? x && y
+                               : flow.op == Op::JustX ? x
+                                                      : y;
+            const u32 dest = flow.dest_offset;
+            const u32 count = flow.num_instructions;
+            // The side that was not run, from and up to, and where the run goes on after
+            u32 from = 0;
+            u32 to = 0;
+            u32 meet = 0;
+            switch (opcode.EffectiveOpCode()) {
+            case OpCode::Id::IFC:
+                meet = dest + count;
+                from = taken ? dest : pc + 1;
+                to = taken ? dest + count : dest;
+                break;
+            case OpCode::Id::JMPC:
+                known = dest > pc;
+                meet = dest;
+                from = pc + 1;
+                to = taken ? dest : pc + 1;
+                break;
+            case OpCode::Id::CALLC:
+                meet = pc + 1;
+                from = dest;
+                to = taken ? dest : dest + count;
+                break;
+            default:
+                known = false;
+                break;
+            }
+            if (!known || to > code.size()) {
+                known = false;
+                break;
+            }
+            Meeting meeting{meet, state};
+            other_side = true;
+            for (u32 at = from; at < to && known; at++) {
+                Instruction there{};
+                there.hex = code[at];
+                if (there.opcode.Value().EffectiveOpCode() == OpCode::Id::NOP) {
+                    continue;
+                }
+                if (!is_arithmetic(there)) {
+                    known = false;
+                    break;
+                }
+                apply(there, meeting.other);
+            }
+            other_side = false;
+            // (Where the sides meet the registers may hold either side's addresses: one that
+            // was set on the other side stays unknown for what follows, unless the vertex
+            // picks it)
+            meetings.push_back(std::move(meeting));
+            break;
+        }
+        case OpCode::Id::LOOP:
+            if ((record.mask & Record::LOOP_INT_IN) != 0) {
+                loop = record.loop_int;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    // (The program ended before two sides met)
+    for (const Meeting& meeting : meetings) {
+        state.Join(meeting.other);
+    }
+
+    // What matters of what the program puts out is what the fragments are made of. A program
+    // made for many kinds of draw puts out texture coordinates for three textures and what
+    // lighting needs, from uniforms the game sets only for a draw that has those textures or
+    // is lit: the output map says what each component is, and the registers which of them a
+    // fragment of this draw is given.
+    const auto& config = regs.internal.texturing.main_config;
+    const bool lit = !regs.internal.lighting.disable;
+    const bool procedural = config.texture3_enable != 0;
+    const std::array<bool, 3> coordinates = {
+        config.texture0_enable != 0 || (procedural && config.texture3_coordinates == 0),
+        config.texture1_enable != 0 ||
+            (config.texture2_enable != 0 && config.texture2_use_coord1 != 0) ||
+            (procedural && config.texture3_coordinates == 1),
+        (config.texture2_enable != 0 && config.texture2_use_coord1 == 0) ||
+            (procedural && config.texture3_coordinates == 2),
+    };
+    const auto fragments_use = [&](u32 meaning) {
+        using Semantic = RasterizerRegs::VSOutputAttributes::Semantic;
+        switch (meaning) {
+        case Semantic::QUATERNION_X:
+        case Semantic::QUATERNION_Y:
+        case Semantic::QUATERNION_Z:
+        case Semantic::QUATERNION_W:
+        case Semantic::VIEW_X:
+        case Semantic::VIEW_Y:
+        case Semantic::VIEW_Z:
+            return lit;
+        case Semantic::TEXCOORD0_U:
+        case Semantic::TEXCOORD0_V:
+        case Semantic::TEXCOORD0_W:
+            return coordinates[0];
+        case Semantic::TEXCOORD1_U:
+        case Semantic::TEXCOORD1_V:
+            return coordinates[1];
+        case Semantic::TEXCOORD2_U:
+        case Semantic::TEXCOORD2_V:
+            return coordinates[2];
+        default:
+            // Position and colour, and whatever is not known here; a component that is
+            // mapped to nothing goes nowhere
+            return meaning <= Semantic::TEXCOORD2_V;
+        }
+    };
+    Taint matter = control | influence;
+    const u32 outputs_on = regs.internal.vs.output_mask;
+    const u32 mapped = std::min<u32>(regs.internal.rasterizer.vs_output_total, 7);
+    u32 slot = 0;
+    for (u32 reg = 0; reg < state.output.size(); reg++) {
+        if ((outputs_on >> reg & 1) == 0) {
+            continue;
+        }
+        // (The outputs that are switched on are taken in their order by the map's entries)
+        if (slot < mapped) {
+            const auto& map = regs.internal.rasterizer.vs_output_attributes[slot];
+            const std::array<u32, 4> meanings = {map.map_x, map.map_y, map.map_z, map.map_w};
+            for (u32 i = 0; i < 4; i++) {
+                if (fragments_use(meanings[i])) {
+                    matter |= state.output[reg][i];
+                }
+            }
+        }
+        slot++;
+    }
+    if (uniforms_that_matter.size() >= 512) {
+        uniforms_that_matter.clear();
+    }
+    UniformsThatMatter& entry = uniforms_that_matter.emplace_back();
+    entry.key = key;
+    entry.control = {control.low, control.high & ~Taint::VERTEX};
+    entry.control_values = values_of(entry.control);
+    entry.known = known;
+    entry.matter = {matter.low, matter.high & ~Taint::VERTEX};
+    entry.zero_sign = {reciprocal.low, reciprocal.high & ~Taint::VERTEX};
+
+    // What was found, for whoever asks why two draws did not compare alike
+    static std::atomic<u32> told{};
+    if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) != 0 &&
+        told.fetch_add(1, std::memory_order_relaxed) < 40) {
+        const auto list = [](Taint taint) {
+            std::string text;
+            for (u32 i = 0; i < 96; i++) {
+                if (((i < 64 ? taint.low : taint.high) >> (i % 64) & 1) != 0) {
+                    text += fmt::format("{}{}", text.empty() ? "" : " ", i);
+                }
+            }
+            return (text.empty() ? std::string{"none"} : text) +
+                   (taint.OfVertex() ? " and the vertex" : "");
+        };
+        std::string by_output;
+        for (u32 reg = 0; reg < state.output.size(); reg++) {
+            if ((outputs_on >> reg & 1) == 0) {
+                continue;
+            }
+            Taint all;
+            for (const Taint& taint : state.output[reg]) {
+                all |= taint;
+            }
+            by_output += fmt::format("; o{} by {}", reg, list(all));
+        }
+        // The run itself, once for each program and set of bool uniforms: place, instruction
+        // and operand pattern of each instruction it came by, to be read with a disassembler
+        static std::array<u64, 8> runs_told{};
+        static std::atomic<u32> runs{};
+        const u64 run_key =
+            Common::HashCombine(vs_setup.GetProgramCodeHash(), u64{main}, u64{bools});
+        if (std::ranges::find(runs_told, run_key) == runs_told.end() && runs.load() < 8) {
+            runs_told[runs.fetch_add(1) % runs_told.size()] = run_key;
+            std::string words;
+            for (const Record& record : trace.records) {
+                if ((record.mask & Record::CUR_INSTR) == 0 ||
+                    record.instruction_offset >= code.size()) {
+                    continue;
+                }
+                const u32 word = code[record.instruction_offset];
+                const u32 pattern = (word >> 26) >= 0x30 ? word & 0x1F : word & 0x7F;
+                words += fmt::format(" {:03X}:{:08X}:{:08X}", record.instruction_offset, word,
+                                     swizzles[pattern]);
+            }
+            LOG_INFO(HW_GPU, "Vertex shader {:016X} from {:X}, bool uniforms {:04X}, its run:{}",
+                     vs_setup.GetProgramCodeHash(), main, bools, words);
+        }
+        const UniformSet& read = FloatUniformsRead();
+        LOG_INFO(HW_GPU,
+                 "Vertex shader {:016X} from {:X}, bool uniforms {:04X}, traced over {} "
+                 "instructions: {}; its way and what it multiplies by nothing go by uniforms "
+                 "{}{}; in all {} of the {} uniforms it reads matter",
+                 vs_setup.GetProgramCodeHash(), main, bools, trace.records.size(),
+                 known ? "followed to its end"
+                       : "not followed, it depends on the vertex where "
+                         "that cannot be gone into: nothing told",
+                 list(control), by_output,
+                 std::popcount(entry.matter[0]) + std::popcount(entry.matter[1]),
+                 std::popcount(read[0]) + std::popcount(read[1]));
+    }
+    return known ? &entry : nullptr;
+}
+
+const PicaCore::UniformSet& PicaCore::FloatUniformsCompared() {
+    if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::AllUniformsRead) == 0) {
+        if (const UniformsThatMatter* const found = FloatUniformsThatMatter()) {
+            return found->matter;
+        }
+    }
+    return FloatUniformsRead();
+}
+
+const PicaCore::UniformSet& PicaCore::FloatUniformsZeroSign() {
+    static constexpr UniformSet ALL{~u64{0}, ~u64{0}};
+    if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::AllUniformsRead) == 0) {
+        if (const UniformsThatMatter* const found = FloatUniformsThatMatter()) {
+            return found->zero_sign;
+        }
+    }
+    return ALL;
 }
 
 void PicaCore::FlushSoftwareBatch() {
@@ -898,9 +1614,33 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
     case PICA_REG_INDEX(pipeline.command_buffer.trigger[1]): {
         const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
         const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
-        const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
-        const u8* head = memory.GpuRead(addr, size);
-        memory.NoteGpuReference(addr, size, Memory::GpuReference::CalledList);
+        u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
+        // The list as it was when the one that jumps to it was handed over, if it was taken
+        // along then: the game may have been told since that all of this is done, and be
+        // writing its next lists to the same place
+        const u8* head = size != 0 ? TakenCalledList(addr, size) : nullptr;
+        if (head == nullptr && size != 0) {
+            if (memory.PhysicalBytesFrom(addr) >= size) {
+                head = memory.GpuRead(addr, size);
+                memory.NoteGpuReference(addr, size, Memory::GpuReference::CalledList);
+            }
+            if (head == nullptr) {
+                static std::atomic<u32> told{};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_ERROR(HW_GPU,
+                              "A command list jumps to {:08X} ({} bytes), which is not in the "
+                              "emulated memory: the list ends there",
+                              addr, size);
+                }
+            }
+        }
+        if (head == nullptr) {
+            // Nothing to carry out. (What the command that jumped has left of parameters is
+            // read from the beginning of the list jumped to: nothing but zeroes here.)
+            static constexpr std::array<u32, LIST_SLACK / sizeof(u32)> NOTHING{};
+            head = reinterpret_cast<const u8*>(NOTHING.data());
+            size = 0;
+        }
         if ((Common::TraceMarkers::Experiments2() & Common::TraceMarkers::MeasureCommandLists) != 0)
             [[unlikely]] {
             MeasureCalledList(head, size, addr);
@@ -1481,6 +2221,9 @@ public:
         Cover();
         return covers && exactly;
     }
+    bool CoverTestIsCostly() const override {
+        return !immediate && IsLarge();
+    }
     bool ViewportSpansTarget() override {
         const auto& rasterizer = pica.regs.internal.rasterizer;
         return rasterizer.viewport_corner.x <= 0 &&
@@ -1507,7 +2250,18 @@ public:
         return pica.vs_setup.uniforms.f;
     }
     const UniformSet& UniformsRead() override {
-        return pica.FloatUniformsRead();
+        return pica.FloatUniformsCompared();
+    }
+    const UniformSet& UniformsZeroSign() override {
+        return pica.FloatUniformsZeroSign();
+    }
+    bool OutputHash(u64& hash) override {
+        if (!output_known) {
+            output_ok = !immediate && pica.SmallDrawOutputHash(is_indexed, output_hash);
+            output_known = true;
+        }
+        hash = output_hash;
+        return output_ok;
     }
 
 private:
@@ -1538,6 +2292,9 @@ private:
     bool exactly{};
     bool large_known{};
     bool large_covers{};
+    bool output_known{};
+    bool output_ok{};
+    u64 output_hash{};
     Overwrites may;
     std::array<bool, 2> hash_known{};
     std::array<u64, 2> hash{};
@@ -1812,25 +2569,38 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
         shader_unit.WriteOutput(regs.internal.vs, output);
         const OutputVertex shaded{regs.internal.rasterizer, output};
 
+        // What follows is the quick way, for two triangles with their corners at those of
+        // the viewport, which is how nearly every full-screen pass is drawn. Two triangles
+        // that are not that may cover the viewport all the same (New Super Mario Bros. 2
+        // clears with a quad many times its size): the way for any small mesh finds out,
+        // which cuts triangles at the depth range and at the viewport as the GPU does.
         const f32 w = shaded.pos.w.ToFloat32();
         if (!(w > 0.f)) {
-            return false;
+            return MeshCoversViewport(is_indexed, exactly);
         }
         // A vertex in front of or behind the depth range has its triangle cut
         const f32 z = shaded.pos.z.ToFloat32() / w;
         if (!(z <= DEPTH_TOLERANCE && z >= -1.f - DEPTH_TOLERANCE)) {
-            return false;
+            return MeshCoversViewport(is_indexed, exactly);
         }
         const f32 x = shaded.pos.x.ToFloat32() / w;
         const f32 y = shaded.pos.y.ToFloat32() / w;
         const Common::Vec2<f32> offset{(std::abs(x) - 1.f) * width / 2.f,
                                        (std::abs(y) - 1.f) * height / 2.f};
-        if (!(offset.x >= -MAX_INSIDE && offset.x <= MAX_OUTSIDE && offset.y >= -MAX_INSIDE &&
-              offset.y <= MAX_OUTSIDE)) {
+        if (!(offset.x >= -MAX_INSIDE && offset.y >= -MAX_INSIDE)) {
+            // Inside the viewport: with a corner of theirs in it two triangles leave a part of
+            // it uncovered (but for one of them covering it alone, which no game was seen to
+            // draw). This is where every sprite ends, without more being asked of it.
             CITRA_FRAME_DUMP("  draw: vertex {} at {},{} is {},{} pixels off a corner of the "
                              "viewport",
                              index, x, y, offset.x, offset.y);
             return false;
+        }
+        if (!(offset.x <= MAX_OUTSIDE && offset.y <= MAX_OUTSIDE)) {
+            CITRA_FRAME_DUMP("  draw: vertex {} at {},{} is {},{} pixels outside of the "
+                             "viewport: looked at as a mesh",
+                             index, x, y, offset.x, offset.y);
+            return MeshCoversViewport(is_indexed, exactly);
         }
         offsets[index] = offset;
         positions[index] = {x, y};
@@ -1853,13 +2623,13 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
     const s32 first_lacks = lacking(first);
     const s32 second_lacks = lacking(second);
     if (first_lacks < 0 || second_lacks < 0 || (first_lacks ^ second_lacks) != 3) {
-        return false;
+        return MeshCoversViewport(is_indexed, exactly);
     }
     // No gap along that diagonal: the two triangles end in the same places
     for (const u32 a : first) {
         for (const u32 b : second) {
             if (corners[a] == corners[b] && offsets[a] != offsets[b]) {
-                return false;
+                return MeshCoversViewport(is_indexed, exactly);
             }
         }
     }
@@ -2081,6 +2851,20 @@ bool PicaCore::ForDrawnTriangles(bool is_indexed, u32 most_vertices, f32& width,
         } else {
             corner = {0, triangle + 1, triangle + 2};
         }
+        // A triangle that is wholly beyond one side of the viewport covers nothing of it, and
+        // neither does what the cuts below leave of it: no more is done with it. Of a backdrop
+        // around the camera most triangles are such. (That this changes no pixel was checked
+        // against the path without it on two million triangles: cover_test.cpp, kept with the
+        // notes of 2026-11-22.)
+        {
+            const ClipPoint& a = at[corner[0]];
+            const ClipPoint& b = at[corner[1]];
+            const ClipPoint& c = at[corner[2]];
+            if ((a.x > a.w && b.x > b.w && c.x > c.w) || (a.x < -a.w && b.x < -b.w && c.x < -c.w) ||
+                (a.y > a.w && b.y > b.w && c.y > c.w) || (a.y < -a.w && b.y < -b.w && c.y < -c.w)) {
+                continue;
+            }
+        }
         // What is in front of the depth range, behind it or behind the eye is cut off, as the
         // console and the host do (a box around the scene, as a game may clear with, has faces
         // that reach behind the range). As far outside of it as CoversViewport lets a vertex
@@ -2239,12 +3023,35 @@ bool PicaCore::LargeMeshCoversPixels(bool is_indexed, u64 state) {
                 cover_bits.assign(std::size_t{rows} * words, 0);
             }
             triangles++;
+            // Its edges, each from its lower end to its upper one, with how far it goes
+            // sideways for each row it goes up: a row asks every edge where it is at the
+            // row's height, which is then a multiplication and no division
+            struct Edge {
+                f32 low;
+                f32 high;
+                f32 x_low;
+                f32 x_high;
+                f32 slope;
+            };
+            std::array<Edge, 12> edges;
+            if (shape.size() > edges.size()) {
+                // (Not counted on)
+                return true;
+            }
             f32 lowest = shape[0].y;
             f32 highest = shape[0].y;
-            for (const Point& point : shape) {
-                lowest = std::min(lowest, point.y);
-                highest = std::max(highest, point.y);
+            for (std::size_t i = 0; i < shape.size(); i++) {
+                const Point& from = shape[i];
+                const Point& to = shape[(i + 1) % shape.size()];
+                const Point& lower = from.y <= to.y ? from : to;
+                const Point& upper = from.y <= to.y ? to : from;
+                edges[i] =
+                    Edge{lower.y, upper.y, lower.x, upper.x,
+                         upper.y != lower.y ? (upper.x - lower.x) / (upper.y - lower.y) : 0.f};
+                lowest = std::min(lowest, from.y);
+                highest = std::max(highest, from.y);
             }
+            const std::size_t edge_count = shape.size();
             const s32 first_row =
                 std::max<s32>(0, static_cast<s32>(std::ceil(lowest - 0.5f - HAIR)));
             const s32 last_row = std::min<s32>(static_cast<s32>(rows) - 1,
@@ -2254,17 +3061,16 @@ bool PicaCore::LargeMeshCoversPixels(bool is_indexed, u64 state) {
                 const f32 y = static_cast<f32>(row) + 0.5f;
                 f32 left = std::numeric_limits<f32>::max();
                 f32 right = std::numeric_limits<f32>::lowest();
-                for (std::size_t i = 0; i < shape.size(); i++) {
-                    const Point& from = shape[i];
-                    const Point& to = shape[(i + 1) % shape.size()];
-                    if (!((from.y <= y && to.y >= y) || (to.y <= y && from.y >= y))) {
+                for (std::size_t i = 0; i < edge_count; i++) {
+                    const Edge& edge = edges[i];
+                    if (!(edge.low <= y && edge.high >= y)) {
                         continue;
                     }
-                    if (from.y == to.y) {
-                        left = std::min({left, from.x, to.x});
-                        right = std::max({right, from.x, to.x});
+                    if (edge.low == edge.high) {
+                        left = std::min({left, edge.x_low, edge.x_high});
+                        right = std::max({right, edge.x_low, edge.x_high});
                     } else {
-                        const f32 x = from.x + (y - from.y) * (to.x - from.x) / (to.y - from.y);
+                        const f32 x = edge.x_low + (y - edge.low) * edge.slope;
                         left = std::min(left, x);
                         right = std::max(right, x);
                     }
@@ -2315,6 +3121,48 @@ bool PicaCore::LargeMeshCoversPixels(bool is_indexed, u64 state) {
         known->rest = REST;
     }
     return false;
+}
+
+bool PicaCore::SmallDrawOutputHash(bool is_indexed, u64& hash) {
+    const auto& pipeline = regs.internal.pipeline;
+    const u32 count = pipeline.num_vertices;
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || !primitive_assembler.IsEmpty() ||
+        count == 0 || count > MAX_COVER_VERTICES) {
+        return false;
+    }
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const u8* index_address_8 = memory.GpuRead(
+        base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
+    if (is_indexed && index_address_8 == nullptr) {
+        return false;
+    }
+    const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+    const bool index_u16 = index_info.format != 0;
+
+    const VertexLoader loader(memory, pipeline);
+    ShaderUnit shader_unit;
+    ShaderEngine& engine = EngineForFewVertices();
+    // The output registers that are switched on, which is what the rasterizer is given of a
+    // vertex, in their order
+    const std::size_t outputs = std::min<std::size_t>(
+        std::popcount(static_cast<u32>(regs.internal.vs.output_mask)), AttributeBuffer{}.size());
+    u64 result = Common::HashCombine(u64{count}, u64{outputs});
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        shader_unit.LoadInput(regs.internal.vs, input);
+        engine.Run(vs_setup, shader_unit);
+        AttributeBuffer output;
+        shader_unit.WriteOutput(regs.internal.vs, output);
+        result = Common::HashCombine(
+            result, Common::ComputeHash64(output.data(), outputs * sizeof(output[0])));
+    }
+    hash = result;
+    return true;
 }
 
 bool PicaCore::TextureRowsOfDraw(bool is_indexed, VideoCore::DrawTextureRows& rows) {
@@ -2544,6 +3392,48 @@ void PicaCore::DumpSmallDraw(bool is_indexed) {
             shaded.color.w.ToFloat32(), shaded.pos.z.ToFloat32() / w);
     }
     VideoCore::FrameStateDump::Line(std::move(text));
+    if (!whole) {
+        return;
+    }
+    // What went into the shader: the vertices as loaded (which of them, and their first
+    // attributes) and the float uniforms that are not zero. Tells a draw whose data is wrong
+    // from one whose constants are.
+    std::string inputs =
+        fmt::format("  draw inputs: base {:08X} indices at {:08X} ({} bytes each) loaders",
+                    base_address, base_address + index_info.offset, index_u16 ? 2 : 1);
+    for (const auto& attribute_loader : pipeline.vertex_attributes.attribute_loaders) {
+        if (attribute_loader.component_count != 0 && attribute_loader.byte_count != 0) {
+            inputs += fmt::format(" +{:X}/{}", attribute_loader.data_offset.Value(),
+                                  attribute_loader.byte_count.Value());
+        }
+    }
+    inputs += " |";
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        inputs += fmt::format(" #{}", vertex);
+        for (u32 attribute = 0; attribute < 3; attribute++) {
+            inputs += fmt::format("({:.3f},{:.3f},{:.3f},{:.3f})", input[attribute].x.ToFloat32(),
+                                  input[attribute].y.ToFloat32(), input[attribute].z.ToFloat32(),
+                                  input[attribute].w.ToFloat32());
+        }
+    }
+    VideoCore::FrameStateDump::Line(std::move(inputs));
+    std::string uniforms = "  draw uniforms:";
+    u32 shown = 0;
+    for (u32 i = 0; i < 96 && shown < 48; i++) {
+        const auto& value = vs_setup.uniforms.f[i];
+        if (value.x.ToFloat32() != 0.f || value.y.ToFloat32() != 0.f ||
+            value.z.ToFloat32() != 0.f || value.w.ToFloat32() != 0.f) {
+            uniforms += fmt::format(" c{}=({:.3f},{:.3f},{:.3f},{:.3f})", i, value.x.ToFloat32(),
+                                    value.y.ToFloat32(), value.z.ToFloat32(), value.w.ToFloat32());
+            shown++;
+        }
+    }
+    VideoCore::FrameStateDump::Line(std::move(uniforms));
 }
 #endif
 
@@ -2668,6 +3558,240 @@ void PicaCore::LoadVertices(bool is_indexed) {
         // Send to geometry pipeline
         geometry_pipeline.SubmitVertex(vs_output);
     }
+}
+
+namespace {
+
+/// The first of the two registers that start a jump, among the places of SCAN_SLOTS
+constexpr s8 SCAN_JUMP = static_cast<s8>(PicaCore::ListScanState::Count);
+
+/// For each register what TakeCalledLists has to do with it: -1 nothing, a place in
+/// ListScanState::regs for one it follows, SCAN_JUMP and SCAN_JUMP + 1 for the two that start
+/// a jump
+constexpr std::array<s8, RegsInternal::NUM_REGS> SCAN_SLOTS = [] {
+    using State = PicaCore::ListScanState;
+    std::array<s8, RegsInternal::NUM_REGS> slots{};
+    for (s8& slot : slots) {
+        slot = -1;
+    }
+    slots[PICA_REG_INDEX(irq_request)] = State::IrqRequest;
+    slots[PICA_REG_INDEX(irq_compare)] = State::IrqCompare;
+    slots[PICA_REG_INDEX(irq_autostop)] = State::IrqAutostop;
+    slots[PICA_REG_INDEX(pipeline.command_buffer.size[0])] = State::Size0;
+    slots[PICA_REG_INDEX(pipeline.command_buffer.size[0]) + 1] = State::Size1;
+    slots[PICA_REG_INDEX(pipeline.command_buffer.addr[0])] = State::Addr0;
+    slots[PICA_REG_INDEX(pipeline.command_buffer.addr[0]) + 1] = State::Addr1;
+    slots[PICA_REG_INDEX(pipeline.command_buffer.trigger[0])] = SCAN_JUMP;
+    slots[PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + 1] = SCAN_JUMP + 1;
+    return slots;
+}();
+
+/// Whether any of the registers `low` to `high` is one TakeCalledLists has to do with
+constexpr bool RunHasScanSlot(u32 low, u32 high) {
+    const auto has = [low, high](u32 reg) { return low <= reg && reg <= high; };
+    return has(PICA_REG_INDEX(irq_request)) || has(PICA_REG_INDEX(irq_compare)) ||
+           has(PICA_REG_INDEX(irq_autostop)) ||
+           (low <= PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + 1 &&
+            high >= PICA_REG_INDEX(pipeline.command_buffer.size[0]));
+}
+
+} // Anonymous namespace
+
+PicaCore::ListScanState PicaCore::ListScanStateNow() const {
+    const auto& reg = regs.internal.reg_array;
+    ListScanState state;
+    for (u32 id = 0; id < RegsInternal::NUM_REGS; id++) {
+        if (const s8 slot = SCAN_SLOTS[id]; slot >= 0 && slot < SCAN_JUMP) {
+            state.regs[slot] = reg[id];
+        }
+    }
+    return state;
+}
+
+bool PicaCore::TakeCalledLists(Memory::MemorySystem& memory, const u8* bytes, u32 size,
+                               u32 readable, ListScanState& state,
+                               std::vector<CalledListCopy>& lists, std::vector<u8>& taken) {
+    // More than any game's frame has (Kirby: Planet Robobot jumps some 3000 times a frame).
+    // A list that jumps to itself would go on for ever.
+    constexpr std::size_t MOST_LISTS = 32768;
+    constexpr std::size_t MOST_BYTES = 16 << 20;
+
+    // The list being followed: its words, how many of them are the list and how many may be
+    // read. This walks as ProcessCmdList does, down to what that does with a command whose
+    // parameters reach beyond its list, so that the two come by the same jumps.
+    const u32* head = reinterpret_cast<const u32*>(bytes);
+    u32 length = size / sizeof(u32);
+    u32 words = std::max(readable, size) / sizeof(u32);
+    u32 index = 0;
+    bool stop = false;
+    bool all = true;
+    // Of the list jumped to that the walk is in (none while it is in the list handed over):
+    // where it is in memory and in `taken`, how much of it is there to take and was taken
+    bool in_taken = false;
+    PAddr taken_addr = 0;
+    std::size_t taken_offset = 0;
+    u32 taken_in_memory = 0;
+    u32 taken_bytes = 0;
+
+    const auto handle = [&](u32 id, u32 value, u32 mask) {
+        const s8 slot = SCAN_SLOTS[id];
+        if (slot < SCAN_JUMP) {
+            const u32 write_mask = ExpandBitsToBytes[mask];
+            state.regs[slot] = (state.regs[slot] & ~write_mask) | (value & write_mask);
+            // The interrupt a list ends with: the decoder stops there
+            stop = static_cast<u32>(slot) == ListScanState::IrqRequest &&
+                   any_byte_match(state.regs[ListScanState::IrqRequest],
+                                  state.regs[ListScanState::IrqCompare]) &&
+                   state.regs[ListScanState::IrqAutostop] != 0;
+            return;
+        }
+        // A jump: the list goes on in another one
+        const u32 which = static_cast<u32>(slot - SCAN_JUMP);
+        const PAddr addr = 8 * (state.regs[ListScanState::Addr0 + which] & 0x0FFFFFFF);
+        const u32 list_size = 8 * (state.regs[ListScanState::Size0 + which] & 0x000FFFFF);
+        const u32 in_memory = memory.PhysicalBytesFrom(addr);
+        if (list_size == 0 || in_memory < list_size) {
+            // Nothing there to go on with: the decoder ends the list here as well
+            stop = true;
+            return;
+        }
+        if (lists.size() >= MOST_LISTS || taken.size() + list_size > MOST_BYTES) {
+            all = false;
+            stop = true;
+            return;
+        }
+        // The list and the two words after it, which the decoder reads where a list has an
+        // odd number of words. More of what follows only once a command reaches there.
+        const u32 take = std::min(in_memory, list_size + 8);
+        const std::size_t offset = (taken.size() + 7) & ~std::size_t{7};
+        taken.resize(offset);
+        const u8* const from = memory.GetPhysicalPointer(addr);
+        taken.insert(taken.end(), from, from + take);
+        lists.push_back(CalledListCopy{addr, list_size, static_cast<u32>(offset)});
+        in_taken = true;
+        taken_addr = addr;
+        taken_offset = offset;
+        taken_in_memory = in_memory;
+        taken_bytes = take;
+        // (`taken` may have moved: the walk is in it only from here to the next jump)
+        head = reinterpret_cast<const u32*>(taken.data() + offset);
+        length = list_size / sizeof(u32);
+        words = take / sizeof(u32);
+        index = 0;
+    };
+
+    while (index < length && !stop) {
+        if (index % 2 != 0) {
+            index++;
+        }
+        if (index + 1 >= words) {
+            break;
+        }
+        const u32 value = head[index];
+        const CommandHeader header{head[index + 1]};
+        index += 2;
+        const u32 id = header.cmd_id;
+        const u32 count = header.extra_data_length;
+        const bool followed = id < RegsInternal::NUM_REGS && SCAN_SLOTS[id] >= 0;
+        if (followed) [[unlikely]] {
+            handle(id, value, header.parameter_mask);
+            if (stop) {
+                break;
+            }
+        }
+        if (count == 0) {
+            continue;
+        }
+        // The parameters that follow, read where the list is now: after a jump that is the
+        // beginning of the list jumped to
+        const u32 first = index;
+        index += count;
+        if (first + count > words && in_taken) [[unlikely]] {
+            // It says it has more parameters than its list has room for. They are read from
+            // what follows the list in memory, which is taken along now: the list is the last
+            // in `taken`, so it is added on.
+            const u32 want = std::min<u64>(taken_in_memory, u64{first + count} * sizeof(u32) + 8);
+            if (want > taken_bytes) {
+                const u8* const from = memory.GetPhysicalPointer(taken_addr);
+                taken.insert(taken.end(), from + taken_bytes, from + want);
+                taken_bytes = want;
+                head = reinterpret_cast<const u32*>(taken.data() + taken_offset);
+                words = want / sizeof(u32);
+            }
+        }
+        const u32 have = first < words ? std::min(count, words - first) : 0;
+        if (have == 0) {
+            continue;
+        }
+        if (!header.group_commands) {
+            // The same register again and again: it keeps the last, and what writing it sets
+            // off comes to the same however often
+            if (followed) [[unlikely]] {
+                handle(id, head[first + have - 1], header.parameter_mask);
+            }
+            continue;
+        }
+        // The registers after it, one after the other. Those followed are picked out first:
+        // a jump among them moves the walk, and the rest are still the old list's.
+        if (!RunHasScanSlot(id + 1, id + have)) [[likely]] {
+            continue;
+        }
+        std::array<std::pair<u32, u32>, 16> found;
+        u32 found_count = 0;
+        for (u32 i = 0; i < have && id + 1 + i < RegsInternal::NUM_REGS; i++) {
+            if (SCAN_SLOTS[id + 1 + i] >= 0 && found_count < found.size()) {
+                found[found_count++] = {id + 1 + i, head[first + i]};
+            }
+        }
+        for (u32 i = 0; i < found_count && !stop; i++) {
+            handle(found[i].first, found[i].second, header.parameter_mask);
+        }
+    }
+    // Whatever the decoder reads behind the last list is in the buffer: also where a list
+    // ends with the memory it is in, and nothing could be taken of what follows
+    if (!taken.empty()) {
+        taken.resize(taken.size() + LIST_SLACK);
+    }
+    return all;
+}
+
+const u8* PicaCore::TakenCalledList(PAddr addr, u32 size) {
+    if (called_lists == nullptr) {
+        return nullptr;
+    }
+    // The copies are in the order of the jumps. (The one before once more: a jump that is
+    // written several times over.)
+    const auto is = [&](std::size_t at) {
+        return at < called_lists->size() && (*called_lists)[at].addr == addr &&
+               (*called_lists)[at].size == size;
+    };
+    const u8* copy = nullptr;
+    if (is(called_next)) {
+        copy = called_bytes + (*called_lists)[called_next].offset;
+        called_next++;
+    } else if (called_next != 0 && is(called_next - 1)) {
+        copy = called_bytes + (*called_lists)[called_next - 1].offset;
+    }
+    if (copy == nullptr) {
+        (called_next >= called_lists->size() ? called_past_copies : called_another)
+            .fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    called_from_copy.fetch_add(1, std::memory_order_relaxed);
+    // For the log: whether the game has written to the list since it handed it over
+    if (const u8* const now = memory.GetPhysicalPointer(addr);
+        now != nullptr && std::memcmp(copy, now, size) != 0) {
+        called_rewritten.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<u32> told{};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 6) {
+            LOG_INFO(HW_GPU,
+                     "A list a command list jumps to ({:08X}, {} bytes) was written to by the "
+                     "game between its hand-over and its decoding; decoded as it was at "
+                     "hand-over",
+                     addr, size);
+        }
+    }
+    return copy;
 }
 
 PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u32 size) {

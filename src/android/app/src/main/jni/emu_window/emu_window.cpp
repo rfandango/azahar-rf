@@ -110,6 +110,34 @@ std::optional<CoreSets> FindFastCores() {
 /// frame's work takes several times longer. The performance hint below asks for the opposite,
 /// but not every device acts on it.
 void KeepOffSlowCores() {
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    // Profiling builds put the thread on the cores a system property names instead, to see on
+    // this device's slow cores what a device made of such cores gets from a change:
+    // `adb shell setprop debug.azahar.emu_cores f` (a mask in hex, read when the game starts).
+    static const unsigned long asked = [] {
+        char value[PROP_VALUE_MAX]{};
+        return __system_property_get("debug.azahar.emu_cores", value) > 0
+                   ? std::strtoul(value, nullptr, 16)
+                   : 0ul;
+    }();
+    if (asked != 0) {
+        static thread_local bool placed = false;
+        if (!placed) {
+            placed = true;
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            for (int cpu = 0; cpu < 64; cpu++) {
+                if ((asked >> cpu) & 1) {
+                    CPU_SET(cpu, &set);
+                }
+            }
+            const int result = sched_setaffinity(0, sizeof(set), &set);
+            LOG_INFO(Frontend, "Emulation thread put on the cores of mask {:x} on request: {}",
+                     asked, result == 0 ? "done" : "refused");
+        }
+        return;
+    }
+#endif
     static const std::optional<CoreSets> cores = FindFastCores();
     if (!cores) {
         return;
@@ -188,6 +216,13 @@ void PollBlockDumpRequest() {
     }
     std::fclose(out);
     LOG_INFO(Frontend, "Wrote the recompiler's blocks to {}", path);
+    // With it, for a count of what ran between two of these: the emulated time so far
+    LOG_INFO(Frontend, "Guest time so far: {} ticks at {} ns (request {})",
+             Common::TraceMarkers::GuestTicks(),
+             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+                 .count(),
+             request);
 }
 
 /// Applies the settings anew when `debug.azahar.reapply` changes, as the app does on another

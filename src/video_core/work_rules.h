@@ -110,6 +110,11 @@ public:
     /// while again once it turned out not to cover; the second is always false of one.
     virtual bool CoversViewport() = 0;
     virtual bool CoversViewportExactly() = 0;
+    /// Whether finding out CoversViewport is costly for this draw: a mesh, of which hundreds
+    /// of vertices are shaded and every pixel of the viewport is looked at (a few tenths of a
+    /// millisecond). A rule asks it of such a draw only where the answer can change what is
+    /// left out.
+    virtual bool CoverTestIsCostly() const = 0;
     /// Its viewport is as wide as its target, so that what covers the viewport covers rows
     virtual bool ViewportSpansTarget() = 0;
     /// How its texture coordinates go with the rows of its target. False if in no known way.
@@ -125,6 +130,17 @@ public:
     /// that its program can read
     virtual const FloatUniforms& Uniforms() const = 0;
     virtual const UniformSet& UniformsRead() = 0;
+    /// Of those, the ones in which plus zero and minus zero are not the same thing to the
+    /// shader: it takes a reciprocal of something they went into. In the others the two are
+    /// different bytes and the same number, and make no pixel differ.
+    virtual const UniformSet& UniformsZeroSign() = 0;
+    /// For a draw of a few vertices: a hash over all that its vertex shader puts out for
+    /// them, vertex by vertex and bit for bit. Two draws with the same registers and textures
+    /// that put out the same make the same fragments, whatever uniforms the shader was given:
+    /// a shader may read one that the game last set for another draw and that changes nothing
+    /// of what this draw puts out. Shades the vertices to find out. False for a draw of many
+    /// vertices and for one whose vertices cannot be shaded here.
+    virtual bool OutputHash(u64& hash) = 0;
 
 protected:
     ~DrawFacts() = default;

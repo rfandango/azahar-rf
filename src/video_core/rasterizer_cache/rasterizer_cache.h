@@ -475,10 +475,17 @@ typename T::Sampler& RasterizerCache<T>::GetSampler(
         .lod_bias = config.lod.bias,
     };
 
+    for (const auto& [asked, id] : recent_samplers) {
+        if (id && asked == params) {
+            return slot_samplers[id];
+        }
+    }
+
     auto [it, is_new] = samplers.try_emplace(params);
     if (is_new) {
         it->second = slot_samplers.insert(runtime, params);
     }
+    recent_samplers[recent_sampler_next++ % recent_samplers.size()] = {params, it->second};
 
     return slot_samplers[it->second];
 }
@@ -1332,11 +1339,48 @@ bool RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
             // beside it keep what the image had there, where the long way round would have put
             // what the range's bytes mean in this format. Nothing reads those either until a
             // draw with a wider viewport comes, which finds old depth values there.
-            CITRA_FRAME_DUMP("cache takes {} @{:08X} +{:X} without what it held: all of it is "
-                             "about to be overwritten",
-                             PixelFormatAsString(surface.pixel_format), addr, size);
-            surface.MarkValid(validate_interval);
-            return true;
+            //
+            // That holds for what the image has been given before. A part of it that nothing
+            // was ever written to is another matter: it is not old depth values but memory as
+            // the image was made with, and the GPU must not be handed that to load or to draw
+            // into beside. (New Super Mario Bros. 2 draws its map into a target of 256x416
+            // through a viewport of 240x400, from a clear that is drawn; the depth image, new
+            // with the scene, went to its first render pass with nothing in it, and the whole
+            // device reset, on an Adreno 650 with Turnip, three times out of three.) Such a
+            // part is cleared, which a render pass does as it begins and costs next to
+            // nothing; where it is not whole rows the range goes the long way after all.
+            bool whole_rows = true;
+            boost::container::small_vector<SurfaceInterval, 4> never_given;
+            for (const auto& piece : SurfaceRegions{validate_regions - surface.given_regions}) {
+                whole_rows = whole_rows && surface.FromInterval(piece).GetInterval() == piece;
+                never_given.push_back(piece);
+            }
+            if (whole_rows) {
+                for (const SurfaceInterval& piece : never_given) {
+                    const SurfaceParams rows = surface.FromInterval(piece);
+                    const bool is_depth = surface.type == SurfaceType::Depth ||
+                                          surface.type == SurfaceType::DepthStencil;
+                    TextureClear clear{
+                        .texture_level = surface.LevelOf(boost::icl::first(piece)),
+                        .texture_rect = surface.GetScaledSubRect(rows),
+                    };
+                    if (is_depth) {
+                        clear.value.depth = 1.f;
+                        clear.value.stencil = 0;
+                    } else {
+                        clear.value.color = Common::Vec4f{0.f, 0.f, 0.f, 0.f};
+                    }
+                    runtime.ClearTexture(surface, clear);
+                }
+                CITRA_FRAME_DUMP("cache takes {} @{:08X} +{:X} without what it held: all of it "
+                                 "is about to be overwritten{}",
+                                 PixelFormatAsString(surface.pixel_format), addr, size,
+                                 never_given.empty() ? ""
+                                                     : "; what the image never held anything "
+                                                       "for is cleared");
+                surface.MarkValid(validate_interval);
+                return true;
+            }
         }
         level = surface.LevelOf(addr);
         level_interval = surface.LevelInterval(level);
@@ -1971,7 +2015,14 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
     if (region_owner_id) {
         DropReadable(addr, size);
         memory.NoteGpuWritten(addr, size);
-        dirty_regions.set({invalid_interval, region_owner_id});
+        // A draw into what the draw before drew into finds the surface noted as the one
+        // that has the newest of the stretch: setting it again takes the stretch out of its
+        // piece and puts it back, to end up with the same piece
+        const auto held = dirty_regions.find(invalid_interval);
+        if (held == dirty_regions.end() || held->second != region_owner_id ||
+            !boost::icl::contains(held->first, invalid_interval)) {
+            dirty_regions.set({invalid_interval, region_owner_id});
+        }
     } else {
         dirty_regions.erase(invalid_interval);
     }
@@ -1996,31 +2047,151 @@ void RasterizerCache<T>::InvalidateRows(PAddr addr, u32 row_size, u32 row_stride
     ASSERT(addr >= region_owner.addr && addr + size <= region_owner.end);
     ASSERT(region_owner.width == region_owner.stride);
 
-    // A copy like this comes every frame, to the same rows, and finds most of what it has to
-    // note noted already. So each row is looked at where it stands and only changed where it
-    // is not as it has to be: every interval that goes into one of these sets is memory
-    // taken from the heap, and with the rows of a whole texture gathered in a set first, cut
-    // to each surface and added to its own, this was most of what such a copy cost
-    // (measured in Luigi's Mansion: 7.8% of the emulation thread).
+    // A copy like this comes every frame, to the same rows. What it has to note is noted row
+    // by row, since what lies between the rows stays as it is: but not by looking each row up
+    // from the top of a tree and cutting it out of the piece it lies in (three searches and a
+    // split for each row, in each of three sets: with the 416 rows Luigi's Mansion 2 copies
+    // every frame that was a tenth of the decoding thread's time). The rows come in the order
+    // of their addresses, and so do the pieces of a set: both are walked side by side, and a
+    // row goes in next to the piece before it. A piece that holds several rows is taken out
+    // once and put back around them. Only a row that lies partly in a piece is done the
+    // general way. The sets end up as they did before.
     const auto row_interval = [&](u32 row) {
         const PAddr row_addr = addr + row * row_stride;
         return SurfaceInterval(row_addr, row_addr + row_size);
     };
+    const SurfaceInterval span(addr, addr + size);
+    /// For a frame dump: rows put in where there was nothing, rows cut out of a piece, rows
+    /// that were as they have to be, rows done the general way
+    struct RowWalk {
+        u32 fresh{};
+        u32 cut{};
+        u32 as_is{};
+        u32 searched{};
+    };
 
-    for (u32 row = 0; row < rows; row++) {
-        const SurfaceInterval interval = row_interval(row);
-        const auto owned = dirty_regions.find(interval);
-        if (owned == dirty_regions.end() || owned->second != region_owner_id ||
-            !boost::icl::contains(owned->first, interval)) {
-            dirty_regions.set({interval, region_owner_id});
+    // Who has the newest of the rows: this surface
+    RowWalk newest{};
+    {
+        auto piece = dirty_regions.lower_bound(span);
+        u32 row = 0;
+        while (row < rows) {
+            const SurfaceInterval interval = row_interval(row);
+            while (piece != dirty_regions.end() && piece->first.upper() <= interval.lower()) {
+                ++piece;
+            }
+            if (piece == dirty_regions.end() || piece->first.lower() >= interval.upper()) {
+                // Nobody's: in it goes, before the piece that follows
+                piece = dirty_regions.insert(piece, {interval, region_owner_id});
+                newest.fresh++;
+                row++;
+                continue;
+            }
+            const PAddr piece_lower = piece->first.lower();
+            const PAddr piece_upper = piece->first.upper();
+            if (piece_lower > interval.lower() || piece_upper < interval.upper()) {
+                dirty_regions.set({interval, region_owner_id});
+                piece = dirty_regions.lower_bound(interval);
+                newest.searched++;
+                row++;
+                continue;
+            }
+            const SurfaceId other = piece->second;
+            if (other == region_owner_id) {
+                // This surface's already, and so are the rows after it within the piece
+                do {
+                    newest.as_is++;
+                    row++;
+                } while (row < rows && row_interval(row).upper() <= piece_upper);
+                continue;
+            }
+            // In a piece of another surface, like the rows after it as far as the piece goes
+            auto at = std::next(piece);
+            dirty_regions.erase(piece);
+            PAddr restored_to = piece_lower;
+            while (row < rows) {
+                const SurfaceInterval inside = row_interval(row);
+                if (inside.upper() > piece_upper) {
+                    break;
+                }
+                if (restored_to < inside.lower()) {
+                    at = dirty_regions.insert(
+                        at, {SurfaceInterval(restored_to, inside.lower()), other});
+                }
+                at = dirty_regions.insert(at, {inside, region_owner_id});
+                restored_to = inside.upper();
+                newest.cut++;
+                row++;
+            }
+            if (restored_to < piece_upper) {
+                at = dirty_regions.insert(at, {SurfaceInterval(restored_to, piece_upper), other});
+            }
+            piece = at;
         }
-        if (!region_owner.IsRegionValid(interval)) {
-            region_owner.invalid_regions.erase(interval);
+    }
+
+    // The rows are valid in this surface
+    RowWalk valid{};
+    {
+        SurfaceRegions& invalid = region_owner.invalid_regions;
+        auto piece = invalid.lower_bound(span);
+        u32 row = 0;
+        while (row < rows) {
+            const SurfaceInterval interval = row_interval(row);
+            while (piece != invalid.end() && piece->upper() <= interval.lower()) {
+                ++piece;
+            }
+            if (piece == invalid.end() || piece->lower() >= interval.upper()) {
+                valid.as_is++;
+                row++;
+                continue;
+            }
+            const PAddr piece_lower = piece->lower();
+            const PAddr piece_upper = piece->upper();
+            if (piece_lower > interval.lower() || piece_upper < interval.upper()) {
+                invalid.erase(interval);
+                piece = invalid.lower_bound(interval);
+                valid.searched++;
+                row++;
+                continue;
+            }
+            auto at = std::next(piece);
+            invalid.erase(piece);
+            PAddr restored_to = piece_lower;
+            while (row < rows) {
+                const SurfaceInterval inside = row_interval(row);
+                if (inside.upper() > piece_upper) {
+                    break;
+                }
+                if (restored_to < inside.lower()) {
+                    at = invalid.insert(at, SurfaceInterval(restored_to, inside.lower()));
+                }
+                restored_to = inside.upper();
+                valid.cut++;
+                row++;
+            }
+            if (restored_to < piece_upper) {
+                at = invalid.insert(at, SurfaceInterval(restored_to, piece_upper));
+            }
+            piece = at;
+        }
+        if (valid.cut + valid.searched != 0) {
+            // (What was valid before was given before)
+            if (!boost::icl::contains(region_owner.given_regions, span)) {
+                for (u32 given = 0; given < rows; given++) {
+                    region_owner.given_regions.insert(row_interval(given));
+                }
+            }
             SurfaceBase::validity_epoch++;
         }
     }
     // What the rows hold is new in any case
     region_owner.modification_tick++;
+    CITRA_FRAME_DUMP("  texcopy rows: the newest of {} rows is this surface's: {} put in where "
+                     "nobody had it, {} cut out of another surface's piece, {} were, {} the "
+                     "general way; valid in it: {} cut out, {} were, {} the general way",
+                     rows, newest.fresh, newest.cut, newest.as_is, newest.searched, valid.cut,
+                     valid.as_is, valid.searched);
 
     boost::container::small_vector<SurfaceId, 4> remove_surfaces;
     ForEachSurfaceInRegion(addr, size, [&](SurfaceId surface_id, Surface& surface) {
@@ -2028,15 +2199,39 @@ void RasterizerCache<T>::InvalidateRows(PAddr addr, u32 row_size, u32 row_stride
             return;
         }
         const SurfaceInterval whole = surface.GetInterval();
-        bool changed = false;
+        const SurfaceInterval within = span & whole;
+        if (boost::icl::is_empty(within)) {
+            return;
+        }
+        // The rows are not valid in any other surface
+        RowWalk theirs{};
+        SurfaceRegions& invalid = surface.invalid_regions;
+        auto piece = invalid.lower_bound(within);
         for (u32 row = 0; row < rows; row++) {
             const SurfaceInterval part = row_interval(row) & whole;
-            if (boost::icl::is_empty(part) || boost::icl::contains(surface.invalid_regions, part)) {
+            if (boost::icl::is_empty(part)) {
                 continue;
             }
-            surface.invalid_regions.insert(part);
+            while (piece != invalid.end() && piece->upper() <= part.lower()) {
+                ++piece;
+            }
+            if (piece == invalid.end() || piece->lower() >= part.upper()) {
+                piece = invalid.insert(piece, part);
+                theirs.fresh++;
+            } else if (piece->lower() <= part.lower() && piece->upper() >= part.upper()) {
+                theirs.as_is++;
+            } else {
+                invalid.insert(part);
+                piece = invalid.lower_bound(part);
+                theirs.searched++;
+            }
+        }
+        CITRA_FRAME_DUMP("  texcopy rows: surface at {:08X} ({} bytes): {} rows made invalid in "
+                         "it, {} were, {} the general way",
+                         surface.addr, surface.size, theirs.fresh, theirs.as_is, theirs.searched);
+        const bool changed = theirs.fresh + theirs.searched != 0;
+        if (changed) {
             SurfaceBase::validity_epoch++;
-            changed = true;
         }
         if (!changed) {
             return;
@@ -2272,8 +2467,13 @@ void RasterizerCache<T>::NoteCpuRead(PAddr addr, u32 size) {
         }
         // A page a surface has marked, with nothing on it that the host GPU has newer
         const PAddr start = page << Memory::CITRA_PAGE_BITS;
-        if (cached_pages.find(page) == cached_pages.end() ||
-            HoldsNewer(start, Memory::CITRA_PAGE_SIZE)) {
+        if (cached_pages.find(page) == cached_pages.end()) {
+            continue;
+        }
+        if (HoldsNewer(start, Memory::CITRA_PAGE_SIZE)) {
+            // Not to be read freely. Reads of what merely shares the page with the surface
+            // need not come here again (see Memory::MemorySystem::Impl::ReadTouchesSurface)
+            memory.RasterizerNotePageHoldsNewer(start);
             continue;
         }
         if (word >= readable_pages.size()) {

@@ -9,6 +9,7 @@
 #include <boost/serialization/split_member.hpp>
 #include "common/archives.h"
 #include "common/assert.h"
+#include "common/trace_markers.h"
 #include "core/core.h"
 #include "core/hle/kernel/errors.h"
 #include "core/hle/kernel/vm_manager.h"
@@ -225,6 +226,14 @@ Result VMManager::ReprotectRange(VAddr target, u32 size, VMAPermission new_perms
     // merged during this process, causing invalidation of the iterators.
     while (vma != end && vma->second.base < target_end) {
         vma = std::next(StripIterConstness(Reprotect(vma, new_perms)));
+    }
+
+    // Memory the process may write from here on: recompiled code that holds words of it as
+    // constants (Dynarmic::A32::UserConfig::fold_read_only_loads) is no longer right once it
+    // does
+    if ((static_cast<u8>(new_perms) & static_cast<u8>(VMAPermission::Write)) != 0 &&
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::LegacyLiteralLoads) == 0) {
+        Core::System::GetInstance().InvalidateCacheRange(target, size);
     }
 
     return ResultSuccess;

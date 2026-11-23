@@ -75,10 +75,12 @@ PerfStats::~PerfStats() {
 void PerfStats::BeginSVCProcessing() {
     // A game makes tens of thousands of system calls a second, and reading the clock at both
     // ends of each took 4% of all CPU time (Xenoblade Chronicles 3D on a Snapdragon 865,
-    // where reading the clock is a system call of the host). One call in sixteen is timed
-    // and stands for the others. The few calls that process GPU commands are far longer
-    // than the rest and would make such an estimate jump: that part is timed every time,
-    // and kept out of what is scaled up.
+    // where reading the clock is a system call of the host). One call in SVC_SAMPLE_INTERVAL
+    // is timed and stands for the others (one in sixteen still cost 0.6% of the emulation
+    // thread in that game, which makes 88,000 calls a second: one in sixty-four is still
+    // over a thousand timed a second there). The few calls that process GPU commands are
+    // far longer than the rest and would make such an estimate jump: that part is timed
+    // every time, and kept out of what is scaled up.
     svc_sample_interval =
         (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyEmulationOverheads)
             ? 1

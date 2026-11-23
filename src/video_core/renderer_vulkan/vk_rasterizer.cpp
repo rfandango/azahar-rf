@@ -1411,6 +1411,10 @@ void RasterizerVulkan::FlushRegion(PAddr addr, u32 size) {
             res_cache.NoteCpuRead(addr, size);
         }
         res_cache.NoteReadbackForGame(addr, size);
+        CITRA_FRAME_DUMP(
+            "game reads {:08X}+{}: the GPU holds newer there {}, on its page {}", addr, size,
+            res_cache.HoldsNewer(addr, size),
+            res_cache.HoldsNewer(addr & ~Memory::CITRA_PAGE_MASK, Memory::CITRA_PAGE_SIZE));
     }
     res_cache.FlushRegion(addr, size);
 }

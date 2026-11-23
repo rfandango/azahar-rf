@@ -755,6 +755,11 @@ public:
      * what other surfaces still cover of them.
      */
     void RasterizerSetSurfaceCells(PAddr start, u32 size, bool covered);
+    /// The rasterizer looked at the page for a read by the game and cannot let it be read
+    /// freely: a surface on it holds something newer than memory. Reads of the page that
+    /// touch nothing a surface covers are not announced from here on (until the page is
+    /// marked readable, or the cells are cleared). Emulation thread.
+    void RasterizerNotePageHoldsNewer(PAddr start);
 
     /// No surface covers anything any more
     void RasterizerClearSurfaceCells();
@@ -778,11 +783,23 @@ public:
     void SetGpuReader(bool transfer);
     /// At a hand-over. `for_list`, `for_transfer`: what is being handed over (a fill reads
     /// nothing). `queued_before` is the number of the last command handed over before this
-    /// one and `done` that of the last the decoder has finished. Returns in `pages` and
-    /// `bytes` the copies of the volatile pages the command may read (4 KiB each, in the
-    /// order of `pages`): pages the game keeps writing are not armed but copied.
+    /// one and `done` that of the last the decoder has finished. `source_addr`, `source_size`:
+    /// what a transfer or copy reads, which the command itself names: held from this hand-over
+    /// on like a page the decoder has read from before (the first time is the one that
+    /// matters: a game that puts data into video memory by a copy reuses the source as soon as
+    /// it is told the copy is done). Returns in `pages` and `bytes` the copies of the volatile
+    /// pages the command may read (4 KiB each, in the order of `pages`): pages the game keeps
+    /// writing are not armed but copied. `pages` comes empty; `bytes` comes with whatever it
+    /// held before and is only made longer, never shorter (a buffer passed from command to
+    /// command: see VideoCore::GPU::Impl::SpareBuffers).
+    /// `written`: what a fill, a transfer or a copy writes, named by the command as well: shut
+    /// from this hand-over on like pages the decoder has written before. (A game that clears
+    /// video memory and then puts data there itself finds the data cleared if the clearing is
+    /// carried out afterwards.)
     void ArmGpuReferences(bool for_list, bool for_transfer, u64 queued_before, u64 done,
-                          std::vector<u32>& pages, std::unique_ptr<u8[]>& bytes);
+                          PAddr source_addr, u32 source_size,
+                          std::span<const std::pair<PAddr, u32>> written, std::vector<u32>& pages,
+                          std::vector<u8>& bytes);
     /// A write went to a page the decoder reads from while the decoder has work: the page is
     /// to be copied at hand-overs from now on, and stays armed until what is queued is done
     void WantVolatile(PAddr addr, u32 size);
@@ -798,6 +815,22 @@ public:
     /// Pages copied for commands that are done, and how many of those copies the decoder
     /// read, since this was last asked
     std::pair<u64, u64> TakeSnapshotReadFigures();
+    /// Of the volatile pages now: how many had a copy read by the decoder within the last 256
+    /// commands that came with copies, within the last 2048, longer ago, and never; where
+    /// the first and the last of them are, and in how many runs of pages next to each other.
+    /// And how many pages were forgotten for not being read (since this was last asked).
+    struct VolatileAges {
+        std::array<u32, 4> read{};
+        /// How many of the pages the decoder last read as each GpuReference, and how many of
+        /// those had a copy read within 256 commands
+        std::array<u32, 5> kinds{};
+        std::array<u32, 5> kinds_read{};
+        PAddr first{};
+        PAddr last{};
+        u32 runs{};
+        u32 forgotten{};
+    };
+    VolatileAges VolatileAgesNow();
     void Disarm(PAddr addr, u32 size, bool written);
 
     /// For what the rasterizer gives the game late (a small image the game reads back every
@@ -818,6 +851,11 @@ public:
 
     /// Gets a pointer to the memory region beginning at the specified physical address.
     u8* GetPhysicalPointer(PAddr address);
+
+    /// How many bytes from the physical address on are in the same stretch of the emulated
+    /// memory as it, which GetPhysicalPointer's pointer may be read for; none where the
+    /// address is in no memory. Unlike GetPhysicalPointer it writes nothing to the log.
+    u32 PhysicalBytesFrom(PAddr address) const;
 
     /// Returns a reference to the memory region beginning at the specified physical address
     MemoryRef GetPhysicalRef(PAddr address);

@@ -75,6 +75,9 @@ private:
     /// Hands the code this core's recompilers produce to the title's code cache, if it has one
     std::unique_ptr<DynarmicCodeCache> code_cache;
     std::unique_ptr<Dynarmic::A32::Jit> MakeJit();
+    /// Whether the recompilers made here turn loads from read-only code memory into constants
+    /// (Dynarmic::A32::UserConfig::fold_read_only_loads): what the callbacks answer by
+    bool fold_read_only_loads = false;
 
     u32 fpexc = 0;
     CP15State cp15_state;

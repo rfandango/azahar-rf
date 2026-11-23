@@ -27,7 +27,10 @@
 #ifdef ENABLE_GDBSTUB
 #include "core/gdbstub/gdbstub.h"
 #endif
+#include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/process.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/vm_manager.h"
 #include "core/memory.h"
 
 #ifndef SIGILL
@@ -74,6 +77,32 @@ public:
     }
     void MemoryWrite64(VAddr vaddr, std::uint64_t value) override {
         memory.Write64(vaddr, value);
+    }
+
+    /// The word at `vaddr` is of the running process's code or of the constants loaded with
+    /// it, in memory the process cannot write. Nothing else: memory the system writes and the
+    /// process only reads (the shared page with the clock, the configuration block, a block
+    /// shared with a service) is read-only to the game and changes all the same. Whoever
+    /// patches such a word in the game's place (loading a module, a cheat) says so to the
+    /// recompiler by its address (Core::System::InvalidateCacheRange).
+    bool IsReadOnlyMemory(VAddr vaddr) override {
+        if (!parent.fold_read_only_loads) {
+            return false;
+        }
+        const std::shared_ptr<Kernel::Process> process = parent.system.Kernel().GetCurrentProcess();
+        if (!process) {
+            return false;
+        }
+        const auto vma = process->vm_manager.FindVMA(vaddr);
+        if (vma == process->vm_manager.vma_map.end()) {
+            return false;
+        }
+        const Kernel::VirtualMemoryArea& area = vma->second;
+        return area.type == Kernel::VMAType::BackingMemory &&
+               area.meminfo_state == Kernel::MemoryState::Code &&
+               (static_cast<u8>(area.permissions) &
+                static_cast<u8>(Kernel::VMAPermission::Write)) == 0 &&
+               u64{vaddr} + 4 <= u64{area.base} + area.size;
     }
 
     bool MemoryWriteExclusive8(u32 vaddr, u8 value, u8 expected) override {
@@ -170,6 +199,7 @@ public:
     }
 
     void AddTicks(std::uint64_t ticks) override {
+        Common::TraceMarkers::NoteGuestTicks(ticks);
         parent.GetTimer().AddTicks(ticks);
     }
     std::uint64_t GetTicksRemaining() override {
@@ -180,6 +210,10 @@ public:
 #ifdef CITRA_ENABLE_TRACE_MARKERS
         NoteHintInstruction(is_thumb, pc, instruction);
 #endif
+        if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::CountGuestInstructions) !=
+            0) [[unlikely]] {
+            return 1;
+        }
         return Core::TicksForInstruction(is_thumb, instruction);
     }
 
@@ -454,6 +488,11 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
         }
     }
     config.code_cache = code_cache.get();
+    if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::CountGuestInstructions) != 0)
+        [[unlikely]] {
+        // The stored code counts time as it was made to
+        config.code_cache = nullptr;
+    }
     if (current_page_table) {
         config.page_table = &current_page_table->GetPointerArray();
         // Host MMU access, if it is in use: an access goes straight to the address in the
@@ -472,6 +511,41 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     if (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyDispatcher) {
         config.optimizations &= ~Dynarmic::OptimizationFlag::FastDispatch;
     }
+
+    // Where the guest's registers are while its code runs: in the host's, unless the
+    // profiling switch asks for the state in memory as it used to be
+    config.pin_guest_registers =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::GuestRegistersInMemory) == 0;
+    config.write_into_guest_registers =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::GuestRegisterMoves) == 0;
+    config.fold_conditional_branches =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::LoneConditionalBranches) == 0;
+    config.guest_flags_in_host_flags =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::GuestFlagsInMemory) == 0;
+    config.fp_status_in_host =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::FpStatusInMemory) == 0;
+    config.fp_registers_through_general =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::FpRegistersThroughFp) == 0;
+    config.look_up_blocks_in_place =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ReturnPredictionList) == 0;
+    config.pin_guest_fp_registers = (Common::TraceMarkers::Experiments3() &
+                                     Common::TraceMarkers::GuestFpRegistersInMemory) == 0;
+    config.conditional_instructions_in_blocks =
+        (Common::TraceMarkers::Experiments3() &
+         Common::TraceMarkers::ConditionalInstructionsSplitBlocks) == 0;
+    // Longer blocks are fewer host instructions and more time: off unless asked for (see the
+    // two switches)
+    config.side_exits =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::SideExits) != 0;
+    config.follow_jumps =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::FollowJumps) != 0;
+    // Loads of constants next to the code are made as constants, unless the profiling switch
+    // asks for them as loads
+    fold_read_only_loads =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::LegacyLiteralLoads) == 0;
+    config.fold_read_only_loads = fold_read_only_loads;
+    config.share_host_addresses =
+        (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ShareHostAddresses) != 0;
 
     // Multi-process state
     config.processor_id = GetID();

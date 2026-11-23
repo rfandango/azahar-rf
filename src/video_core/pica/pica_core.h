@@ -137,9 +137,66 @@ public:
     /// from where it was, which most are.
     /// Has the next ProcessCmdList read the list from these bytes, a copy made when the list
     /// was handed over, instead of from the emulated memory, which the game may have
-    /// written since. Lists called from it are read where they are.
+    /// written since. The lists it jumps to are given with UseCalledLists.
     void UseCommandListCopy(const u8* copy) {
         list_copy = copy;
+    }
+
+    /// A list another list jumps to, as it was when the first was handed over
+    struct CalledListCopy {
+        PAddr addr;
+        u32 size;
+        /// Where its bytes begin among the bytes taken along
+        u32 offset;
+    };
+    /// What the lists handed over so far leave in the registers that decide where a list ends
+    /// and where it jumps to: followed at hand-over, when the registers themselves are still
+    /// those of whatever the decoder is at
+    struct ListScanState {
+        enum : u32 { IrqRequest, IrqCompare, IrqAutostop, Size0, Size1, Addr0, Addr1, Count };
+        std::array<u32, Count> regs{};
+    };
+    /// Those registers as they are now. Only where no list is being decoded.
+    [[nodiscard]] ListScanState ListScanStateNow() const;
+    /// How far behind a list's end the bytes that follow it are taken along with the list
+    /// that is handed over: a command at the end of a list may say it has more parameters
+    /// than the list has room for, and they are read from what follows, as on the console.
+    /// (Of a list jumped to, what follows is taken only if a command of it reaches there:
+    /// a game may jump a thousand times a frame.)
+    static constexpr u32 LIST_SLACK = 260 * sizeof(u32);
+
+    /// Follows the list of `size` bytes at `bytes` (with `readable` bytes there in all) the
+    /// way ProcessCmdList will, from the registers in `state`, and for every jump to another
+    /// list adds that list as it is in the emulated memory now to `lists`, its bytes to
+    /// `taken`. The lists are in the order they are jumped to. False if there were more lists
+    /// than are taken along: then what is in `lists` is only the first of them.
+    static bool TakeCalledLists(Memory::MemorySystem& memory, const u8* bytes, u32 size,
+                                u32 readable, ListScanState& state,
+                                std::vector<CalledListCopy>& lists, std::vector<u8>& taken);
+
+    /// Has the next ProcessCmdList read the lists it jumps to from these copies. Null: from
+    /// the emulated memory.
+    void UseCalledLists(const std::vector<CalledListCopy>* lists, const u8* bytes) {
+        called_lists = lists;
+        called_bytes = bytes;
+        called_next = 0;
+    }
+    /// Lists jumped to since this was last asked: how many were read from a copy, how many of
+    /// those the game had written to since the copy was made, and how many were read from the
+    /// emulated memory because no copy had been made of them: after the last copy that came
+    /// with the list (the walk at hand-over ended before the decoder did), or where the next
+    /// copy was of another list (the two went different ways)
+    struct CalledListFigures {
+        u32 from_copy;
+        u32 rewritten;
+        u32 past_the_copies;
+        u32 another_list;
+    };
+    CalledListFigures TakeCalledListFigures() {
+        return {called_from_copy.exchange(0, std::memory_order_relaxed),
+                called_rewritten.exchange(0, std::memory_order_relaxed),
+                called_past_copies.exchange(0, std::memory_order_relaxed),
+                called_another.exchange(0, std::memory_order_relaxed)};
     }
 
     [[nodiscard]] u64 CommandSite() const {
@@ -217,6 +274,31 @@ private:
     using UniformSet = std::array<u64, 2>;
     const UniformSet& FloatUniformsRead();
     std::vector<std::pair<u64, UniformSet>> uniforms_read;
+    /// The float uniforms that can make a difference to what the vertex shader puts out as
+    /// it is set up now: those a value it puts out depends on, or a branch it takes. Narrower
+    /// than what it reads: a program made to serve many kinds of draw reads uniforms whose
+    /// values it then does nothing with, and the game does not set those for a draw that has
+    /// no use for them. Found by following one run of the program. Null where that tells
+    /// nothing, which is where the program's way depends on the vertex.
+    struct UniformsThatMatter;
+    const UniformsThatMatter* FloatUniformsThatMatter();
+    /// What two draws with the same registers are compared by: the above, or all it reads.
+    /// And of those the ones that have to hold the same bytes, not only the same numbers
+    /// (see VideoCore::DrawFacts::UniformsZeroSign): all of them where nothing was found.
+    const UniformSet& FloatUniformsCompared();
+    const UniformSet& FloatUniformsZeroSign();
+    struct UniformsThatMatter {
+        u64 key;
+        /// The uniforms its branches and the tables it indexes depend on, and a hash of what
+        /// they held: with other values there the program may go another way
+        UniformSet control;
+        u64 control_values;
+        bool known;
+        UniformSet matter;
+        /// Those that reach a reciprocal
+        UniformSet zero_sign;
+    };
+    std::vector<UniformsThatMatter> uniforms_that_matter;
 
     void LoadVertices(bool is_indexed);
 
@@ -261,6 +343,8 @@ private:
     /// draws of two triangles at the most, whose vertices are shaded here to find out.
     /// False if it is none.
     bool TextureRowsOfDraw(bool is_indexed, VideoCore::DrawTextureRows& rows);
+    /// See VideoCore::DrawFacts::OutputHash
+    bool SmallDrawOutputHash(bool is_indexed, u64& hash);
 
 #ifdef CITRA_ENABLE_TRACE_MARKERS
     /// Frame dumps: where the vertices of a draw of two triangles at the most end up in the
@@ -553,6 +637,17 @@ private:
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
     const u8* list_copy{};
+    /// The copies of the lists the list being decoded jumps to, and the next of them due
+    const std::vector<CalledListCopy>* called_lists{};
+    const u8* called_bytes{};
+    std::size_t called_next{};
+    std::atomic<u32> called_from_copy{};
+    std::atomic<u32> called_rewritten{};
+    std::atomic<u32> called_past_copies{};
+    std::atomic<u32> called_another{};
+    /// The copy of the list at `addr` of `size` bytes that came with the list being decoded,
+    /// null if there is none
+    const u8* TakenCalledList(PAddr addr, u32 size);
     VideoCore::WorkRules* work_rules{};
     std::unique_ptr<ShaderEngine> shader_engine;
     /// Shades a few vertices while `shader_engine` does not have their shader ready

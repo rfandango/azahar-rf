@@ -291,6 +291,12 @@ private:
     tsl::robin_pg_map<u64, std::vector<SurfaceId>, Common::IdentityHash<u64>> page_table;
     std::unordered_map<FramebufferParams, FramebufferId> framebuffers;
     std::unordered_map<SamplerParams, SamplerId> samplers;
+    /// The samplers asked for last, with what they were asked for: a draw asks for one for
+    /// each of its textures, nearly always one of the last few, and finding it in the map
+    /// above means hashing what it was asked with every time (2.5% of the decoding thread in
+    /// a game of 426 draws a frame). Samplers are never taken out of the map.
+    std::array<std::pair<SamplerParams, SamplerId>, 4> recent_samplers{};
+    u32 recent_sampler_next{};
     std::list<std::pair<SurfaceId, u64>> sentenced;
     Common::SlotVector<Surface> slot_surfaces;
     Common::SlotVector<Sampler> slot_samplers;

@@ -399,6 +399,11 @@ public:
         u64 checksum{};
         /// While it is still armed: the command that has to be done before it need not be
         u64 disarm_after{~u64{0}};
+        /// The number of the last command that read a copy of it, as last looked at
+        /// (snapshot_last_read), and the VBlank (late_vblank) at which that was seen to have
+        /// moved on, or at which the page became volatile
+        u32 read_turn{};
+        u64 read_vblank{};
     };
     std::vector<VolatilePage> volatile_pages;
     /// Those of them a command gets copies of, while they are made
@@ -413,6 +418,10 @@ public:
     std::vector<u8> snapshot_read;
     std::atomic<u64> snapshot_given_sum{};
     std::atomic<u64> snapshot_read_sum{};
+    /// The number of the command with copies it is on, and for each page that of the last
+    /// one that read its copy (0: none did). The emulation thread looks for the figures.
+    std::atomic<u32> snapshot_turn{1};
+    std::unique_ptr<std::atomic<u32>[]> snapshot_last_read;
     /// What it read across copied and other pages, put together
     std::deque<std::vector<u8>> stitched;
 
@@ -421,6 +430,22 @@ public:
     /// thousand hand-overs
     static constexpr u32 VOLATILE_DECAY = 64;
 
+    /// A volatile page of which the decoder has read no copy for this many VBlanks (a quarter
+    /// of a minute) is forgotten: neither copied nor armed any more, as if the decoder had
+    /// never read from it, and learnt anew if it reads from it again. The decoder reads
+    /// textures from a stretch of memory once, the game later uses that memory for something
+    /// it writes all the time, and the page was copied at every hand-over from then on: its
+    /// contents never stand still, which was the only way off the list. (Kid Icarus:
+    /// Uprising, ten seconds after a state was loaded: 192 of 387 pages, half of 7.7 MB
+    /// copied every VBlank.)
+    static constexpr u64 FORGET_AFTER = 900;
+    /// Emulation thread to decoder, under reference_mutex: pages forgotten, whose noting the
+    /// decoder takes back (it notes a page once)
+    std::vector<u32> forgotten_pages;
+    std::atomic<bool> has_forgotten{false};
+    /// Since the figures were last asked for
+    u32 forgotten_count{};
+
     void AddVolatile(std::size_t page) {
         if ((reference_state[page] & 32) != 0 || volatile_pages.size() >= MAX_VOLATILE_PAGES) {
             return;
@@ -428,6 +453,8 @@ public:
         reference_state[page] |= 32;
         VolatilePage entry{};
         entry.page = static_cast<u32>(page);
+        entry.read_turn = snapshot_last_read[page].load(std::memory_order_relaxed);
+        entry.read_vblank = late_vblank;
         volatile_pages.insert(std::lower_bound(volatile_pages.begin(), volatile_pages.end(), entry,
                                                [](const VolatilePage& a, const VolatilePage& b) {
                                                    return a.page < b.page;
@@ -638,6 +665,49 @@ public:
         }
         return false;
     }
+
+    /// Whether a read of `size` bytes on cached pages touches what a surface covers (of which
+    /// the host GPU may hold something newer), or a page that is watched or that queued
+    /// commands write, or nothing is known of where it goes. A surface seldom begins and ends
+    /// with a page, and what shares its first and last page is the game's own data: Kid
+    /// Icarus: Uprising keeps what it reads 150 times a frame in front of its framebuffer,
+    /// and each of those reads waited for the decoding thread and went to the rasterizer to
+    /// be told there was nothing to fetch (6% of the emulation thread).
+    ///
+    /// Only on pages the rasterizer has said it cannot let the game read freely
+    /// (holds_newer_pages): a read that is announced is also what lets the rasterizer look at
+    /// the page and, with nothing newer anywhere on it, mark it readable, after which reads
+    /// of it come here no more. Left unannounced on any page, the reads of pages that could
+    /// be made readable all came by the slow way for good (Xenoblade Chronicles: 9% of the
+    /// emulation thread). And one in 256 is announced all the same, so that a page whose
+    /// surface has since been written back is found out.
+    bool ReadTouchesSurface(VAddr vaddr, PAddr paddr, u32 size) {
+        if (surface_cells.empty() || holds_newer_pages.empty() || size == 0 ||
+            (Common::TraceMarkers::Experiments3() &
+             Common::TraceMarkers::LegacyReadAnnouncements) != 0) {
+            return true;
+        }
+        u32 done = 0;
+        while (done < size) {
+            const auto page = CellPage(paddr + done);
+            if (!page || holds_newer_pages[*page] == 0 || watch_marker.IsCached(vaddr + done) ||
+                shut_marker.IsCached(vaddr + done)) {
+                return true;
+            }
+            const u32 in_page = (paddr + done) & CITRA_PAGE_MASK;
+            const u32 take = std::min(size - done, CITRA_PAGE_SIZE - in_page);
+            if ((surface_cells[*page] & CellMask(in_page, in_page + take - 1)) != 0) {
+                return true;
+            }
+            done += take;
+        }
+        return (++unannounced_reads & 255) == 0;
+    }
+    /// For each page (as surface_cells): set by the rasterizer when it looked at the page for
+    /// a read and found a surface on it holding something newer than memory; cleared when the
+    /// page is marked readable. Emulation thread.
+    std::vector<u8> holds_newer_pages;
+    u32 unannounced_reads{};
 
     std::vector<std::shared_ptr<PageTable>> page_table_list;
 
@@ -893,6 +963,11 @@ public:
             if (mode == FlushMode::Flush && !ReadNeedsAnnouncing(overlap_start, overlap_size)) {
                 return;
             }
+            // Nor one of what merely shares a page with a surface
+            if (mode == FlushMode::Flush &&
+                !ReadTouchesSurface(overlap_start, physical_start, overlap_size)) {
+                return;
+            }
             // Nor one of what the rasterizer gives the game late: memory as it is
             if (mode == FlushMode::Flush && !late_ranges.empty() &&
                 IsExemptRead(physical_start, overlap_size)) {
@@ -1011,6 +1086,7 @@ MemorySystem::Impl::Impl(Core::System& system_)
     reference_cells.resize(surface_cells.size());
     reference_state.resize(surface_cells.size());
     snapshot_slot.resize(surface_cells.size());
+    snapshot_last_read = std::make_unique<std::atomic<u32>[]>(surface_cells.size());
     // The page tables made from here on get their views of it
     if (WantsHostMmu()) {
         host_backing = backing.get();
@@ -1609,6 +1685,22 @@ MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address
     return {};
 }
 
+u32 MemorySystem::PhysicalBytesFrom(PAddr address) const {
+    const auto left = [address](PAddr start, u32 size) -> u32 {
+        return address >= start && address - start < size ? size - (address - start) : 0;
+    };
+    if (const u32 bytes = left(FCRAM_PADDR, FCRAM_N3DS_SIZE)) {
+        return bytes;
+    }
+    if (const u32 bytes = left(VRAM_PADDR, VRAM_SIZE)) {
+        return bytes;
+    }
+    if (const u32 bytes = left(DSP_RAM_PADDR, DSP_RAM_SIZE)) {
+        return bytes;
+    }
+    return left(N3DS_EXTRA_RAM_PADDR, N3DS_EXTRA_RAM_SIZE);
+}
+
 u8* MemorySystem::GetPhysicalPointer(PAddr address) {
     auto target_mem = GetPhysMemRegionInfo(address);
 
@@ -1797,6 +1889,16 @@ void MemorySystem::RasterizerSetSurfaceCells(PAddr start, u32 size, bool covered
 
 void MemorySystem::RasterizerClearSurfaceCells() {
     std::fill(impl->surface_cells.begin(), impl->surface_cells.end(), u64{0});
+    std::fill(impl->holds_newer_pages.begin(), impl->holds_newer_pages.end(), u8{0});
+}
+
+void MemorySystem::RasterizerNotePageHoldsNewer(PAddr start) {
+    if (impl->holds_newer_pages.empty()) {
+        impl->holds_newer_pages.resize((FCRAM_N3DS_SIZE + VRAM_SIZE) >> CITRA_PAGE_BITS);
+    }
+    if (const auto page = Impl::CellPage(start)) {
+        impl->holds_newer_pages[*page] = 1;
+    }
 }
 
 void MemorySystem::TrackGpuReferences(bool track) {
@@ -1813,11 +1915,28 @@ void MemorySystem::NoteGpuWritten(PAddr addr, u32 size) {
 
 void MemorySystem::SetGpuReader(bool transfer) {
     impl->gpu_reader = transfer ? 16 : 1;
+    if (impl->has_forgotten.load(std::memory_order_relaxed)) [[unlikely]] {
+        // Pages the emulation thread has forgotten (see FORGET_AFTER): noted anew the next
+        // time something is read from them
+        std::vector<u32> pages;
+        {
+            std::scoped_lock lock{impl->reference_mutex};
+            pages.swap(impl->forgotten_pages);
+            impl->has_forgotten.store(false, std::memory_order_relaxed);
+        }
+        for (const u32 page : pages) {
+            impl->reference_noted[page] &= static_cast<u8>(~(1 | 16));
+        }
+        // (A stretch found in this table is taken as noted)
+        impl->noted_stretches.fill({});
+    }
 }
 
 void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued_before, u64 done,
+                                    PAddr source_addr, u32 source_size,
+                                    std::span<const std::pair<PAddr, u32>> written,
                                     std::vector<u32>& snapshot_pages,
-                                    std::unique_ptr<u8[]>& snapshot_bytes) {
+                                    std::vector<u8>& snapshot_bytes) {
     std::vector<u32> fresh_list;
     std::vector<u32> fresh_transfer;
     std::vector<u32> fresh_written;
@@ -1826,6 +1945,30 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
         fresh_list.swap(impl->new_references);
         fresh_transfer.swap(impl->new_transfer_references);
         fresh_written.swap(impl->new_written);
+    }
+    if (for_transfer && source_size != 0) {
+        // Known from the command, without the decoder having been there: learnt and armed
+        // (or copied, if the game keeps writing them) below, for this very command
+        const u64 last = u64{source_addr} + source_size - 1;
+        for (u64 at = source_addr & ~CITRA_PAGE_MASK; at <= last; at += CITRA_PAGE_SIZE) {
+            // (Those known already are armed, copied, or wait to be armed below)
+            const auto page = Impl::CellPage(static_cast<PAddr>(at));
+            if (page && (impl->reference_state[*page] & 16) == 0) {
+                fresh_transfer.push_back(static_cast<u32>(*page));
+            }
+        }
+    }
+    for (const auto& [addr, size] : written) {
+        if (size == 0) {
+            continue;
+        }
+        const u64 last = u64{addr} + size - 1;
+        for (u64 at = addr & ~CITRA_PAGE_MASK; at <= last; at += CITRA_PAGE_SIZE) {
+            const auto page = Impl::CellPage(static_cast<PAddr>(at));
+            if (page && (impl->reference_state[*page] & 4) == 0) {
+                fresh_written.push_back(static_cast<u32>(*page));
+            }
+        }
     }
     std::vector<u8>& state = impl->reference_state;
     const auto learn = [&](const std::vector<u32>& fresh, std::vector<u32>& waiting, u8 known) {
@@ -1844,6 +1987,7 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
     // that were handed over without a copy of them are done
     std::vector<Impl::VolatilePage>& volatile_pages = impl->volatile_pages;
     bool demoted = false;
+    std::vector<u32> forgotten;
     for (Impl::VolatilePage& entry : volatile_pages) {
         u8& bits = state[entry.page];
         if ((bits & 2) != 0) {
@@ -1862,11 +2006,14 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
         impl->snapshot_wanted.push_back(&entry);
     }
     if (!impl->snapshot_wanted.empty()) {
-        // One buffer for the command, left as it comes: all of it is written here
+        // One buffer for the command, which comes with the room an earlier command needed and
+        // is left as it comes: what is used of it is written here
         const std::size_t count = impl->snapshot_wanted.size();
-        snapshot_bytes.reset(new u8[count * CITRA_PAGE_SIZE]);
+        if (snapshot_bytes.size() < count * CITRA_PAGE_SIZE) {
+            snapshot_bytes.resize(count * CITRA_PAGE_SIZE);
+        }
         snapshot_pages.reserve(count);
-        u8* copy = snapshot_bytes.get();
+        u8* copy = snapshot_bytes.data();
         for (Impl::VolatilePage* const entry : impl->snapshot_wanted) {
             std::memcpy(copy, GetPhysicalPointer(Impl::CellPageAddress(entry->page)),
                         CITRA_PAGE_SIZE);
@@ -1874,13 +2021,27 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
             // Whether the game still writes the page is looked at now and then only: the sum
             // costs ten times the copy
             if ((entry->turn++ & 31) == 0) {
+                u8& bits = state[entry->page];
+                // And first whether the decoder still reads it (see FORGET_AFTER)
+                const u32 read_turn =
+                    impl->snapshot_last_read[entry->page].load(std::memory_order_relaxed);
+                if (read_turn != entry->read_turn) {
+                    entry->read_turn = read_turn;
+                    entry->read_vblank = impl->late_vblank;
+                } else if ((bits & 2) == 0 &&
+                           impl->late_vblank - entry->read_vblank > Impl::FORGET_AFTER) {
+                    bits &= static_cast<u8>(~(1 | 16 | 32));
+                    forgotten.push_back(entry->page);
+                    demoted = true;
+                    copy += CITRA_PAGE_SIZE;
+                    continue;
+                }
                 u64 checksum = 0;
                 for (u32 i = 0; i < CITRA_PAGE_SIZE; i += sizeof(u64)) {
                     u64 word;
                     std::memcpy(&word, copy + i, sizeof(word));
                     checksum = checksum * 31 + word;
                 }
-                u8& bits = state[entry->page];
                 if (checksum != entry->checksum) {
                     entry->checksum = checksum;
                     entry->same = 0;
@@ -1905,6 +2066,16 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
         std::erase_if(volatile_pages, [&](const Impl::VolatilePage& entry) {
             return (state[entry.page] & 32) == 0;
         });
+    }
+    if (!forgotten.empty()) {
+        for (const u32 page : forgotten) {
+            impl->snapshot_last_read[page].store(0, std::memory_order_relaxed);
+        }
+        impl->forgotten_count += static_cast<u32>(forgotten.size());
+        std::scoped_lock lock{impl->reference_mutex};
+        impl->forgotten_pages.insert(impl->forgotten_pages.end(), forgotten.begin(),
+                                     forgotten.end());
+        impl->has_forgotten.store(true, std::memory_order_relaxed);
     }
 
     std::vector<u32> pages;
@@ -2088,8 +2259,13 @@ void MemorySystem::DropGpuSnapshot() {
         impl->snapshot_slot[page] = 0;
     }
     u64 read = 0;
-    for (const u8 was_read : impl->snapshot_read) {
-        read += was_read;
+    const u32 turn = impl->snapshot_turn.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < impl->snapshot_read.size(); i++) {
+        if (impl->snapshot_read[i] != 0) {
+            read++;
+            impl->snapshot_last_read[(*impl->snapshot_pages)[i]].store(turn,
+                                                                       std::memory_order_relaxed);
+        }
     }
     impl->snapshot_given_sum.fetch_add(impl->snapshot_pages->size(), std::memory_order_relaxed);
     impl->snapshot_read_sum.fetch_add(read, std::memory_order_relaxed);
@@ -2147,6 +2323,31 @@ std::pair<u64, u64> MemorySystem::TakeSnapshotReadFigures() {
             impl->snapshot_read_sum.exchange(0, std::memory_order_relaxed)};
 }
 
+MemorySystem::VolatileAges MemorySystem::VolatileAgesNow() {
+    VolatileAges ages{};
+    ages.forgotten = std::exchange(impl->forgotten_count, 0);
+    if (!impl->snapshot_last_read || impl->volatile_pages.empty()) {
+        return ages;
+    }
+    const u32 turn = impl->snapshot_turn.load(std::memory_order_relaxed);
+    u32 before = ~u32{0};
+    for (const Impl::VolatilePage& entry : impl->volatile_pages) {
+        const u32 last = impl->snapshot_last_read[entry.page].load(std::memory_order_relaxed);
+        const u32 ago = turn - last;
+        ages.read[last == 0 ? 3 : ago <= 256 ? 0 : ago <= 2048 ? 1 : 2]++;
+        const std::size_t kind = std::min<std::size_t>(impl->reference_kind[entry.page], 4);
+        ages.kinds[kind]++;
+        ages.kinds_read[kind] += last != 0 && ago <= 256 ? 1 : 0;
+        if (before == ~u32{0} || entry.page != before + 1) {
+            ages.runs++;
+        }
+        before = entry.page;
+    }
+    ages.first = Impl::CellPageAddress(impl->volatile_pages.front().page);
+    ages.last = Impl::CellPageAddress(impl->volatile_pages.back().page);
+    return ages;
+}
+
 std::pair<u32, u64> MemorySystem::TakeSnapshotFigures() {
     return {static_cast<u32>(impl->volatile_pages.size()),
             std::exchange(impl->snapshot_bytes_copied, 0)};
@@ -2170,6 +2371,11 @@ void MemorySystem::RasterizerMarkRegionReadable(PAddr start, u32 size, bool read
     });
 
     for (u32 i = 0; i < num_pages; ++i, paddr += CITRA_PAGE_SIZE) {
+        if (const auto page = Impl::CellPage(paddr);
+            page && *page < impl->holds_newer_pages.size()) {
+            // Looked at anew at the next read that is announced
+            impl->holds_newer_pages[*page] = 0;
+        }
         for (VAddr vaddr : PhysicalToVirtualAddressForRasterizer(paddr)) {
             // Only of a cached page can this be said
             impl->readable_marker.Mark(vaddr, readable && impl->cache_marker.IsCached(vaddr));

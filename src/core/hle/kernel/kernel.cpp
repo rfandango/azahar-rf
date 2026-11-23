@@ -66,7 +66,7 @@ u32 KernelSystem::GenerateObjectID() {
     return next_object_id++;
 }
 
-std::shared_ptr<Process> KernelSystem::GetCurrentProcess() const {
+const std::shared_ptr<Process>& KernelSystem::GetCurrentProcess() const {
     return current_process;
 }
 

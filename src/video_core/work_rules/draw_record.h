@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -18,6 +19,10 @@ struct DrawRecord {
     u64 state{};
     bool clear{};
     DrawFacts::FloatUniforms uniforms;
+    /// What its vertex shader put out (DrawFacts::OutputHash), where whoever keeps the
+    /// record asked for it
+    bool has_output{};
+    u64 output{};
 
     DrawRecord() = default;
     DrawRecord(DrawFacts& facts, bool as_clear)
@@ -35,6 +40,10 @@ struct UniformDifference {
     /// The largest difference, as a share of the largest value in the registers around the
     /// uniform (the rows of its matrix); infinite for one that is not a number
     float largest_shift{};
+    /// The first that differs: which register, what it held on record and what it holds now
+    u32 first{};
+    std::array<float, 4> was{};
+    std::array<float, 4> is{};
 };
 
 /// Compares only the uniforms the program reads: the others hold what earlier draws left
@@ -48,12 +57,29 @@ inline UniformDifference CompareUniforms(const DrawRecord& record, DrawFacts& fa
         return difference;
     }
     const DrawFacts::UniformSet& read = facts.UniformsRead();
+    const DrawFacts::UniformSet& zero_sign = facts.UniformsZeroSign();
     for (u32 i = 0; i < now.size(); i++) {
         if ((read[i / 64] >> (i % 64) & 1) == 0 ||
             std::memcmp(&now[i], &record.uniforms[i], sizeof(now[i])) == 0) {
             continue;
         }
-        difference.differing++;
+        // Other bytes and the same numbers: a zero with the other sign (a game works out the
+        // same matrix twice, for each eye, and a product that comes to nothing has the sign
+        // of what it was multiplied by). No difference unless the shader takes a reciprocal.
+        if ((zero_sign[i / 64] >> (i % 64) & 1) == 0 &&
+            now[i].x.ToFloat32() == record.uniforms[i].x.ToFloat32() &&
+            now[i].y.ToFloat32() == record.uniforms[i].y.ToFloat32() &&
+            now[i].z.ToFloat32() == record.uniforms[i].z.ToFloat32() &&
+            now[i].w.ToFloat32() == record.uniforms[i].w.ToFloat32()) {
+            continue;
+        }
+        if (difference.differing++ == 0) {
+            difference.first = i;
+            difference.was = {record.uniforms[i].x.ToFloat32(), record.uniforms[i].y.ToFloat32(),
+                              record.uniforms[i].z.ToFloat32(), record.uniforms[i].w.ToFloat32()};
+            difference.is = {now[i].x.ToFloat32(), now[i].y.ToFloat32(), now[i].z.ToFloat32(),
+                             now[i].w.ToFloat32()};
+        }
         float scale = 1e-4f;
         for (u32 j = i >= 3 ? i - 3 : 0; j < std::min<u32>(i + 4, 96); j++) {
             const auto& row = record.uniforms[j];

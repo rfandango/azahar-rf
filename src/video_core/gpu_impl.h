@@ -59,6 +59,11 @@ struct GPU::Impl {
         std::vector<u64> early_delays;
         /// The bytes of a command list as they were at hand-over
         std::vector<u8> list_copy;
+        /// The lists it jumps to, as they were then (Pica::PicaCore::TakeCalledLists), if
+        /// they were looked for
+        bool has_called_lists{};
+        std::vector<Pica::PicaCore::CalledListCopy> called_lists;
+        std::vector<u8> called_bytes;
         /// Not a command but a buffer swap, kept in its place among the commands
         bool is_swap{};
         u32 swap_screen{};
@@ -74,8 +79,46 @@ struct GPU::Impl {
         u64 seq{};
         /// Copies of the pages the game keeps writing, as they were at hand-over
         std::vector<u32> snapshot_pages;
-        std::unique_ptr<u8[]> snapshot_bytes;
+        /// (As large as the largest set of them it ever held: only what snapshot_pages
+        /// names is of this command)
+        std::vector<u8> snapshot_bytes;
     };
+    /// The buffers of commands that are done, for the commands to come. A command list and
+    /// what goes with it is tens to hundreds of kilobytes, and memory of that size the
+    /// allocator takes from the system and gives back each time: a hand-over then paid for
+    /// the mapping, for a fault at the first touch of every page of the copy, and the decoder
+    /// for the unmapping (Xenoblade Chronicles: 3% of the emulation thread's time and 4% of
+    /// the decoder's, in the kernel). Taken at hand-over and returned by the decoder, under
+    /// their own mutex.
+    struct SpareBuffers {
+        std::vector<std::vector<u8>> lists;
+        std::vector<std::vector<Pica::PicaCore::CalledListCopy>> called_lists;
+        std::vector<std::vector<u8>> called_bytes;
+        std::vector<std::vector<u32>> snapshot_pages;
+        std::vector<std::vector<u8>> snapshot_bytes;
+    };
+    std::mutex spare_mutex;
+    SpareBuffers spare;
+    /// More than are ever on their way at once: beyond it a buffer is freed as before
+    static constexpr std::size_t MOST_SPARE = 64;
+    template <typename T>
+    static void TakeSpare(std::vector<std::vector<T>>& from, std::vector<T>& buffer) {
+        if (!from.empty()) {
+            buffer = std::move(from.back());
+            from.pop_back();
+        }
+    }
+    /// `emptied`: handed on with nothing in it, its room kept
+    template <typename T>
+    static void GiveSpare(std::vector<std::vector<T>>& to, std::vector<T>& buffer, bool emptied) {
+        if (buffer.capacity() == 0 || to.size() >= MOST_SPARE) {
+            return;
+        }
+        if (emptied) {
+            buffer.clear();
+        }
+        to.push_back(std::move(buffer));
+    }
     struct RaisedInterrupt {
         Service::GSP::InterruptId id;
         u64 delay;
@@ -103,6 +146,19 @@ struct GPU::Impl {
     /// The number of the last item handed over (emulation thread) and of the last one done
     u64 queued_seq{};
     std::atomic<u64> done_seq{};
+
+    /// What the lists handed over leave in the registers a list's jumps go by (emulation
+    /// thread), and what was taken along of lists jumped to since the last report
+    Pica::PicaCore::ListScanState list_scan{};
+    u64 called_taken{};
+    u64 called_taken_bytes{};
+    /// Hand-overs where not all lists jumped to could be taken, and the time the taking took
+    u64 called_not_all{};
+    u64 called_take_ns{};
+    /// The most lists and bytes a hand-over took along lately: room is made for as many at
+    /// once, and the buffers of a command do not grow a dozen times
+    std::size_t called_lists_room{};
+    std::size_t called_bytes_room{};
 
     void Queue(QueuedCommand&& item) {
         item.seq = ++queued_seq;

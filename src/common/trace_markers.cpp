@@ -136,6 +136,18 @@ InjectedStall Stall() {
     return {static_cast<std::uint32_t>(value >> 32), static_cast<std::uint32_t>(value)};
 }
 
+namespace {
+std::atomic<std::uint64_t> guest_ticks{0};
+}
+
+void NoteGuestTicks(std::uint64_t ticks) {
+    guest_ticks.fetch_add(ticks, std::memory_order_relaxed);
+}
+
+std::uint64_t GuestTicks() {
+    return guest_ticks.load(std::memory_order_relaxed);
+}
+
 void RefreshSettings() {
     experiments.store(ReadExperiments(), std::memory_order_relaxed);
     experiments2.store(ReadExperiments(EXPERIMENT2_PROPERTY), std::memory_order_relaxed);
@@ -147,7 +159,13 @@ void RefreshSettings() {
 }
 
 void EndFrame() {
-    RefreshSettings();
+    // The switches are system properties, each found by its name every time it is read: four
+    // of them at every VBlank were 15 microseconds of the emulation thread, a VBlank. Twice a
+    // second is soon enough for a switch that a person or a script throws.
+    static std::atomic<std::uint32_t> turn{0};
+    if ((turn.fetch_add(1, std::memory_order_relaxed) & 31) == 0) {
+        RefreshSettings();
+    }
 
     if (!IsEnabled(Level::Frame)) {
         return;
