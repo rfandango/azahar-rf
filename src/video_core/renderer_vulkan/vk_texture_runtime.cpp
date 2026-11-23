@@ -161,6 +161,58 @@ void MakeInitBarriers(vk::ImageAspectFlags aspect, std::span<const vk::Image> im
     MakeInitBarriers(aspect, images.size(), images, out_barriers);
 }
 
+/// Whether a new image of this format is written once in full when it is made, see InitImages.
+/// Not one in a block-compressed format, which cannot be cleared and is uploaded whole.
+bool WritesNewImages(vk::Format format) {
+    return !vk::isCompressed(format) &&
+           (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::UnwrittenImages) == 0;
+}
+
+/// Brings new images into the layout they are used in (at most four), and writes the ones in
+/// `written` once in full.
+///
+/// An image nothing was written to is not harmless to draw into or to load. Where the GPU
+/// keeps side data for an image (an Adreno's framebuffer compression has flags for every block
+/// of pixels, which it consults when it writes into a block and not only when it reads one), a
+/// new image has there whatever its memory held before, and once a game has run a while the
+/// memory of a new image is memory the allocator has handed out before. A render pass that
+/// begins on such an image without a clear (its first draw covers the viewport, or it loads
+/// what is there) has the GPU take those bytes for flags. With a Turnip that does not
+/// initialise them itself, an Adreno 650 locked up so that the whole device reset: Shinobi 3D
+/// at the scene change after its opening video, four times out of four (2026-11-23); the
+/// image was the second image of a colour target, made for a full-screen effect that samples
+/// what it draws over. Clearing all of an image writes every block and its flags.
+void InitImages(vk::CommandBuffer cmdbuf, vk::ImageAspectFlags aspect,
+                std::span<const vk::Image> images, std::span<const vk::Image> written) {
+    std::array<vk::ImageMemoryBarrier, 4> barriers;
+    MakeInitBarriers(aspect, images, barriers);
+    if (!written.empty()) {
+        for (std::size_t i = 0; i < images.size(); i++) {
+            barriers[i].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+        }
+    }
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+                           written.empty() ? vk::PipelineStageFlagBits::eTopOfPipe
+                                           : vk::PipelineStageFlagBits::eTransfer,
+                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr,
+                           static_cast<u32>(images.size()), barriers.data());
+    const vk::ImageSubresourceRange range = {
+        .aspectMask = aspect,
+        .baseMipLevel = 0,
+        .levelCount = VK_REMAINING_MIP_LEVELS,
+        .baseArrayLayer = 0,
+        .layerCount = VK_REMAINING_ARRAY_LAYERS,
+    };
+    for (const vk::Image image : written) {
+        if (aspect & vk::ImageAspectFlagBits::eColor) {
+            cmdbuf.clearColorImage(image, vk::ImageLayout::eGeneral, vk::ClearColorValue{}, range);
+        } else {
+            cmdbuf.clearDepthStencilImage(image, vk::ImageLayout::eGeneral,
+                                          vk::ClearDepthStencilValue{}, range);
+        }
+    }
+}
+
 vk::ImageSubresourceRange MakeSubresourceRange(vk::ImageAspectFlags aspect, u32 level = 0,
                                                u32 levels = 1, u32 layer = 0) {
     return vk::ImageSubresourceRange{
@@ -180,7 +232,7 @@ constexpr u64 DOWNLOAD_BUFFER_SIZE = 16_MiB;
 void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::Format format,
                     vk::SampleCountFlagBits samples, vk::ImageUsageFlags usage,
                     vk::ImageCreateFlags flags, vk::ImageAspectFlags aspect, bool need_format_list,
-                    std::string_view debug_name) {
+                    std::string_view debug_name, bool stencil_sampled) {
 
     Destroy();
 
@@ -203,8 +255,21 @@ void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::For
         .pViewFormats = format_list.data(),
     };
 
+    // What the stencil is used for, where that is less than what the depth is used for
+    const vk::ImageStencilUsageCreateInfo stencil_usage = {
+        .stencilUsage =
+            usage & ~(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eInputAttachment),
+    };
+    const bool separate_stencil = !stencil_sampled && !need_format_list &&
+                                  instance.IsSeparateStencilUsageSupported() &&
+                                  static_cast<bool>(aspect & vk::ImageAspectFlagBits::eStencil) &&
+                                  stencil_usage.stencilUsage != usage;
+    const void* const next =
+        need_format_list ? static_cast<const void*>(&image_format_list)
+                         : (separate_stencil ? static_cast<const void*>(&stencil_usage) : nullptr);
+
     const vk::ImageCreateInfo image_info = {
-        .pNext = need_format_list ? &image_format_list : nullptr,
+        .pNext = next,
         .flags = flags,
         .imageType = vk::ImageType::e2D,
         .format = format,
@@ -371,6 +436,22 @@ void TextureRuntime::NoteStorageUse(PAddr addr, u32 width, u32 height) {
 
 bool TextureRuntime::HadStorageUse(PAddr addr, u32 width, u32 height) const {
     return std::ranges::find(storage_uses, StorageUse{addr, width, height}) != storage_uses.end();
+}
+
+void TextureRuntime::NoteStencilUse(PAddr addr, u32 width, u32 height) {
+    static constexpr std::size_t MAX_STENCIL_USES = 64;
+    const StorageUse use{addr, width, height};
+    if (std::ranges::find(stencil_uses, use) != stencil_uses.end()) {
+        return;
+    }
+    if (stencil_uses.size() == MAX_STENCIL_USES) {
+        stencil_uses.erase(stencil_uses.begin());
+    }
+    stencil_uses.push_back(use);
+}
+
+bool TextureRuntime::HadStencilUse(PAddr addr, u32 width, u32 height) const {
+    return std::ranges::find(stencil_uses, StorageUse{addr, width, height}) != stencil_uses.end();
 }
 
 bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
@@ -1208,16 +1289,22 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
     image_flags = flags;
     image_format_list = need_format_list;
     has_image_params = true;
+    // The stencil of a depth and stencil surface is declared as sampled only for guest pixels
+    // whose stencil was sampled before, see MakeStencilSampleable
+    image_stencil_sampled = !static_cast<bool>(traits.aspect & vk::ImageAspectFlagBits::eStencil) ||
+                            !instance.IsSeparateStencilUsageSupported() ||
+                            runtime.HadStencilUse(addr, width, height);
     handles[Type::Base].Create(width, height, levels, texture_type, format,
                                vk::SampleCountFlagBits::e1, usage, flags, traits.aspect,
-                               need_format_list, DebugName(false));
+                               need_format_list, DebugName(false), image_stencil_sampled);
     raw_images.emplace_back(handles[Type::Base].image);
 
     // Upscaled image
     if (res_scale != 1) {
         handles[Type::Scaled].Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type,
                                      format, vk::SampleCountFlagBits::e1, usage, flags,
-                                     traits.aspect, need_format_list, DebugName(true));
+                                     traits.aspect, need_format_list, DebugName(true),
+                                     image_stencil_sampled);
         raw_images.emplace_back(handles[Type::Scaled].image);
     }
 
@@ -1226,20 +1313,17 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
         handles[Type::MultiSampled].Create(
             GetScaledWidth(), GetScaledHeight(), levels, texture_type, format,
             vk::SampleCountFlagBits(sample_count), traits.usage, flags, traits.aspect,
-            need_format_list, DebugName(true, false, sample_count));
+            need_format_list, DebugName(true, false, sample_count), image_stencil_sampled);
         raw_images.emplace_back(handles[Type::MultiSampled].image);
     }
 
     current = res_scale != 1 ? Type::Scaled : Type::Base;
 
     runtime.renderpass_cache.EndRendering();
-    scheduler.Record([raw_images, aspect = traits.aspect](vk::CommandBuffer cmdbuf) {
-        std::array<vk::ImageMemoryBarrier, 4> barriers;
-        MakeInitBarriers(aspect, raw_images, barriers);
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                               vk::PipelineStageFlagBits::eTopOfPipe,
-                               vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr,
-                               raw_images.size(), barriers.data());
+    scheduler.Record([raw_images, aspect = traits.aspect,
+                      write = WritesNewImages(format)](vk::CommandBuffer cmdbuf) {
+        InitImages(cmdbuf, aspect, raw_images,
+                   write ? std::span<const vk::Image>{raw_images} : std::span<const vk::Image>{});
     });
 }
 
@@ -1291,15 +1375,20 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
 
     current = res_scale != 1 ? Type::Scaled : Type::Base;
 
+    // The image the pack's texture is scaled into is always one that can be cleared; the
+    // others are in the pack's format
+    boost::container::static_vector<vk::Image, 4> written_images;
+    if (WritesNewImages(format)) {
+        written_images = raw_images;
+    } else if (res_scale != 1 && WritesNewImages(vk::Format::eR8G8B8A8Unorm)) {
+        written_images.emplace_back(handles[Type::Scaled].image);
+    }
+
     runtime.renderpass_cache.EndRendering();
-    scheduler.Record([raw_images, aspect = traits.aspect](vk::CommandBuffer cmdbuf) {
-        std::array<vk::ImageMemoryBarrier, 4> barriers;
-        MakeInitBarriers(aspect, raw_images, barriers);
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                               vk::PipelineStageFlagBits::eTopOfPipe,
-                               vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr,
-                               raw_images.size(), barriers.data());
-    });
+    scheduler.Record(
+        [raw_images, written_images, aspect = traits.aspect](vk::CommandBuffer cmdbuf) {
+            InitImages(cmdbuf, aspect, raw_images, written_images);
+        });
 
     custom_format = mat->format;
     material = mat;
@@ -1581,20 +1670,19 @@ void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
 
         handles[Type::Scaled].Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type,
                                      traits.native, vk::SampleCountFlagBits::e1, scaled_usage,
-                                     flags, traits.aspect, format_list, DebugName(true));
+                                     flags, traits.aspect, format_list, DebugName(true),
+                                     image_stencil_sampled);
         current = Type::Scaled;
 
         handles[Type::Copy].Destroy();
 
         runtime.renderpass_cache.EndRendering();
-        scheduler.Record(
-            [raw_images = std::array{Image()}, aspect = traits.aspect](vk::CommandBuffer cmdbuf) {
-                std::array<vk::ImageMemoryBarrier, 1> barriers;
-                MakeInitBarriers(aspect, 1, raw_images, barriers);
-                cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                                       vk::PipelineStageFlagBits::eTopOfPipe,
-                                       vk::DependencyFlagBits::eByRegion, {}, {}, barriers);
-            });
+        scheduler.Record([raw_images = std::array{Image()}, aspect = traits.aspect,
+                          write = WritesNewImages(traits.native)](vk::CommandBuffer cmdbuf) {
+            InitImages(cmdbuf, aspect, raw_images,
+                       write ? std::span<const vk::Image>{raw_images}
+                             : std::span<const vk::Image>{});
+        });
 
         for (u32 level = 0; level < levels; level++) {
             const VideoCore::TextureBlit blit = {
@@ -1612,7 +1700,7 @@ void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
         handles[Type::MultiSampled].Create(
             GetScaledWidth(), GetScaledHeight(), levels, texture_type, traits.native,
             vk::SampleCountFlagBits(sample_count), traits.usage, flags, traits.aspect, false,
-            DebugName(res_scale != 1, false, sample_count));
+            DebugName(res_scale != 1, false, sample_count), image_stencil_sampled);
 
         // The multi-sampled image is just a transient image that is almost always immediately
         // resolved into the current image, and should not be representative of the entire surface!
@@ -1621,12 +1709,11 @@ void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
 
         runtime.renderpass_cache.EndRendering();
         scheduler.Record([raw_images = std::array{Image(Type::MultiSampled)},
-                          aspect = traits.aspect](vk::CommandBuffer cmdbuf) {
-            std::array<vk::ImageMemoryBarrier, 1> barriers;
-            MakeInitBarriers(aspect, 1, raw_images, barriers);
-            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-                                   vk::PipelineStageFlagBits::eTopOfPipe,
-                                   vk::DependencyFlagBits::eByRegion, {}, {}, barriers);
+                          aspect = traits.aspect,
+                          write = WritesNewImages(traits.native)](vk::CommandBuffer cmdbuf) {
+            InitImages(cmdbuf, aspect, raw_images,
+                       write ? std::span<const vk::Image>{raw_images}
+                             : std::span<const vk::Image>{});
         });
     }
 }
@@ -1680,6 +1767,30 @@ bool Surface::MakeStorageCapable() {
     image_flags |= vk::ImageCreateFlagBits::eMutableFormat;
     image_format_list = instance.IsImageFormatListSupported();
 
+    RemakeImages();
+    runtime.NoteStorageUse(addr, width, height);
+    LOG_INFO(Render_Vulkan, "Surface {}x{} @{:08X} was given images a shadow map can use",
+             GetScaledWidth(), GetScaledHeight(), addr);
+    return true;
+}
+
+bool Surface::MakeStencilSampleable() {
+    if (image_stencil_sampled || !has_image_params) {
+        return false;
+    }
+    runtime.renderpass_cache.EndRendering();
+    NoteAllWritten();
+
+    image_stencil_sampled = true;
+
+    RemakeImages();
+    runtime.NoteStencilUse(addr, width, height);
+    LOG_INFO(Render_Vulkan, "Surface {}x{} @{:08X} was given images whose stencil can be sampled",
+             GetScaledWidth(), GetScaledHeight(), addr);
+    return true;
+}
+
+void Surface::RemakeImages() {
     // The second image holds nothing that lasts: it is made again when it is needed
     if (handles[Type::Copy]) {
         runtime.Retire(std::move(handles[Type::Copy]));
@@ -1692,7 +1803,7 @@ bool Surface::MakeStorageCapable() {
         Handle fresh{instance};
         fresh.Create(handle.width, handle.height, handle.levels, texture_type, traits.native,
                      vk::SampleCountFlagBits::e1, image_usage, image_flags, traits.aspect,
-                     image_format_list, DebugName(type == Type::Scaled));
+                     image_format_list, DebugName(type == Type::Scaled), image_stencil_sampled);
 
         const RecordParams params = {
             .aspect = Aspect(),
@@ -1771,10 +1882,6 @@ bool Surface::MakeStorageCapable() {
         handle = std::move(fresh);
     }
     image_generation++;
-    runtime.NoteStorageUse(addr, width, height);
-    LOG_INFO(Render_Vulkan, "Surface {}x{} @{:08X} was given images a shadow map can use",
-             GetScaledWidth(), GetScaledHeight(), addr);
-    return true;
 }
 
 bool Surface::EnsureCopyHandle() {
@@ -1786,7 +1893,7 @@ bool Surface::EnsureCopyHandle() {
         // Of the same kind as the image the surface is in, so that the two can change places
         copy_handle.Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type, traits.native,
                            vk::SampleCountFlagBits::e1, image_usage, image_flags, traits.aspect,
-                           image_format_list);
+                           image_format_list, {}, image_stencil_sampled);
     } else {
         vk::ImageCreateFlags flags{};
         if (texture_type == VideoCore::TextureType::CubeMap) {
@@ -1797,7 +1904,16 @@ bool Surface::EnsureCopyHandle() {
     }
     // Nothing is in it yet
     copy_differs_all = true;
-    return true;
+    if (!WritesNewImages(traits.native)) {
+        return true;
+    }
+    // Written once in full before anything else is done with it, see InitImages: a full-screen
+    // effect drawn in place makes this image the colour target of a render pass that neither
+    // loads nor clears. It is in the general layout after that.
+    runtime.renderpass_cache.EndRendering();
+    scheduler.Record([images = std::array{copy_handle.image}, aspect = traits.aspect](
+                         vk::CommandBuffer cmdbuf) { InitImages(cmdbuf, aspect, images, images); });
+    return false;
 }
 
 bool Surface::CanSwapForOverwrite() const noexcept {
@@ -2117,6 +2233,9 @@ vk::ImageView Surface::ImageView(ViewType view_type, Type type) noexcept {
     }
     if (view_type == ViewType::Depth || view_type == ViewType::Stencil) {
         ASSERT(this->type == SurfaceType::DepthStencil);
+        // The two are asked for together, by the conversions and copies done in a shader, which
+        // sample the stencil: the images of the surface change here if theirs cannot be
+        MakeStencilSampleable();
         aspect = view_type == ViewType::Depth ? vk::ImageAspectFlagBits::eDepth
                                               : vk::ImageAspectFlagBits::eStencil;
     }

@@ -558,15 +558,19 @@ private:
                         dot = fmt::format("dot(vec3({}), vec3({}))", src1, src2);
                     }
                 } else {
+                    // The homogeneous dot product takes its first operand as (x, y, z, 1),
+                    // whatever its fourth component holds. That has nothing to do with how
+                    // multiplications are done: without it a shader that leaves something
+                    // else there (Shinobi 3D's skinning: products of a quaternion) puts its
+                    // vertices in the wrong place, and the player's model was not drawn.
+                    const std::string src1_ =
+                        (opcode == OpCode::Id::DPH || opcode == OpCode::Id::DPHI)
+                            ? fmt::format("vec4({}.xyz, 1.0)", src1)
+                            : std::move(src1);
                     if (sanitize_mul) {
-                        const std::string src1_ =
-                            (opcode == OpCode::Id::DPH || opcode == OpCode::Id::DPHI)
-                                ? fmt::format("vec4({}.xyz, 1.0)", src1)
-                                : std::move(src1);
-
                         dot = fmt::format("dot(sanitize_mul({}, {}), vec4(1.0))", src1_, src2);
                     } else {
-                        dot = fmt::format("dot({}, {})", src1, src2);
+                        dot = fmt::format("dot({}, {})", src1_, src2);
                     }
                 }
 

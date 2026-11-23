@@ -174,7 +174,14 @@ android {
             matchingFallbacks += listOf("release")
             externalNativeBuild {
                 cmake {
-                    arguments("-DENABLE_PROFILING=ON")
+                    // -PleanProfile builds this same app (package name, signature, so it
+                    // installs over the profiling build and keeps its data) without frame
+                    // pointers and trace markers: what the release build runs, for playing
+                    // and for telling what the instrumentation costs.
+                    arguments(
+                        if (project.hasProperty("leanProfile")) "-DENABLE_PROFILING=OFF"
+                        else "-DENABLE_PROFILING=ON"
+                    )
                 }
             }
         }

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 #include <vector>
 #include "video_core/work_rules/draw_record.h"
 
@@ -31,6 +32,14 @@ namespace VideoCore {
  * draw that is not is drawn, and all after it. What is not compared is what the game's memory
  * holds at the addresses the draws name: their vertices and textures are taken not to change
  * between the two runs of one frame.
+ *
+ * The clear may be a backdrop: a mesh drawn with the depth test at always that covers the
+ * viewport and resets colour, depth and stencil (Mario Kart 7 begins each eye with its sky,
+ * 192 vertices, and has one buffer for both eyes and the bottom screen: 180 of its 450 draws
+ * a frame are the right eye's). Whether a mesh covers the viewport takes shading its
+ * vertices, so it is asked of the first run's backdrop only, in one frame of sixteen until a
+ * frame has shown the two runs to be alike and in every frame from then on; the second run's
+ * backdrop is known by having the registers of the first.
  *
  * Not covered: runs that begin with a fill and not with a clear that is drawn (the fill of
  * the second run would have to be left out before the run is known to repeat), and eyes that
@@ -64,9 +73,20 @@ private:
     };
     static constexpr u32 MAX_DRAWS = 1024;
     static constexpr u32 FRAMES_ALIKE = 4;
+    static constexpr u32 MESH_ASKED_EVERY = 16;
+    static constexpr u32 MESH_TRUSTED_FOR = 8;
+    /// Two draws whose uniforms differ by no more than this share of their matrix make the
+    /// same image: a millionth of a matrix that puts a vertex on a screen of a few thousand
+    /// pixels moves it by a thousandth of a pixel. (Mario Kart 7 draws one quad of its right
+    /// eye with terms of 0.0001 of its matrix at the other sign, a shift of 1.4e-7; the other
+    /// 230 draws are the left eye's bit for bit.)
+    static constexpr float MAX_SAME_SHIFT = 1e-6f;
     static constexpr std::size_t MAX_SAMPLED = 256;
 
     bool LeavesOut(DrawFacts& facts);
+    /// For the log: which registers the draw has differently from the one at its place in the
+    /// first run
+    std::string DifferingRegister(DrawFacts& facts) const;
     /// The pattern is contradicted: what was learned about it is forgotten
     void EndPass(const char* why);
 
@@ -77,6 +97,16 @@ private:
     std::array<u32, 3> viewport{};
     /// The draws of the first run, and the textures they sample
     std::vector<DrawRecord> first;
+    /// Whether the first run began with a backdrop mesh and not a clear of a few vertices
+    bool first_is_mesh{};
+    /// With ExplainScenePasses: the registers each draw of the first run went by, to say which
+    /// of them a draw of the second run has differently
+    std::vector<std::vector<u32>> first_registers;
+    /// Counts frames, for asking about backdrops now and then (see above)
+    u32 frame_number{};
+    /// The backdrop last found to cover its viewport, by its registers, and in which frame
+    u64 backdrop_state{};
+    u32 backdrop_frame{};
     std::vector<PAddr> sampled;
     bool too_many_sampled{};
     /// Where the first run's image was transferred to

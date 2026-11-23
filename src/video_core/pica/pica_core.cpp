@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "common/archives.h"
 #include "common/hash.h"
 #include "common/hitch_tracker.h"
+#include "common/math_util.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -2360,7 +2362,9 @@ void PicaCore::DrawArrays(bool is_indexed) {
         // this, so this is left unimplemented for now. Revisit this when an issue is found in
         // games.
 
-        bool accelerate_draw = Settings::values.use_hw_shader && primitive_assembler.IsEmpty();
+        bool accelerate_draw =
+            Settings::values.use_hw_shader && primitive_assembler.IsEmpty() &&
+            (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::CpuVertexShading) == 0;
         const auto topology = primitive_assembler.GetTopology();
         if (topology == PipelineRegs::TriangleTopology::Shader ||
             topology == PipelineRegs::TriangleTopology::List) {
@@ -3335,10 +3339,210 @@ void PicaCore::DumpGeometryProgram() {
     }
 }
 
+void PicaCore::DumpMeshDraw(bool is_indexed) {
+    const auto& pipeline = regs.internal.pipeline;
+    const u32 count = pipeline.num_vertices;
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const bool index_u16 = index_info.format != 0;
+    const u8* index_address_8 =
+        memory.GpuRead(base_address + index_info.offset, count * (index_u16 ? 2 : 1));
+    if (is_indexed && index_address_8 == nullptr) {
+        VideoCore::FrameStateDump::Line("  draw mesh: its indices are not in memory");
+        return;
+    }
+    const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+
+    const VertexLoader loader(memory, pipeline);
+    ShaderUnit shader_unit;
+    shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+
+    const auto& rasterizer = regs.internal.rasterizer;
+    const f32 width = f24::FromRaw(rasterizer.viewport_size_x).ToFloat32() * 2.f;
+    const f32 height = f24::FromRaw(rasterizer.viewport_size_y).ToFloat32() * 2.f;
+    f32 lowest[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+    f32 highest[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+    u32 behind = 0;
+    u32 broken = 0;
+    u32 lowest_vertex = 0xFFFFFFFF;
+    u32 highest_vertex = 0;
+    std::string first;
+    // Inputs that are no ordinary numbers: the console multiplies an infinity by zero to zero,
+    // a host GPU to "not a number", so these are where a mesh can differ between the two
+    std::array<u32, 12> infinite_inputs{};
+    std::array<u32, 12> nan_inputs{};
+    std::array<f32, 12> largest_input{};
+    std::string odd_vertex;
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        lowest_vertex = std::min(lowest_vertex, vertex);
+        highest_vertex = std::max(highest_vertex, vertex);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        for (u32 attribute = 0; attribute < 12; attribute++) {
+            bool odd = false;
+            for (u32 component = 0; component < 4; component++) {
+                const f32 value = input[attribute][component].ToFloat32();
+                if (value != value) {
+                    nan_inputs[attribute]++;
+                    odd = true;
+                } else if (std::abs(value) > 3.0e38f) {
+                    infinite_inputs[attribute]++;
+                    odd = true;
+                } else {
+                    largest_input[attribute] = std::max(largest_input[attribute], std::abs(value));
+                }
+            }
+            if (odd && odd_vertex.empty()) {
+                odd_vertex =
+                    fmt::format(" the first: vertex #{} a{}=({},{},{},{})", vertex, attribute,
+                                input[attribute].x.ToFloat32(), input[attribute].y.ToFloat32(),
+                                input[attribute].z.ToFloat32(), input[attribute].w.ToFloat32());
+            }
+        }
+        shader_unit.LoadInput(regs.internal.vs, input);
+        shader_engine->Run(vs_setup, shader_unit);
+        AttributeBuffer output;
+        shader_unit.WriteOutput(regs.internal.vs, output);
+        const OutputVertex shaded{rasterizer, output};
+        const f32 w = shaded.pos.w.ToFloat32();
+        const f32 values[4] = {
+            (shaded.pos.x.ToFloat32() / w + 1.f) * width / 2.f +
+                static_cast<f32>(rasterizer.viewport_corner.x),
+            (shaded.pos.y.ToFloat32() / w + 1.f) * height / 2.f +
+                static_cast<f32>(rasterizer.viewport_corner.y),
+            shaded.pos.z.ToFloat32() / w,
+            w,
+        };
+        if (!(values[0] == values[0]) || !(values[1] == values[1]) || !(values[2] == values[2]) ||
+            !(w == w)) {
+            broken++;
+        } else {
+            behind += w <= 0.f;
+            for (u32 i = 0; i < 4; i++) {
+                lowest[i] = std::min(lowest[i], values[i]);
+                highest[i] = std::max(highest[i], values[i]);
+            }
+        }
+        if (index < 3) {
+            first += fmt::format(" #{} in", vertex);
+            for (u32 attribute = 0; attribute < 8; attribute++) {
+                first +=
+                    fmt::format("({:.3f},{:.3f},{:.3f},{:.3f})", input[attribute].x.ToFloat32(),
+                                input[attribute].y.ToFloat32(), input[attribute].z.ToFloat32(),
+                                input[attribute].w.ToFloat32());
+            }
+            first += fmt::format(
+                " out pos({:.3f},{:.3f},{:.3f},{:.3f}) colour({:.3f},{:.3f},"
+                "{:.3f},{:.3f}) tc0({:.4f},{:.4f})",
+                shaded.pos.x.ToFloat32(), shaded.pos.y.ToFloat32(), shaded.pos.z.ToFloat32(), w,
+                shaded.color.x.ToFloat32(), shaded.color.y.ToFloat32(), shaded.color.z.ToFloat32(),
+                shaded.color.w.ToFloat32(), shaded.tc0.x.ToFloat32(), shaded.tc0.y.ToFloat32());
+        }
+    }
+    std::string loaders;
+    for (const auto& attribute_loader : pipeline.vertex_attributes.attribute_loaders) {
+        if (attribute_loader.component_count != 0 && attribute_loader.byte_count != 0) {
+            loaders += fmt::format(" +{:X}/{}x{}", attribute_loader.data_offset.Value(),
+                                   attribute_loader.byte_count.Value(),
+                                   attribute_loader.component_count.Value());
+        }
+    }
+    // The attributes as the game declares them: b, ub, s or f and how many, or "fixed" for
+    // one that has the same value for every vertex
+    std::string attributes;
+    for (u32 n = 0; n < pipeline.vertex_attributes.GetNumTotalAttributes(); n++) {
+        if (pipeline.vertex_attributes.IsDefaultAttribute(n)) {
+            attributes += fmt::format(" a{}=fixed", n);
+            continue;
+        }
+        static constexpr std::array<const char*, 4> names{"b", "ub", "s", "f"};
+        attributes += fmt::format(
+            " a{}={}{}", n, names[static_cast<u32>(pipeline.vertex_attributes.GetFormat(n)) & 3],
+            pipeline.vertex_attributes.GetNumElements(n));
+    }
+    // And the register of the shader each goes to, for as many as the shader takes
+    attributes +=
+        fmt::format("; the shader takes {}:", regs.internal.vs.max_input_attribute_index + 1);
+    for (u32 n = 0; n <= regs.internal.vs.max_input_attribute_index; n++) {
+        attributes += fmt::format(" a{}>v{}", n, regs.internal.vs.GetRegisterForAttribute(n));
+    }
+    VideoCore::FrameStateDump::Line(fmt::format(
+        "  draw mesh, shaded here: x {:.1f} to {:.1f}, y {:.1f} to {:.1f} (pixels of the target), "
+        "depth {:.4f} to {:.4f}, w {:.3f} to {:.3f}; {} of {} vertices behind the viewer, {} not "
+        "numbers; vertices {} to {}; base {:08X} indices at {:08X} ({} bytes each) loaders{}; "
+        "attributes{}",
+        lowest[0], highest[0], lowest[1], highest[1], lowest[2], highest[2], lowest[3], highest[3],
+        behind, count, broken, lowest_vertex, highest_vertex, base_address,
+        base_address + index_info.offset, index_u16 ? 2 : 1, loaders, attributes));
+    VideoCore::FrameStateDump::Line("  draw mesh, its first vertices:" + first);
+    std::string odd_inputs = "  draw mesh, inputs that are no ordinary numbers:";
+    bool any_odd = false;
+    for (u32 attribute = 0; attribute < 12; attribute++) {
+        if (infinite_inputs[attribute] != 0 || nan_inputs[attribute] != 0) {
+            odd_inputs += fmt::format(" a{}: {} infinite, {} not numbers;", attribute,
+                                      infinite_inputs[attribute], nan_inputs[attribute]);
+            any_odd = true;
+        }
+    }
+    for (u32 i = 0; i < 96; i++) {
+        const auto& value = vs_setup.uniforms.f[i];
+        for (u32 component = 0; component < 4; component++) {
+            const f32 number = value[component].ToFloat32();
+            if (number != number || std::abs(number) > 3.0e38f) {
+                odd_inputs +=
+                    fmt::format(" c{}=({},{},{},{});", i, value.x.ToFloat32(), value.y.ToFloat32(),
+                                value.z.ToFloat32(), value.w.ToFloat32());
+                any_odd = true;
+                break;
+            }
+        }
+    }
+    if (!any_odd) {
+        odd_inputs += " none";
+    }
+    odd_inputs += odd_vertex;
+    odd_inputs += "; largest ordinary value of each attribute:";
+    for (u32 attribute = 0; attribute < pipeline.vertex_attributes.GetNumTotalAttributes();
+         attribute++) {
+        odd_inputs += fmt::format(" a{} {:.4g}", attribute, largest_input[attribute]);
+    }
+    VideoCore::FrameStateDump::Line(std::move(odd_inputs));
+    std::string uniforms = "  draw uniforms: bools";
+    for (u32 i = 0; i < 16; i++) {
+        uniforms += vs_setup.uniforms.b[i] ? '1' : '0';
+    }
+    for (u32 i = 0; i < 4; i++) {
+        const auto& value = vs_setup.uniforms.i[i];
+        uniforms += fmt::format(" i{}=({},{},{},{})", i, value.x, value.y, value.z, value.w);
+    }
+    u32 shown = 0;
+    for (u32 i = 0; i < 96; i++) {
+        const auto& value = vs_setup.uniforms.f[i];
+        // All of the last ones, where games keep constants, and the others while there is room
+        if (i < 88 && shown >= 64) {
+            continue;
+        }
+        if (value.x.ToFloat32() != 0.f || value.y.ToFloat32() != 0.f ||
+            value.z.ToFloat32() != 0.f || value.w.ToFloat32() != 0.f) {
+            uniforms += fmt::format(" c{}=({:.3f},{:.3f},{:.3f},{:.3f})", i, value.x.ToFloat32(),
+                                    value.y.ToFloat32(), value.z.ToFloat32(), value.w.ToFloat32());
+            shown++;
+        }
+    }
+    VideoCore::FrameStateDump::Line(std::move(uniforms));
+}
+
 void PicaCore::DumpSmallDraw(bool is_indexed) {
     const auto& pipeline = regs.internal.pipeline;
     const u32 count = pipeline.num_vertices;
-    if (pipeline.use_gs != PipelineRegs::UseGS::No || count == 0 || count > MAX_COVER_VERTICES) {
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || count == 0) {
+        return;
+    }
+    if (count > MAX_COVER_VERTICES) {
+        DumpMeshDraw(is_indexed);
         return;
     }
     // Of a mesh only where its vertices end up
@@ -3564,6 +3768,14 @@ namespace {
 
 /// The first of the two registers that start a jump, among the places of SCAN_SLOTS
 constexpr s8 SCAN_JUMP = static_cast<s8>(PicaCore::ListScanState::Count);
+/// And the first of the registers a draw's vertices and indices are found by, which are the
+/// first of the pipeline's (ListScanState::vertex), with the register that is
+constexpr s8 SCAN_VERTEX = SCAN_JUMP + 2;
+constexpr u32 SCAN_VERTEX_FIRST = PICA_REG_INDEX(pipeline);
+static_assert(PICA_REG_INDEX(pipeline.trigger_draw_indexed) <
+              SCAN_VERTEX_FIRST + PicaCore::ListScanState::VERTEX_REGS);
+static_assert(PICA_REG_INDEX(pipeline.command_buffer.size[0]) >=
+              SCAN_VERTEX_FIRST + PicaCore::ListScanState::VERTEX_REGS);
 
 /// For each register what TakeCalledLists has to do with it: -1 nothing, a place in
 /// ListScanState::regs for one it follows, SCAN_JUMP and SCAN_JUMP + 1 for the two that start
@@ -3583,6 +3795,9 @@ constexpr std::array<s8, RegsInternal::NUM_REGS> SCAN_SLOTS = [] {
     slots[PICA_REG_INDEX(pipeline.command_buffer.addr[0]) + 1] = State::Addr1;
     slots[PICA_REG_INDEX(pipeline.command_buffer.trigger[0])] = SCAN_JUMP;
     slots[PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + 1] = SCAN_JUMP + 1;
+    for (u32 i = 0; i < State::VERTEX_REGS; i++) {
+        slots[SCAN_VERTEX_FIRST + i] = static_cast<s8>(SCAN_VERTEX + i);
+    }
     return slots;
 }();
 
@@ -3595,6 +3810,75 @@ constexpr bool RunHasScanSlot(u32 low, u32 high) {
             high >= PICA_REG_INDEX(pipeline.command_buffer.size[0]));
 }
 
+/// And whether any of them is one a draw's vertices and indices are found by
+constexpr bool RunHasVertexSlot(u32 low, u32 high) {
+    return low < SCAN_VERTEX_FIRST + PicaCore::ListScanState::VERTEX_REGS &&
+           high >= SCAN_VERTEX_FIRST;
+}
+
+/// A draw is about to be found in a list that is handed over: tells the memory system what
+/// vertex and index data it reads, which is what LoadVertices and the rasterizers'
+/// AnalyzeVertexArray read for it (or more), so that the pages of it the game keeps writing
+/// are copied for the list. `words` are the pipeline's first registers as the lists leave
+/// them.
+void WantDrawReads(Memory::MemorySystem& memory,
+                   const std::array<u32, PicaCore::ListScanState::VERTEX_REGS>& words,
+                   bool indexed) {
+    // Read as the pipeline's own registers are (what lies behind the first of them is not
+    // looked at)
+    PipelineRegs pipeline;
+    std::memcpy(static_cast<void*>(&pipeline), words.data(), sizeof(words));
+    const u32 count = pipeline.num_vertices;
+    if (count == 0) {
+        return;
+    }
+    const auto& attributes = pipeline.vertex_attributes;
+    const PAddr base = attributes.GetPhysicalBaseAddress();
+    u32 lowest = pipeline.vertex_offset;
+    u32 highest = pipeline.vertex_offset + count - 1;
+    if (indexed) {
+        const bool index_u16 = static_cast<u32>(pipeline.index_array.format.Value()) != 0;
+        const PAddr index_addr = base + pipeline.index_array.offset;
+        const u32 index_bytes = count * (index_u16 ? 2 : 1);
+        memory.WantCopyOf(index_addr, index_bytes);
+        // Which vertices it reads is in the indices. They are looked through only if a
+        // volatile page lies where the vertices of some loader can be at all.
+        bool any = false;
+        for (const auto& loader : attributes.attribute_loaders) {
+            any |= loader.component_count != 0 && loader.byte_count != 0 &&
+                   memory.HasVolatileIn(base + loader.data_offset, 0x10000 * loader.byte_count);
+        }
+        if (!any) {
+            return;
+        }
+        const u8* const indices = memory.GetPhysicalPointer(index_addr);
+        if (indices == nullptr) {
+            // (The decoder draws nothing then)
+            return;
+        }
+        if (memory.PhysicalBytesFrom(index_addr) < index_bytes) {
+            // Indices that run out of the memory they are in: any vertex
+            lowest = 0;
+            highest = 0xFFFF;
+        } else if (index_u16) {
+            const auto [least, most] = Common::FindMinMax(
+                std::span<const u16>{reinterpret_cast<const u16*>(indices), count});
+            lowest = least;
+            highest = most;
+        } else {
+            const auto [least, most] = Common::FindMinMax(std::span<const u8>{indices, count});
+            lowest = least;
+            highest = most;
+        }
+    }
+    for (const auto& loader : attributes.attribute_loaders) {
+        if (loader.component_count != 0 && loader.byte_count != 0) {
+            memory.WantCopyOf(base + loader.data_offset + lowest * loader.byte_count,
+                              (highest - lowest + 1) * loader.byte_count);
+        }
+    }
+}
+
 } // Anonymous namespace
 
 PicaCore::ListScanState PicaCore::ListScanStateNow() const {
@@ -3605,11 +3889,14 @@ PicaCore::ListScanState PicaCore::ListScanStateNow() const {
             state.regs[slot] = reg[id];
         }
     }
+    for (u32 i = 0; i < ListScanState::VERTEX_REGS; i++) {
+        state.vertex[i] = reg[SCAN_VERTEX_FIRST + i];
+    }
     return state;
 }
 
 bool PicaCore::TakeCalledLists(Memory::MemorySystem& memory, const u8* bytes, u32 size,
-                               u32 readable, ListScanState& state,
+                               u32 readable, ListScanState& state, bool follow_draws,
                                std::vector<CalledListCopy>& lists, std::vector<u8>& taken) {
     // More than any game's frame has (Kirby: Planet Robobot jumps some 3000 times a frame).
     // A list that jumps to itself would go on for ever.
@@ -3635,6 +3922,19 @@ bool PicaCore::TakeCalledLists(Memory::MemorySystem& memory, const u8* bytes, u3
 
     const auto handle = [&](u32 id, u32 value, u32 mask) {
         const s8 slot = SCAN_SLOTS[id];
+        if (slot >= SCAN_VERTEX) {
+            // Where a draw's vertices and indices are, and the draw itself
+            const u32 write_mask = ExpandBitsToBytes[mask];
+            u32& word = state.vertex[static_cast<u32>(slot - SCAN_VERTEX)];
+            word = (word & ~write_mask) | (value & write_mask);
+            if (id == PICA_REG_INDEX(pipeline.trigger_draw) ||
+                id == PICA_REG_INDEX(pipeline.trigger_draw_indexed)) {
+                state.draws_followed++;
+                WantDrawReads(memory, state.vertex,
+                              id == PICA_REG_INDEX(pipeline.trigger_draw_indexed));
+            }
+            return;
+        }
         if (slot < SCAN_JUMP) {
             const u32 write_mask = ExpandBitsToBytes[mask];
             state.regs[slot] = (state.regs[slot] & ~write_mask) | (value & write_mask);
@@ -3692,7 +3992,8 @@ bool PicaCore::TakeCalledLists(Memory::MemorySystem& memory, const u8* bytes, u3
         index += 2;
         const u32 id = header.cmd_id;
         const u32 count = header.extra_data_length;
-        const bool followed = id < RegsInternal::NUM_REGS && SCAN_SLOTS[id] >= 0;
+        const s8 own_slot = id < RegsInternal::NUM_REGS ? SCAN_SLOTS[id] : s8{-1};
+        const bool followed = own_slot >= 0 && (own_slot < SCAN_VERTEX || follow_draws);
         if (followed) [[unlikely]] {
             handle(id, value, header.parameter_mask);
             if (stop) {
@@ -3733,13 +4034,16 @@ bool PicaCore::TakeCalledLists(Memory::MemorySystem& memory, const u8* bytes, u3
         }
         // The registers after it, one after the other. Those followed are picked out first:
         // a jump among them moves the walk, and the rest are still the old list's.
-        if (!RunHasScanSlot(id + 1, id + have)) [[likely]] {
+        if (!RunHasScanSlot(id + 1, id + have) &&
+            !(follow_draws && RunHasVertexSlot(id + 1, id + have))) [[likely]] {
             continue;
         }
-        std::array<std::pair<u32, u32>, 16> found;
+        // (No more of them than there are places in SCAN_SLOTS)
+        std::array<std::pair<u32, u32>, 64> found;
         u32 found_count = 0;
         for (u32 i = 0; i < have && id + 1 + i < RegsInternal::NUM_REGS; i++) {
-            if (SCAN_SLOTS[id + 1 + i] >= 0 && found_count < found.size()) {
+            const s8 slot = SCAN_SLOTS[id + 1 + i];
+            if (slot >= 0 && (slot < SCAN_VERTEX || follow_draws) && found_count < found.size()) {
                 found[found_count++] = {id + 1 + i, head[first + i]};
             }
         }

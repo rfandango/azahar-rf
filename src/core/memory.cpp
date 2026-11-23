@@ -404,8 +404,83 @@ public:
         /// moved on, or at which the page became volatile
         u32 read_turn{};
         u64 read_vblank{};
+        /// A draw of the list about to be handed over reads it (WantCopyOf)
+        bool wanted{};
+        /// Copied for every list until this VBlank: the decoder read it without a copy
+        u64 always_until{};
     };
     std::vector<VolatilePage> volatile_pages;
+    /// For each page 1 if it is one of them, 2 once the decoder has said it read it without
+    /// a copy (set here, looked at by the decoder), and how many there are
+    std::unique_ptr<std::atomic<u8>[]> volatile_flag;
+    std::atomic<u32> volatile_count{0};
+    /// Decoder to emulation thread, under reference_mutex: volatile pages it read for a list
+    /// that came without a copy of them
+    std::vector<u32> unheld_pages;
+    std::atomic<bool> has_unheld{false};
+    std::atomic<u64> unheld_reads{};
+    u64 narrowed_out{};
+    /// VBlanks a page is copied for every list after that
+    static constexpr u64 ALWAYS_COPIED_FOR = 600;
+    /// Whether following the draws pays (NoteDrawsFollowed): over FOLLOW_WINDOW lists the
+    /// draws followed and the pages left uncopied; a page not copied is taken to be worth
+    /// DRAWS_A_PAGE draws followed (a copy of a page nobody has in its cache is one to two
+    /// microseconds, a draw followed a quarter of one); and until which VBlank it is left be
+    u64 follow_draws{};
+    u64 follow_saved{};
+    u32 follow_lists{};
+    u64 follow_paused_until{};
+    /// How long it is left be the next time it does not pay: a few seconds the first time
+    /// (the lists right after a change of scene say little), twice as long each time after
+    /// that up to half a minute, and from the beginning again once it has paid
+    u64 follow_pause{FOLLOW_PAUSE_FIRST};
+    static constexpr u32 FOLLOW_WINDOW = 64;
+    static constexpr u64 DRAWS_A_PAGE = 4;
+    static constexpr u64 FOLLOW_PAUSE_FIRST = 300;
+    static constexpr u64 FOLLOW_PAUSE_MOST = 1800;
+
+    /// The volatile pages the stretch lies on: all of them where the stretch is not within
+    /// the memory they are counted in
+    std::pair<std::size_t, std::size_t> VolatileIn(PAddr addr, u32 size) const {
+        if (size == 0 || volatile_pages.empty()) {
+            return {0, 0};
+        }
+        const auto first = CellPage(addr);
+        const auto last = CellPage(addr + size - 1);
+        if (!first || !last || *last < *first) {
+            return {0, volatile_pages.size()};
+        }
+        const auto by_page = [](const VolatilePage& entry, std::size_t page) {
+            return entry.page < page;
+        };
+        const auto from =
+            std::lower_bound(volatile_pages.begin(), volatile_pages.end(), *first, by_page);
+        const auto to = std::lower_bound(from, volatile_pages.end(), *last + 1, by_page);
+        return {static_cast<std::size_t>(from - volatile_pages.begin()),
+                static_cast<std::size_t>(to - volatile_pages.begin())};
+    }
+
+    /// Decoder thread, on a list: a read of the stretch. Says so if a volatile page of it
+    /// came without a copy.
+    void NoteUnheldRead(PAddr addr, u32 size) {
+        const auto first = CellPage(addr);
+        const auto last = CellPage(addr + size - 1);
+        if (!first || !last || *last < *first) {
+            return;
+        }
+        for (std::size_t page = *first; page <= *last; page++) {
+            if (volatile_flag[page].load(std::memory_order_relaxed) == 0 ||
+                (snapshot_pages != nullptr && snapshot_slot[page] != 0)) {
+                continue;
+            }
+            unheld_reads.fetch_add(1, std::memory_order_relaxed);
+            if (volatile_flag[page].exchange(2, std::memory_order_relaxed) == 1) {
+                std::scoped_lock lock{reference_mutex};
+                unheld_pages.push_back(static_cast<u32>(page));
+                has_unheld.store(true, std::memory_order_relaxed);
+            }
+        }
+    }
     /// Those of them a command gets copies of, while they are made
     std::vector<VolatilePage*> snapshot_wanted;
     u64 snapshot_bytes_copied{};
@@ -451,6 +526,8 @@ public:
             return;
         }
         reference_state[page] |= 32;
+        volatile_flag[page].store(1, std::memory_order_relaxed);
+        volatile_count.fetch_add(1, std::memory_order_relaxed);
         VolatilePage entry{};
         entry.page = static_cast<u32>(page);
         entry.read_turn = snapshot_last_read[page].load(std::memory_order_relaxed);
@@ -1087,6 +1164,7 @@ MemorySystem::Impl::Impl(Core::System& system_)
     reference_state.resize(surface_cells.size());
     snapshot_slot.resize(surface_cells.size());
     snapshot_last_read = std::make_unique<std::atomic<u32>[]>(surface_cells.size());
+    volatile_flag = std::make_unique<std::atomic<u8>[]>(surface_cells.size());
     // The page tables made from here on get their views of it
     if (WantsHostMmu()) {
         host_backing = backing.get();
@@ -1934,9 +2012,27 @@ void MemorySystem::SetGpuReader(bool transfer) {
 
 void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued_before, u64 done,
                                     PAddr source_addr, u32 source_size,
-                                    std::span<const std::pair<PAddr, u32>> written,
+                                    std::span<const std::pair<PAddr, u32>> written, bool narrow,
                                     std::vector<u32>& snapshot_pages,
                                     std::vector<u8>& snapshot_bytes) {
+    if (impl->has_unheld.load(std::memory_order_relaxed)) [[unlikely]] {
+        // Pages the decoder read without a copy: what the draws of their list told was not
+        // all that was read of them. Copied for every list for a while.
+        std::vector<u32> unheld;
+        {
+            std::scoped_lock lock{impl->reference_mutex};
+            unheld.swap(impl->unheld_pages);
+            impl->has_unheld.store(false, std::memory_order_relaxed);
+        }
+        for (const u32 page : unheld) {
+            const auto entry = std::lower_bound(
+                impl->volatile_pages.begin(), impl->volatile_pages.end(), page,
+                [](const Impl::VolatilePage& one, u32 number) { return one.page < number; });
+            if (entry != impl->volatile_pages.end() && entry->page == page) {
+                entry->always_until = impl->late_vblank + Impl::ALWAYS_COPIED_FOR;
+            }
+        }
+    }
     std::vector<u32> fresh_list;
     std::vector<u32> fresh_transfer;
     std::vector<u32> fresh_written;
@@ -2003,6 +2099,33 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
         if (!((for_list && (bits & 1) != 0) || (for_transfer && (bits & 16) != 0))) {
             continue;
         }
+        if (narrow && !entry.wanted && impl->late_vblank >= entry.always_until) {
+            const auto kind = static_cast<GpuReference>(impl->reference_kind[entry.page]);
+            if (kind == GpuReference::VertexData || kind == GpuReference::IndexData) {
+                // No draw of the list reads it: no copy. (From here on a read of it without
+                // one is news again.) Whether the decoder reads it at all any more is looked
+                // at as for the pages that are copied.
+                impl->narrowed_out++;
+                impl->follow_saved++;
+                if (impl->volatile_flag[entry.page].load(std::memory_order_relaxed) == 2) {
+                    impl->volatile_flag[entry.page].store(1, std::memory_order_relaxed);
+                }
+                if ((entry.turn++ & 31) == 0) {
+                    const u32 read_turn =
+                        impl->snapshot_last_read[entry.page].load(std::memory_order_relaxed);
+                    if (read_turn != entry.read_turn) {
+                        entry.read_turn = read_turn;
+                        entry.read_vblank = impl->late_vblank;
+                    } else if ((bits & 2) == 0 &&
+                               impl->late_vblank - entry.read_vblank > Impl::FORGET_AFTER) {
+                        bits &= static_cast<u8>(~(1 | 16 | 32));
+                        forgotten.push_back(entry.page);
+                        demoted = true;
+                    }
+                }
+                continue;
+            }
+        }
         impl->snapshot_wanted.push_back(&entry);
     }
     if (!impl->snapshot_wanted.empty()) {
@@ -2064,7 +2187,12 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
     }
     if (demoted) {
         std::erase_if(volatile_pages, [&](const Impl::VolatilePage& entry) {
-            return (state[entry.page] & 32) == 0;
+            if ((state[entry.page] & 32) != 0) {
+                return false;
+            }
+            impl->volatile_flag[entry.page].store(0, std::memory_order_relaxed);
+            impl->volatile_count.fetch_sub(1, std::memory_order_relaxed);
+            return true;
         });
     }
     if (!forgotten.empty()) {
@@ -2242,6 +2370,50 @@ void MemorySystem::WantVolatile(PAddr addr, u32 size) {
     }
 }
 
+bool MemorySystem::BeginWantedCopies() {
+    bool any = false;
+    for (Impl::VolatilePage& entry : impl->volatile_pages) {
+        entry.wanted = false;
+        const auto kind = static_cast<GpuReference>(impl->reference_kind[entry.page]);
+        any |= kind == GpuReference::VertexData || kind == GpuReference::IndexData;
+    }
+    return any && impl->late_vblank >= impl->follow_paused_until &&
+           (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::LegacyPageCopies) == 0;
+}
+
+void MemorySystem::NoteDrawsFollowed(u32 draws) {
+    impl->follow_draws += draws;
+    if (++impl->follow_lists < Impl::FOLLOW_WINDOW) {
+        return;
+    }
+    if (impl->follow_saved * Impl::DRAWS_A_PAGE < impl->follow_draws) {
+        impl->follow_paused_until = impl->late_vblank + impl->follow_pause;
+        impl->follow_pause = std::min(impl->follow_pause * 2, Impl::FOLLOW_PAUSE_MOST);
+    } else {
+        impl->follow_pause = Impl::FOLLOW_PAUSE_FIRST;
+    }
+    impl->follow_draws = 0;
+    impl->follow_saved = 0;
+    impl->follow_lists = 0;
+}
+
+bool MemorySystem::HasVolatileIn(PAddr addr, u32 size) const {
+    const auto [from, to] = impl->VolatileIn(addr, size);
+    return to > from;
+}
+
+void MemorySystem::WantCopyOf(PAddr addr, u32 size) {
+    const auto [from, to] = impl->VolatileIn(addr, size);
+    for (std::size_t index = from; index < to; index++) {
+        impl->volatile_pages[index].wanted = true;
+    }
+}
+
+std::pair<u64, u64> MemorySystem::TakeNarrowFigures() {
+    return {std::exchange(impl->narrowed_out, 0),
+            impl->unheld_reads.exchange(0, std::memory_order_relaxed)};
+}
+
 void MemorySystem::UseGpuSnapshot(const std::vector<u32>& pages, const u8* bytes) {
     impl->snapshot_pages = &pages;
     impl->snapshot_bytes = bytes;
@@ -2276,6 +2448,13 @@ void MemorySystem::DropGpuSnapshot() {
 
 const u8* MemorySystem::GpuRead(PAddr addr, u32 size) {
     const u8* const direct = GetPhysicalPointer(addr);
+    // A page the game keeps writing, read for a list that came without a copy of it: the
+    // list's draws did not tell of this read (see BeginWantedCopies). The emulation thread
+    // is told, and copies the page for every list for a while.
+    if (impl->gpu_reader == 1 && size != 0 && direct != nullptr &&
+        impl->volatile_count.load(std::memory_order_relaxed) != 0) {
+        impl->NoteUnheldRead(addr, size);
+    }
     if (!impl->snapshot_pages || size == 0 || !direct) [[likely]] {
         return direct;
     }

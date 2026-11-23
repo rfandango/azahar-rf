@@ -39,6 +39,37 @@ void RepeatedEyeRule::EndPass(const char* why) {
     phase = Phase::Idle;
 }
 
+std::string RepeatedEyeRule::DifferingRegister(DrawFacts& facts) const {
+    std::string text{"registers or the vertex shader differ"};
+    if (at >= first_registers.size()) {
+        return text;
+    }
+    const std::vector<u32>& kept = first_registers[at];
+    const Pica::RegsInternal& regs = facts.Regs();
+    std::size_t place = 0;
+    u32 found = 0;
+    bool same_stretches = true;
+    facts.ForStateRegisters(false, [&](u32 from, u32 to) {
+        for (u32 id = from; id < to; id++, place++) {
+            if (place >= kept.size()) {
+                same_stretches = false;
+                return;
+            }
+            if (kept[place] != regs.reg_array[id] && found < 4) {
+                text += fmt::format("{} register {:03X} was {:08X} and is {:08X}",
+                                    found == 0 ? ":" : ",", id, kept[place], regs.reg_array[id]);
+                found++;
+            }
+        }
+    });
+    if (!same_stretches || place != kept.size()) {
+        text += ": not the same registers are gone by (a texture unit or the lights on or off)";
+    } else if (found == 0) {
+        text += ": no register, so the vertex shader's program or its operand table";
+    }
+    return text;
+}
+
 bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
     const Pica::RegsInternal& regs = facts.Regs();
     const auto& framebuffer = regs.framebuffer.framebuffer;
@@ -53,7 +84,31 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
     if (phase == Phase::Idle && !may_clear) {
         return false;
     }
-    const bool clears = may_clear && color != 0 && facts.CoversViewportExactly();
+    bool clears = may_clear && color != 0 && facts.CoversViewportExactly();
+    bool mesh_clears = false;
+    if (!clears && may_clear && color != 0 && facts.CoverTestIsCostly()) {
+        // A backdrop mesh may be the clear (see the class)
+        if (phase == Phase::Closed) {
+            // The first run's backdrop once more, by its registers: compared with it below
+            // like every draw of a second run
+            mesh_clears = to_target && first_is_mesh && !first.empty() &&
+                          first.front().state == facts.StateHash(false);
+        } else if (phase != Phase::Second &&
+                   (frames_alike != 0 || frame_number % MESH_ASKED_EVERY == 0)) {
+            // The backdrop that covered the viewport a few frames ago, by its registers, is
+            // taken to cover it now (its matrix moves with the camera): asked afresh one
+            // frame in MESH_TRUSTED_FOR
+            const u64 state = facts.StateHash(false);
+            if (state == backdrop_state && frame_number - backdrop_frame < MESH_TRUSTED_FOR) {
+                mesh_clears = true;
+            } else {
+                mesh_clears = facts.CoversViewport();
+                backdrop_state = mesh_clears ? state : 0;
+                backdrop_frame = frame_number;
+            }
+        }
+        clears = mesh_clears;
+    }
 
     if (phase == Phase::Closed) {
         if (clears && to_target) {
@@ -83,13 +138,16 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
             // the first run, the scene's last before the second).
             bool same_output = false;
             if (same_state) {
-                uniforms = CompareUniforms(first[at], facts, 0, 0.f);
+                uniforms = CompareUniforms(first[at], facts, 96, MAX_SAME_SHIFT);
                 if (uniforms.differing != 0 && first[at].has_output) {
                     u64 output = 0;
                     same_output = facts.OutputHash(output) && output == first[at].output;
                 }
             }
-            const u32 differing = same_output ? 0 : uniforms.differing;
+            // Uniforms that differ by less than can show count as the same (MAX_SAME_SHIFT)
+            const bool within_reach =
+                uniforms.differing != 0 && uniforms.largest_shift <= MAX_SAME_SHIFT;
+            const u32 differing = same_output || within_reach ? 0 : uniforms.differing;
             const bool same = same_state && differing == 0;
             if (!same) {
                 const u32 lines = (Common::TraceMarkers::Experiments3() &
@@ -114,7 +172,7 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
                                                first[at].has_output
                                                    ? ", and it does not put out the same either"
                                                    : "")
-                                 : std::string{"registers or the vertex shader differ"});
+                                 : DifferingRegister(facts));
                 }
                 repeats = false;
                 leaving_out = false;
@@ -131,6 +189,13 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
 
     const auto record = [&](bool with_output) {
         first.emplace_back(facts, false);
+        if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) !=
+            0) {
+            std::vector<u32>& kept = first_registers.emplace_back();
+            facts.ForStateRegisters(false, [&](u32 from, u32 to) {
+                kept.insert(kept.end(), &regs.reg_array[from], &regs.reg_array[to]);
+            });
+        }
         if (with_output) {
             first.back().has_output = facts.OutputHash(first.back().output);
         }
@@ -158,6 +223,8 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
                         Pica::FramebufferRegs::BytesPerColorPixel(framebuffer.color_format);
         viewport = draw_viewport;
         first.clear();
+        first_registers.clear();
+        first_is_mesh = mesh_clears;
         sampled.clear();
         too_many_sampled = false;
         // (What the clear puts out is kept: see where the second run is compared)
@@ -295,6 +362,7 @@ void RepeatedEyeRule::OnFrameEnd(const FrameFacts& facts) {
         frames_alike = 0;
     }
     completed = false;
+    frame_number++;
     // Runs are not paired across frames
     phase = Phase::Idle;
 

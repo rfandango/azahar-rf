@@ -796,10 +796,33 @@ public:
     /// from this hand-over on like pages the decoder has written before. (A game that clears
     /// video memory and then puts data there itself finds the data cleared if the clearing is
     /// carried out afterwards.)
+    /// `narrow`: the list's draws were followed (BeginWantedCopies, WantCopyOf) and a volatile
+    /// page of vertex or index data that none of them reads gets no copy.
     void ArmGpuReferences(bool for_list, bool for_transfer, u64 queued_before, u64 done,
                           PAddr source_addr, u32 source_size,
-                          std::span<const std::pair<PAddr, u32>> written, std::vector<u32>& pages,
-                          std::vector<u8>& bytes);
+                          std::span<const std::pair<PAddr, u32>> written, bool narrow,
+                          std::vector<u32>& pages, std::vector<u8>& bytes);
+    /// A game that builds its vertex data anew every frame has hundreds of volatile pages, and
+    /// a command list reads a few of them: a copy of each for every list was megabytes a
+    /// VBlank (Kid Icarus: Uprising: 206 pages for each of five lists, of which a list read
+    /// about ten). Whoever hands a list over can tell from its draws what vertex and index
+    /// data it reads, and then only those pages are copied. Emulation thread, before the list
+    /// is followed: takes the marks of the list before back and says whether any volatile
+    /// page holds such data at all (false: nothing to tell, every page is copied).
+    bool BeginWantedCopies();
+    /// Whether a volatile page lies in the stretch; marks those that do as read by the list
+    /// about to be handed over. (A page the decoder then reads without a copy all the same is
+    /// copied for every list for a while: see GpuRead.)
+    bool HasVolatileIn(PAddr addr, u32 size) const;
+    void WantCopyOf(PAddr addr, u32 size);
+    /// How many draws the list just followed had. Following costs something for every draw
+    /// and saves something for every page left uncopied: where it saves less than it costs
+    /// over a number of lists (a game of a thousand draws a frame with a few dozen such
+    /// pages), BeginWantedCopies says no for half a minute, and then it is tried again.
+    void NoteDrawsFollowed(u32 draws);
+    /// Volatile pages left uncopied because no draw of their list read them, and reads by
+    /// the decoder of such a page without a copy, since this was last asked
+    std::pair<u64, u64> TakeNarrowFigures();
     /// A write went to a page the decoder reads from while the decoder has work: the page is
     /// to be copied at hand-overs from now on, and stays armed until what is queued is done
     void WantVolatile(PAddr addr, u32 size);

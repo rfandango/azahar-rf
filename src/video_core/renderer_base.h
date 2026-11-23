@@ -156,6 +156,15 @@ protected:
     /// called once per VBlank.
     bool ShouldPresentImage();
 
+public:
+    /// Whether the model of the console's GPU time is left to make the game miss VBlanks
+    /// (VideoCore::GPU::PaceCompletion): only while the host has no room for more frames than
+    /// the game then draws. False where the host's GPU time is not measured.
+    [[nodiscard]] bool ModelledGpuCostsFrames() const noexcept {
+        return modelled_gpu_costs_frames.load(std::memory_order_relaxed);
+    }
+
+protected:
     Core::System& system;
     RendererSettings settings;
     Frontend::EmuWindow& render_window;    /// Reference to the render window handle.
@@ -187,6 +196,10 @@ private:
     std::chrono::nanoseconds load_window_waited{};    /// The emulation waiting for it
     std::chrono::microseconds load_window_work{};     /// The host at work on the emulation
     std::chrono::microseconds load_window_emulated{}; /// Emulated time
+    u64 load_window_game_frames = 0;                  /// The game's frame count at its start
+    // See ModelledGpuCostsFrames: the state, and stretches in a row that speak for the other
+    std::atomic<bool> modelled_gpu_costs_frames{false};
+    u32 model_change_windows = 0;
     // Stretches in a row, see GovernResolution
     u32 overloaded_windows = 0;
     u32 roomy_windows = 0;

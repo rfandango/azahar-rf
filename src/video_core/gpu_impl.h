@@ -45,6 +45,8 @@ struct GPU::Impl {
     RasterizerInterface* rasterizer;
     std::unique_ptr<SwRenderer::SwBlitter> sw_blitter;
     Core::TimingEventType* vblank_event;
+    /// The emulated time of the next VBlank, for PaceCompletion; zero while none is known
+    u64 next_vblank_ticks{};
     Service::GSP::InterruptHandler signal_interrupt;
 
     // The thread that decodes commands, see GPU::Submit. What is below the mutex is under it.
@@ -150,6 +152,10 @@ struct GPU::Impl {
     /// What the lists handed over leave in the registers a list's jumps go by (emulation
     /// thread), and what was taken along of lists jumped to since the last report
     Pica::PicaCore::ListScanState list_scan{};
+    /// Whether list_scan's registers of where draws read their vertices are as the lists
+    /// handed over leave them: looked up with nothing left to decode, and followed in every
+    /// list since
+    bool list_scan_draws_known{};
     u64 called_taken{};
     u64 called_taken_bytes{};
     /// Hand-overs where not all lists jumped to could be taken, and the time the taking took

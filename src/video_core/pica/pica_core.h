@@ -155,6 +155,15 @@ public:
     struct ListScanState {
         enum : u32 { IrqRequest, IrqCompare, IrqAutostop, Size0, Size1, Addr0, Addr1, Count };
         std::array<u32, Count> regs{};
+        /// The registers that say where the vertices and indices of a draw are: the first
+        /// VERTEX_REGS of the pipeline's (where attribute data begins, the twelve loaders,
+        /// the index array, how many vertices and from which one, the two that start a
+        /// draw). Followed only where TakeCalledLists is asked to, and right only if followed
+        /// without a break since they were last looked up.
+        static constexpr u32 VERTEX_REGS = 0x30;
+        std::array<u32, VERTEX_REGS> vertex{};
+        /// Draws followed so far, for whoever follows to take
+        u32 draws_followed{};
     };
     /// Those registers as they are now. Only where no list is being decoded.
     [[nodiscard]] ListScanState ListScanStateNow() const;
@@ -170,8 +179,11 @@ public:
     /// list adds that list as it is in the emulated memory now to `lists`, its bytes to
     /// `taken`. The lists are in the order they are jumped to. False if there were more lists
     /// than are taken along: then what is in `lists` is only the first of them.
+    /// With `follow_draws` the registers of ListScanState::vertex are followed as well, and
+    /// every draw has the memory system told what vertex and index data it reads, for the
+    /// copies of pages the game keeps writing (Memory::MemorySystem::WantCopyOf).
     static bool TakeCalledLists(Memory::MemorySystem& memory, const u8* bytes, u32 size,
-                                u32 readable, ListScanState& state,
+                                u32 readable, ListScanState& state, bool follow_draws,
                                 std::vector<CalledListCopy>& lists, std::vector<u8>& taken);
 
     /// Has the next ProcessCmdList read the lists it jumps to from these copies. Null: from
@@ -350,6 +362,10 @@ private:
     /// Frame dumps: where the vertices of a draw of two triangles at the most end up in the
     /// target, and which texture coordinates they have
     void DumpSmallDraw(bool is_indexed);
+    /// Frame dumps, for a draw of more vertices than that: where the mesh as a whole ends up
+    /// when it is shaded here, its first vertices as loaded and as shaded, and the uniforms.
+    /// Tells a mesh the host GPU draws wrongly from one whose data or constants are wrong.
+    void DumpMeshDraw(bool is_indexed);
     /// Frame dumps: the geometry shader program of a draw that has one, with its
     /// configuration, once for each
     void DumpGeometryProgram();

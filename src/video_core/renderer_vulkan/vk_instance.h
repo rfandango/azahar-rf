@@ -171,6 +171,12 @@ public:
         return image_format_list;
     }
 
+    /// Returns true when VK_EXT_separate_stencil_usage is supported: the stencil of a depth
+    /// image can then be declared for other uses than its depth
+    bool IsSeparateStencilUsageSupported() const {
+        return separate_stencil_usage;
+    }
+
     /// Returns true when VK_GOOGLE_display_timing is supported
     bool IsDisplayTimingSupported() const {
         return display_timing;
@@ -364,6 +370,7 @@ protected:
     bool null_descriptor{};
     bool fragment_shader_interlock{};
     bool image_format_list{};
+    bool separate_stencil_usage{};
     bool display_timing{};
     bool create_renderpass2{};
     bool depth_stencil_resolve{};

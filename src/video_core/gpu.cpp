@@ -453,10 +453,9 @@ Result GPU::Submit(const Service::GSP::Command& command) {
                 may_tell_early = false;
             }
         }
-        impl->memory.ArmGpuReferences(command.id == CommandId::SubmitCmdList, is_transfer,
-                                      impl->queued_seq, impl->done_seq.load(), source_addr,
-                                      source_size, written, item.snapshot_pages,
-                                      item.snapshot_bytes);
+        // Whether the list's draws were followed, so that only the pages they read of those
+        // the game keeps writing are copied for it (below)
+        bool draws_followed = false;
         if (command.id == CommandId::SubmitCmdList) {
             const auto& list = command.submit_gpu_cmdlist;
             const auto address = VirtualToPhysicalAddress(list.address, list.size);
@@ -478,19 +477,35 @@ Result GPU::Submit(const Service::GSP::Command& command) {
                     // lists before it may have written, which the decoder may not have got
                     // to yet: followed here from list to list, and looked up whenever
                     // nothing is left to decode.
-                    if (impl->done_seq.load() == impl->queued_seq) {
+                    const bool nothing_pending = impl->done_seq.load() == impl->queued_seq;
+                    if (nothing_pending) {
                         impl->list_scan = impl->pica.ListScanStateNow();
                     }
+                    // Where its draws read their vertices and indices is followed as well
+                    // while the game keeps writing pages of such data: those are copied for
+                    // the list, the others of that kind are not. The registers that takes are
+                    // known from the last look at them on, as long as every list is followed.
+                    impl->list_scan_draws_known = impl->memory.BeginWantedCopies() &&
+                                                  (nothing_pending || impl->list_scan_draws_known);
+                    draws_followed = impl->list_scan_draws_known;
                     item.has_called_lists = true;
                     const auto take_start = std::chrono::steady_clock::now();
                     item.called_lists.reserve(impl->called_lists_room);
                     item.called_bytes.reserve(impl->called_bytes_room);
                     if (!Pica::PicaCore::TakeCalledLists(impl->memory, item.list_copy.data(),
                                                          list_size, readable, impl->list_scan,
-                                                         item.called_lists, item.called_bytes)) {
+                                                         draws_followed, item.called_lists,
+                                                         item.called_bytes)) {
                         // Too many to take along: the game goes on when they are decoded
                         may_tell_early = false;
                         impl->called_not_all++;
+                        // (And the draws behind them were not seen)
+                        draws_followed = false;
+                        impl->list_scan_draws_known = false;
+                    }
+                    if (draws_followed) {
+                        impl->memory.NoteDrawsFollowed(
+                            std::exchange(impl->list_scan.draws_followed, 0));
                     }
                     impl->called_take_ns +=
                         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -503,13 +518,20 @@ Result GPU::Submit(const Service::GSP::Command& command) {
                         std::max(item.called_lists.size(), impl->called_lists_room * 15 / 16);
                     impl->called_bytes_room =
                         std::max(item.called_bytes.size(), impl->called_bytes_room * 15 / 16);
+                } else {
+                    impl->list_scan_draws_known = false;
                 }
             } else {
                 may_tell_early = false;
+                impl->list_scan_draws_known = false;
             }
         } else if (command.id != CommandId::MemoryFill) {
             pace_target = PaceTargetOf(command);
         }
+        impl->memory.ArmGpuReferences(command.id == CommandId::SubmitCmdList, is_transfer,
+                                      impl->queued_seq, impl->done_seq.load(), source_addr,
+                                      source_size, written, draws_followed, item.snapshot_pages,
+                                      item.snapshot_bytes);
     }
     std::vector<Impl::RaisedInterrupt> tell;
     {
@@ -806,6 +828,13 @@ void GPU::ReportDecoderWaits() {
     const auto [volatile_pages, copied] = impl->memory.TakeSnapshotFigures();
     waits += fmt::format("; {} pages copied at hand-over, {:.0f} KiB a vblank", volatile_pages,
                          static_cast<double>(copied) / 1024.0 / REPORT_VBLANKS);
+    // (Here and not at the end: the line is longer than the system's log takes)
+    if (const auto [left_uncopied, unheld] = impl->memory.TakeNarrowFigures();
+        left_uncopied != 0 || unheld != 0) {
+        waits += fmt::format(", {:.0f} a vblank left uncopied for lists whose draws do not "
+                             "read them, {} read without a copy",
+                             static_cast<double>(left_uncopied) / REPORT_VBLANKS, unheld);
+    }
     if (const auto ages = impl->memory.VolatileAgesNow();
         volatile_pages != 0 || ages.forgotten != 0) {
         waits +=
@@ -936,8 +965,35 @@ std::optional<PAddr> GPU::VirtualToPhysicalAddress(VAddr addr, u32 size) {
     return std::nullopt;
 }
 
+u64 GPU::PaceCompletion(Service::GSP::InterruptId id, u64 delay) {
+    using Service::GSP::InterruptId;
+    // The service adds its own time to a completion's, and the game's thread has to come
+    // round to it: this much before the VBlank
+    static constexpr u64 GUARD_NS = 1'500'000;
+    if (delay == 0 || (id != InterruptId::P3D && id != InterruptId::PPF &&
+                       id != InterruptId::PSC0 && id != InterruptId::PSC1)) {
+        return delay;
+    }
+    if (impl->renderer->ModelledGpuCostsFrames()) {
+        return delay;
+    }
+    const u64 now = static_cast<u64>(impl->timing.GetGlobalTicks());
+    if (impl->next_vblank_ticks <= now) {
+        return delay;
+    }
+    const u64 left = cyclesToNs(static_cast<s64>(impl->next_vblank_ticks - now));
+    if (delay + GUARD_NS <= left) {
+        return delay;
+    }
+    return left > GUARD_NS ? left - GUARD_NS : 0;
+}
+
 void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
-    impl->deliver_interrupt = handler;
+    // What the model of the console's GPU makes of a completion's time goes through
+    // PaceCompletion on its way to the game
+    impl->deliver_interrupt = [this, handler](Service::GSP::InterruptId id, u64 delay) {
+        handler(id, PaceCompletion(id, delay));
+    };
     // The service's handler schedules an event and wakes threads of the game: emulation
     // thread only. What the decoding thread raises is kept for DeliverInterrupts.
     Service::GSP::InterruptHandler raise = [this](Service::GSP::InterruptId id, u64 delay) {
@@ -1597,6 +1653,8 @@ void GPU::FinishHeldTransfer() {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+    impl->next_vblank_ticks =
+        static_cast<u64>(impl->timing.GetGlobalTicks() + FRAME_TICKS - cycles_late);
     if (impl->early_completion && UsesDecoder() && impl->renderer->ComposesApart()) {
         // The decoder works behind the game: at a VBlank it may still be on what was handed
         // over since the VBlank before, and on no more than that. Its composing of the image

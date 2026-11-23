@@ -29,6 +29,12 @@ namespace {
 
 /// VBlanks the GPU's load is added up over before anything is made of it
 constexpr u32 LOAD_WINDOW = 30;
+/// For the model of the console's GPU time (RendererBase::ModelledGpuCostsFrames): the load
+/// the GPU may have with a frame at every VBlank for the model to be reined in, the load
+/// from which it is given its way again, and the stretches in a row either takes
+constexpr float MODEL_ROOM_LOAD = 0.85f;
+constexpr float MODEL_FULL_LOAD = 0.93f;
+constexpr u32 MODEL_CHANGE_WINDOWS = 2;
 /// Such stretches with the emulation behind, in a row of stretches with the GPU holding it
 /// back, before the scale is lowered
 constexpr u32 OVERLOADED_WINDOWS = 3;
@@ -81,12 +87,16 @@ u32 RendererBase::GetResolutionScaleFactor() {
 
 void RendererBase::GovernResolution() {
     const bool governs = Settings::values.dynamic_resolution.GetValue();
-    const auto busy = TakeGpuTime(governs || Common::Hitches::IsEnabled());
+    // Also followed for the model of the console's GPU time, see ModelledGpuCostsFrames
+    const bool models = Settings::values.simulate_3ds_gpu_timings.GetValue();
+    const auto busy = TakeGpuTime(governs || models || Common::Hitches::IsEnabled());
     if (!busy) {
         scale_reduction.store(0, std::memory_order_relaxed);
         load_window_open = false;
+        modelled_gpu_costs_frames.store(false, std::memory_order_relaxed);
         return;
     }
+    const u64 game_frames = system.perf_stats->GetGameFrameCount();
     const auto now = std::chrono::steady_clock::now();
     const auto restart = [&] {
         load_window_open = true;
@@ -96,6 +106,7 @@ void RendererBase::GovernResolution() {
         load_window_waited = {};
         load_window_work = {};
         load_window_emulated = {};
+        load_window_game_frames = game_frames;
     };
     if (!load_window_open) {
         // What was just taken is of a time that was not followed
@@ -123,7 +134,38 @@ void RendererBase::GovernResolution() {
     const bool behind =
         limit > 0.0 && static_cast<double>(load_window_work.count()) >
                            static_cast<double>(load_window_emulated.count()) / limit * 1.003;
+    // The game's frames a VBlank in this stretch: one for a game at the display's rate
+    const float frame_rate =
+        static_cast<float>(game_frames - load_window_game_frames) / static_cast<float>(LOAD_WINDOW);
     restart();
+
+    // The model of the console's GPU time. It tells the game later that its drawing is done
+    // the more there was to draw, and a game with a frame rate of its own then leaves out
+    // frames, as it does on the console. Where the host's GPU has room for every frame, that
+    // only costs frames (Monster Hunter 4 Ultimate at 50 a second on a GPU two thirds busy):
+    // the model is then kept from reaching past a VBlank. Where the host has no room, the
+    // model is what lets the game shed frames instead of the emulation falling behind. Room
+    // is judged by what the GPU's load would be with a frame at every VBlank.
+    if (models) {
+        const bool costs = modelled_gpu_costs_frames.load(std::memory_order_relaxed);
+        const float at_full_rate = load / std::clamp(frame_rate, 0.25f, 1.f);
+        const bool speaks_for_change = costs ? (!behind && at_full_rate < MODEL_ROOM_LOAD)
+                                             : (behind || load > MODEL_FULL_LOAD);
+        model_change_windows = speaks_for_change ? model_change_windows + 1 : 0;
+        if (model_change_windows >= MODEL_CHANGE_WINDOWS) {
+            model_change_windows = 0;
+            modelled_gpu_costs_frames.store(!costs, std::memory_order_relaxed);
+            LOG_INFO(Render,
+                     "Host GPU {:.0f}% busy with {:.2f} frames of the game a VBlank{}: the model "
+                     "of the console's GPU time {}",
+                     load * 100.f, frame_rate, behind ? ", the emulation behind" : "",
+                     costs ? "is kept from costing the game VBlanks from now on"
+                           : "sets the game's pace from now on");
+        }
+    } else {
+        modelled_gpu_costs_frames.store(false, std::memory_order_relaxed);
+        model_change_windows = 0;
+    }
 
     const u32 asked = AskedResolutionScaleFactor();
     const u32 lowest = LowestGovernedScale(asked);

@@ -201,6 +201,13 @@ private:
 
     void VBlankCallback(uintptr_t user_data, s64 cycles_late);
 
+    /// The time after which a completion (of a command list, a transfer, a fill) is reported
+    /// to the game, given what the model of the console's GPU makes it: while the host has
+    /// room (RendererBase::ModelledGpuCostsFrames says no), one that would land after the
+    /// next VBlank lands just before it, so that the model alone never costs the game a
+    /// VBlank the host could have met.
+    u64 PaceCompletion(Service::GSP::InterruptId id, u64 delay);
+
     friend class boost::serialization::access;
     template <class Archive>
     void serialize(Archive& ar, const u32 file_version);

@@ -325,6 +325,16 @@ enum Experiment3 : std::uint32_t {
     /// the copy of a page that came with the command; and a copy between two places of the
     /// game's memory (DMA) does not wait for the commands handed over before it.
     UnheldCommandRanges = 16777216,
+    /// As before: every page the game keeps writing that the decoder has read for a command
+    /// list is copied for every list at hand-over, and not only the ones the vertex and
+    /// index data of that list's draws lie on (Memory::MemorySystem::BeginWantedCopies).
+    LegacyPageCopies = 33554432,
+    /// Vulkan, as before: a new image is not written when it is made. What a render pass that
+    /// neither loads nor clears then draws into is whatever the image's memory held, the
+    /// GPU's side data for it included (Vulkan::InitImages; with a Turnip that leaves an
+    /// Adreno's compression flags as it finds them, this reset a Retroid Pocket 5 in
+    /// Shinobi 3D). Read when an image is made.
+    UnwrittenImages = 67108864,
     // (33554432 and 67108864 switched longer blocks on until 2026-11-23: a conditional branch
     // ahead that leaves its block only where it is taken, and a block that goes on at the
     // target of a jump. Both ran fewer host instructions (2.84 to 2.79 to 2.68 for one of the
@@ -361,6 +371,11 @@ enum Experiment3 : std::uint32_t {
     /// its slow, in-order cores (Kid Icarus 2.78 against 2.77-2.79 s). Read when a game's
     /// recompiler is made: set before the game starts.
     ShareHostAddresses = 1073741824,
+    /// For telling where a mesh goes wrong: the vertex shader of every draw runs on the CPU
+    /// (as with hardware shaders off in the settings, but for this run only), so that the
+    /// host GPU gets vertices that are shaded already. A mesh that is right with this and
+    /// wrong without has its fault in the host's vertex shader or in what that is given.
+    CpuVertexShading = 2147483648,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as

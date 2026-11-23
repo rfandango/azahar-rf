@@ -476,6 +476,7 @@ bool Instance::CreateDevice() {
 
     add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     image_format_list = add_extension(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
+    separate_stencil_usage = add_extension(VK_EXT_SEPARATE_STENCIL_USAGE_EXTENSION_NAME);
     display_timing = add_extension(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
     create_renderpass2 = add_extension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
     depth_stencil_resolve = add_extension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);

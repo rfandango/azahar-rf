@@ -83,10 +83,13 @@ struct Handle {
         return *this;
     }
 
+    /// stencil_sampled: whether the stencil of a depth and stencil image is declared as
+    /// sampled where the usage of the image says sampled. Without, where the device can tell
+    /// the two apart, only its depth is: see Surface::MakeStencilSampleable.
     void Create(u32 width, u32 height, u32 levels, VideoCore::TextureType type, vk::Format format,
                 vk::SampleCountFlagBits samples, vk::ImageUsageFlags usage,
                 vk::ImageCreateFlags flags, vk::ImageAspectFlags aspect, bool need_format_list,
-                std::string_view debug_name = {});
+                std::string_view debug_name = {}, bool stencil_sampled = true);
 
     void Destroy();
 
@@ -161,6 +164,11 @@ public:
 
     /// Whether a surface of these guest pixels had to be given storage usage before
     bool HadStorageUse(PAddr addr, u32 width, u32 height) const;
+
+    /// The same for a depth and stencil surface whose stencil had to be sampled
+    /// (Surface::MakeStencilSampleable)
+    void NoteStencilUse(PAddr addr, u32 width, u32 height);
+    bool HadStencilUse(PAddr addr, u32 width, u32 height) const;
 
     /// Maps an internal staging buffer of the provided size for pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
@@ -251,6 +259,8 @@ private:
         bool operator==(const StorageUse&) const = default;
     };
     std::vector<StorageUse> storage_uses;
+    /// Guest surfaces whose stencil had to be sampled, oldest first, see NoteStencilUse
+    std::vector<StorageUse> stencil_uses;
     /// The blits that wait, see HasPendingBlits. Surfaces are told apart by a number of
     /// their own (the cache moves them about); the images are those the surfaces were in
     /// when the blit was asked for, which is why every change of them carries it out first.
@@ -427,6 +437,16 @@ public:
     /// a surface made from a texture pack stays as it is, see HasStorageUsage.
     bool MakeStorageCapable();
 
+    /// Gives a depth and stencil surface images whose stencil can be sampled, with what the
+    /// ones it had held, if it has none such yet. Surfaces are not created that way where the
+    /// device can declare the use of the stencil apart from that of the depth: an Adreno
+    /// without the format for reading stencil as a number (the 610 among them) keeps a depth
+    /// and stencil image whose stencil may be sampled uncompressed, and few surfaces ever
+    /// have theirs sampled (by a conversion or a copy done in a shader). Ends the render
+    /// pass. Views and framebuffers obtained before are for the old images. Returns whether
+    /// images changed.
+    bool MakeStencilSampleable();
+
     /// Returns the R32 image view used for atomic load/store.
     vk::ImageView StorageView() noexcept {
         is_storage = true;
@@ -459,7 +479,8 @@ public:
 
 private:
     /// Makes sure there is a second image, like the one the surface is in. Returns whether it
-    /// was made just now, with nothing in it and no layout.
+    /// was made just now and has no layout yet: a new one is written once in full and is in
+    /// the general layout, unless new images are left unwritten (see InitImages).
     bool EnsureCopyHandle();
 
     /// Performs blit between the scaled/unscaled images
@@ -486,6 +507,12 @@ public:
     vk::ImageCreateFlags image_flags{};
     bool image_format_list{};
     bool has_image_params{};
+    /// Whether the stencil of the images of the surface is declared as sampled
+    bool image_stencil_sampled{true};
+
+    /// Makes the images of the surface anew from image_usage, image_flags, image_format_list
+    /// and image_stencil_sampled, with what they held copied over; the old ones are retired
+    void RemakeImages();
     /// Where the second image may differ from the one the surface is in: all of it (also
     /// while there is no second image), or within a rectangle, which is empty while
     /// differs_x0 >= differs_x1. See NoteWritten.

@@ -221,8 +221,12 @@ private:
     SurfaceId FindMatch(const SurfaceParams& params, ScaleMatch match_scale_type,
                         std::optional<SurfaceInterval> validate_interval = std::nullopt);
 
-    /// Unregisters sentenced surfaces that have surpassed the destruction threshold.
-    void RunGarbageCollector();
+    /// Unregisters sentenced surfaces that have surpassed the destruction threshold: all the
+    /// GPU is done with if at_once, else those of them sentenced a few frames ago.
+    void RunGarbageCollector(bool at_once = false);
+
+    /// Puts a surface that is no longer in the cache on the list of those to be destroyed
+    void Sentence(SurfaceId surface_id);
 
     /// Removes any framebuffers that reference the provided surface_id.
     void RemoveFramebuffers(SurfaceId surface_id);
@@ -297,7 +301,17 @@ private:
     /// a game of 426 draws a frame). Samplers are never taken out of the map.
     std::array<std::pair<SamplerParams, SamplerId>, 4> recent_samplers{};
     u32 recent_sampler_next{};
-    std::list<std::pair<SurfaceId, u64>> sentenced;
+    /// A surface taken out of the cache. It stays until the GPU is done with what used it and
+    /// a few frames longer (RunGarbageCollector), and in that time a surface asked for with
+    /// the same parameters takes it over, images and all (CreateSurface). A game that draws
+    /// both screens into the same memory has its targets taken out and asked for again every
+    /// frame: Shinobi 3D made 200 new images a second that way.
+    struct Sentenced {
+        SurfaceId surface_id;
+        u64 last_used_tick;
+        u64 frame;
+    };
+    std::list<Sentenced> sentenced;
     Common::SlotVector<Surface> slot_surfaces;
     Common::SlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;

@@ -139,14 +139,28 @@ void RasterizerCache<T>::TickFrame() {
 }
 
 template <class T>
-void RasterizerCache<T>::RunGarbageCollector() {
+void RasterizerCache<T>::Sentence(SurfaceId surface_id) {
+    sentenced.push_back(Sentenced{
+        .surface_id = surface_id,
+        .last_used_tick = runtime.GetResourceTick(),
+        .frame = late_frame,
+    });
+}
+
+template <class T>
+void RasterizerCache<T>::RunGarbageCollector(bool at_once) {
+    /// Frames (TickFrame, one a VBlank) a sentenced surface is kept for CreateSurface to take
+    /// over: a game at 15 fps asks for a target again four VBlanks after it gave it up
+    static constexpr u64 SENTENCED_FRAMES = 8;
     const u64 resource_free_tick = runtime.GetResourceFreeTick();
     for (auto it = sentenced.begin(); it != sentenced.end();) {
-        const auto [surface_id, resource_last_used_tick] = *it;
+        const SurfaceId surface_id = it->surface_id;
+        const u64 resource_last_used_tick = it->last_used_tick;
         // Tick-values less than or equal to the current resource-tick are possibly still in-use.
         // Tick-values larger than the current resource-tick are not being utilized anymore and can
         // be safely deleted.
         if (resource_free_tick <= resource_last_used_tick ||
+            (!at_once && late_frame - it->frame < SENTENCED_FRAMES) ||
             runtime.StillNeeded(slot_surfaces[surface_id])) {
             // Resource is still in-use, skip deletion
             it++;
@@ -186,7 +200,7 @@ void RasterizerCache<T>::RemoveTextureCubeFace(SurfaceId surface_id) {
         }
         if (std::none_of(cube.face_ids.begin(), cube.face_ids.end(),
                          [](SurfaceId id) { return id; })) {
-            sentenced.emplace_back(cube.surface_id, runtime.GetResourceTick());
+            Sentence(cube.surface_id);
             it = texture_cube_cache.erase(it);
         } else {
             it++;
@@ -723,7 +737,7 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
         SurfaceId tmp_surface_id = CreateSurface(params, initial_flags);
         Surface& src_surface = slot_surfaces[src_surface_id];
         Surface& tmp_surface = slot_surfaces[tmp_surface_id];
-        sentenced.emplace_back(tmp_surface_id, runtime.GetResourceTick());
+        Sentence(tmp_surface_id);
 
         const TextureBlit blit = {
             .src_level = src_surface.LevelOf(params.addr),
@@ -2255,23 +2269,24 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
     const SurfaceId surface_id = [&] {
         const u64 resource_free_tick = runtime.GetResourceFreeTick();
         // Try to find a matching texture in the deletion queue
-        const auto it = std::find_if(sentenced.begin(), sentenced.end(), [&](const auto& pair) {
+        const auto it = std::find_if(sentenced.begin(), sentenced.end(), [&](const auto& entry) {
+            const Surface& candidate = slot_surfaces[entry.surface_id];
             return
                 // Only recycle the texture if:
                 // The texture-runtime is completely done with it
-                (resource_free_tick > pair.second)
+                (resource_free_tick > entry.last_used_tick)
                 // The surface parameters match the incoming texture
-                && (slot_surfaces[pair.first] == params)
+                && (candidate == params)
                 // Its resolution scale is equal or less than the incoming texture
-                && (slot_surfaces[pair.first].res_scale <= params.res_scale) &&
-                (slot_surfaces[pair.first].half_scale_x == params.half_scale_x) &&
-                (slot_surfaces[pair.first].half_scale_y == params.half_scale_y)
+                && (candidate.res_scale <= params.res_scale) &&
+                (candidate.half_scale_x == params.half_scale_x) &&
+                (candidate.half_scale_y == params.half_scale_y)
                 // Its sample count is equal or less than the incoming texture
-                && (slot_surfaces[pair.first].sample_count <= params.sample_count);
+                && (candidate.sample_count <= params.sample_count);
         });
         // If a matching texture was found in the deletion queue, recycle it.
         if (it != sentenced.end()) {
-            const SurfaceId surface_id = it->first;
+            const SurfaceId surface_id = it->surface_id;
             sentenced.erase(it);
             return surface_id;
         }
@@ -2340,7 +2355,7 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
 
     if (surface.type != SurfaceType::Fill) {
         RemoveTextureCubeFace(surface_id);
-        sentenced.emplace_back(surface_id, runtime.GetResourceTick());
+        Sentence(surface_id);
         return;
     }
 
@@ -2356,7 +2371,7 @@ void RasterizerCache<T>::UnregisterAll() {
         }
     }
     runtime.Finish();
-    RunGarbageCollector();
+    RunGarbageCollector(true);
 }
 
 template <class T>
