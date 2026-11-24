@@ -293,10 +293,10 @@ void SetPacing(const Pacing& pacing);
 /// How busy the host's GPU was over the last stretch of time, and the resolution scale the
 /// renderer draws at against the one the settings ask for.
 struct HostGpu {
-    float load;      ///< Share of the time it worked on what was sent to it, negative if unknown
-    float waited;    ///< Share of the time the emulation waited for it to finish a frame
-    u32 scale;       ///< Resolution scale in use
-    u32 asked_scale; ///< Resolution scale of the settings
+    float load;        ///< Share of the time it worked on what was sent to it, negative if unknown
+    float waited;      ///< Share of the time the emulation waited for it to finish a frame
+    float scale;       ///< Resolution scale in use
+    float asked_scale; ///< Resolution scale of the settings
 };
 void SetHostGpu(const HostGpu& gpu);
 

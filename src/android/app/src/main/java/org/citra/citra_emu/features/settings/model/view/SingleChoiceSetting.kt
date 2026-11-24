@@ -4,6 +4,7 @@
 
 package org.citra.citra_emu.features.settings.model.view
 
+import android.content.res.Resources
 import androidx.annotation.StringRes
 import org.citra.citra_emu.R
 import org.citra.citra_emu.features.settings.model.AbstractSetting
@@ -22,9 +23,21 @@ class SingleChoiceSetting(
     private val getValue: (() -> Int)? = null,
     private val setValue: ((Int) -> Unit)? = null,
     @StringRes override var disabledMessage: Int =
-        R.string.setting_disabled_description_incompatible_setting
+        R.string.setting_disabled_description_incompatible_setting,
+    // Choices that are put together, instead of those of choicesId and valuesId
+    private val ownChoices: Array<String>? = null,
+    private val ownValues: IntArray? = null
 ) : SettingsItem(setting, titleId, descriptionId) {
     override val type = TYPE_SINGLE_CHOICE
+
+    fun choices(resources: Resources): Array<String> =
+        ownChoices ?: resources.getStringArray(choicesId)
+
+    /**
+     * The value of each choice, or null if that is its place in the list.
+     */
+    fun values(resources: Resources): IntArray? =
+        ownValues ?: if (valuesId > 0) resources.getIntArray(valuesId) else null
 
     val selectedValue: Int
         get() {

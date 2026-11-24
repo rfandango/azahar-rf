@@ -261,7 +261,8 @@ private:
     /// spare, and the rectangle the draw is confined to otherwise
     Common::Rectangle<u32> WrittenBy(bool accelerate, bool is_indexed,
                                      const Common::Rectangle<u32>& draw_rect,
-                                     const VideoCore::ViewportInfo& viewport, u32 res_scale);
+                                     const VideoCore::ViewportInfo& viewport,
+                                     Common::ResolutionScale res_scale);
     /// What the draw that comes next overwrites of the area it is confined to
     bool next_draw_overwrites_color{};
     bool next_draw_overwrites_depth{};

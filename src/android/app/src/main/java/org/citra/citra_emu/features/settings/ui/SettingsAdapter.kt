@@ -238,7 +238,7 @@ class SettingsAdapter(val fragmentView: SettingsFragmentView, val context: Conte
         val value = getSelectionForSingleChoiceValue(item)
         dialog = MaterialAlertDialogBuilder(context)
             .setTitle(item.nameId)
-            .setSingleChoiceItems(item.choicesId, value, this)
+            .setSingleChoiceItems(item.choices(context.resources), value, this)
             .show()
     }
 
@@ -692,15 +692,8 @@ class SettingsAdapter(val fragmentView: SettingsFragmentView, val context: Conte
         }
     }
 
-    private fun getValueForSingleChoiceSelection(item: SingleChoiceSetting, which: Int): Int {
-        val valuesId = item.valuesId
-        return if (valuesId > 0) {
-            val valuesArray = context.resources.getIntArray(valuesId)
-            valuesArray[which]
-        } else {
-            which
-        }
-    }
+    private fun getValueForSingleChoiceSelection(item: SingleChoiceSetting, which: Int): Int =
+        item.values(context.resources)?.get(which) ?: which
 
     private fun getValueForMultiChoiceSelection(item: MultiChoiceSetting, which: Int): Int {
         val valuesId = item.valuesId
@@ -714,19 +707,7 @@ class SettingsAdapter(val fragmentView: SettingsFragmentView, val context: Conte
 
     private fun getSelectionForSingleChoiceValue(item: SingleChoiceSetting): Int {
         val value = item.selectedValue
-        val valuesId = item.valuesId
-        if (valuesId > 0) {
-            val valuesArray = context.resources.getIntArray(valuesId)
-            for (index in valuesArray.indices) {
-                val current = valuesArray[index]
-                if (current == value) {
-                    return index
-                }
-            }
-        } else {
-            return value
-        }
-        return -1
+        return item.values(context.resources)?.indexOf(value) ?: value
     }
 
     private fun getSelectionForMultiChoiceValue(item: MultiChoiceSetting): BooleanArray {

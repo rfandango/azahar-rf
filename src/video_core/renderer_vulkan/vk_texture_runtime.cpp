@@ -1300,7 +1300,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
     raw_images.emplace_back(handles[Type::Base].image);
 
     // Upscaled image
-    if (res_scale != 1) {
+    if (!res_scale.IsNative()) {
         handles[Type::Scaled].Create(GetScaledWidth(), GetScaledHeight(), levels, texture_type,
                                      format, vk::SampleCountFlagBits::e1, usage, flags,
                                      traits.aspect, need_format_list, DebugName(true),
@@ -1317,7 +1317,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
         raw_images.emplace_back(handles[Type::MultiSampled].image);
     }
 
-    current = res_scale != 1 ? Type::Scaled : Type::Base;
+    current = !res_scale.IsNative() ? Type::Scaled : Type::Base;
 
     runtime.renderpass_cache.EndRendering();
     scheduler.Record([raw_images, aspect = traits.aspect,
@@ -1353,7 +1353,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
                                false, debug_name);
     raw_images.emplace_back(handles[Type::Base].image);
 
-    if (res_scale != 1) {
+    if (!res_scale.IsNative()) {
         handles[Type::Scaled].Create(mat->width, mat->height, levels, texture_type,
                                      vk::Format::eR8G8B8A8Unorm, vk::SampleCountFlagBits::e1,
                                      traits.usage, flags, traits.aspect, false, debug_name);
@@ -1363,7 +1363,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
         handles[Type::MultiSampled].Create(
             GetScaledWidth(), GetScaledHeight(), levels, texture_type, format,
             vk::SampleCountFlagBits(sample_count), traits.usage, flags, traits.aspect, false,
-            DebugName(res_scale != 1, true, sample_count));
+            DebugName(!res_scale.IsNative(), true, sample_count));
         raw_images.emplace_back(handles[Type::MultiSampled].image);
     }
     if (has_normal) {
@@ -1373,14 +1373,14 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
         raw_images.emplace_back(handles[Type::Custom].image);
     }
 
-    current = res_scale != 1 ? Type::Scaled : Type::Base;
+    current = !res_scale.IsNative() ? Type::Scaled : Type::Base;
 
     // The image the pack's texture is scaled into is always one that can be cleared; the
     // others are in the pack's format
     boost::container::static_vector<vk::Image, 4> written_images;
     if (WritesNewImages(format)) {
         written_images = raw_images;
-    } else if (res_scale != 1 && WritesNewImages(vk::Format::eR8G8B8A8Unorm)) {
+    } else if (!res_scale.IsNative() && WritesNewImages(vk::Format::eR8G8B8A8Unorm)) {
         written_images.emplace_back(handles[Type::Scaled].image);
     }
 
@@ -1468,7 +1468,7 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
 
     runtime.upload_buffer.Commit(staging.size);
 
-    if (res_scale != 1) {
+    if (!res_scale.IsNative()) {
         ASSERT_MSG(handles[Type::Scaled], "Scaled allocation missing during upload");
 
         const VideoCore::TextureBlit blit = {
@@ -1575,7 +1575,7 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
         return;
     }
 
-    if (res_scale != 1) {
+    if (!res_scale.IsNative()) {
         const VideoCore::TextureBlit blit = {
             .src_level = download.texture_level,
             .dst_level = download.texture_level,
@@ -1647,7 +1647,7 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
         });
 }
 
-void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
+void Surface::ScaleUp(Common::ResolutionScale new_scale, u8 new_sample_count) {
     NoteAllWritten();
     // Of the kind the surface's images are, see the constructor
     const bool is_mutable =
@@ -1665,7 +1665,7 @@ void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
     }
 
     const bool res_scale_modified = res_scale != new_scale;
-    if (res_scale_modified && new_scale > 1) {
+    if (res_scale_modified && !new_scale.IsNative()) {
         res_scale = new_scale;
 
         // The surface moves to another image. What was recorded so far can be for the one it
@@ -1705,7 +1705,7 @@ void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
         handles[Type::MultiSampled].Create(
             GetScaledWidth(), GetScaledHeight(), levels, texture_type, traits.native,
             vk::SampleCountFlagBits(sample_count), traits.usage, flags, traits.aspect, false,
-            DebugName(res_scale != 1, false, sample_count));
+            DebugName(!res_scale.IsNative(), false, sample_count));
 
         // The multi-sampled image is just a transient image that is almost always immediately
         // resolved into the current image, and should not be representative of the entire surface!
@@ -1936,7 +1936,7 @@ bool Surface::CanSwapForOverwrite() const noexcept {
     return has_image_params && levels == 1 && sample_count == 1 &&
            texture_type == VideoCore::TextureType::Texture2D &&
            traits.aspect == vk::ImageAspectFlagBits::eColor &&
-           current == (res_scale != 1 ? Type::Scaled : Type::Base);
+           current == (!res_scale.IsNative() ? Type::Scaled : Type::Base);
 }
 
 vk::ImageView Surface::SwapForOverwrite(const Common::Rectangle<u32>& rect) noexcept {

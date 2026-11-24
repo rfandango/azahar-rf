@@ -57,9 +57,9 @@ inline constexpr vk::PushConstantRange COMPUTE_PUSH_CONSTANT_RANGE{
 struct RelayoutInfo {
     Common::Vec2i dst_offset;
     Common::Vec2i dst_extent;
-    s32 dst_scale;
-    s32 src_scale_x2;
-    s32 src_scale_y2;
+    s32 dst_eighths;
+    s32 src_eighths_x;
+    s32 src_eighths_y;
     s32 dst_width;
     s32 dst_height;
     s32 dst_tiled;
@@ -579,11 +579,14 @@ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
                                         static_cast<int>(copy.src_offset.y)},
             .dst_offset = Common::Vec2i{static_cast<int>(copy.dst_offset.x),
                                         static_cast<int>(copy.dst_offset.y)},
+            .src_extent = Common::Vec2i{static_cast<int>(copy.extent.width),
+                                        static_cast<int>(copy.extent.height)},
         };
         cmdbuf.pushConstants(compute_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                              sizeof(info), &info);
 
-        cmdbuf.dispatch(copy.extent.width / 8, copy.extent.height / 8, 1);
+        // (The host pixels of a tile are not a multiple of eight at every scale)
+        cmdbuf.dispatch((copy.extent.width + 7) / 8, (copy.extent.height + 7) / 8, 1);
 
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
                                vk::PipelineStageFlagBits::eEarlyFragmentTests |
@@ -629,9 +632,9 @@ bool BlitHelper::Relayout(Surface& source, Surface& dest,
                                     static_cast<int>(relayout.dst_rect.bottom)},
         .dst_extent = Common::Vec2i{static_cast<int>(relayout.dst_rect.GetWidth()),
                                     static_cast<int>(relayout.dst_rect.GetHeight())},
-        .dst_scale = static_cast<s32>(dest.res_scale),
-        .src_scale_x2 = static_cast<s32>(source.res_scale * (source.half_scale_x ? 1 : 2)),
-        .src_scale_y2 = static_cast<s32>(source.res_scale * (source.half_scale_y ? 1 : 2)),
+        .dst_eighths = static_cast<s32>(dest.Scaling().EighthsX()),
+        .src_eighths_x = static_cast<s32>(source.Scaling().EighthsX()),
+        .src_eighths_y = static_cast<s32>(source.Scaling().EighthsY()),
         .dst_width = static_cast<s32>(dest.width),
         .dst_height = static_cast<s32>(dest.height),
         .dst_tiled = dest.is_tiled,
@@ -1042,7 +1045,7 @@ void BlitHelper::FilterPass(Surface& surface, vk::Pipeline pipeline, vk::Pipelin
             },
     };
     renderpass_cache.BeginRendering(render_pass);
-    const float src_scale = static_cast<float>(surface.GetResScale());
+    const float src_scale = surface.GetResScale().Factor();
     // Calculate normalized texture coordinates like OpenGL does
     const auto src_extent = surface.RealExtent(false); // Get unscaled texture extent
     const float tex_scale_x =
@@ -1128,7 +1131,7 @@ void BlitHelper::FilterPassThreeTextures(Surface& surface, vk::Pipeline pipeline
     };
     renderpass_cache.BeginRendering(render_pass);
 
-    const float src_scale = static_cast<float>(surface.GetResScale());
+    const float src_scale = surface.GetResScale().Factor();
     // Calculate normalized texture coordinates like OpenGL does
     const auto src_extent = surface.RealExtent(false); // Get unscaled texture extent
     const float tex_scale_x =

@@ -388,7 +388,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
         texture_type == VideoCore::TextureType::CubeMap ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
 
     textures[0] = MakeHandle(target, width, height, levels, 1, tuple, DebugName(false));
-    if (res_scale != 1) {
+    if (!res_scale.IsNative()) {
         textures[1] = MakeHandle(target, GetScaledWidth(), GetScaledHeight(), levels, 1, tuple,
                                  DebugName(true, false));
     }
@@ -415,7 +415,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
     material = mat;
 
     textures[0] = MakeHandle(target, mat->width, mat->height, levels, 1, tuple, DebugName(false));
-    if (res_scale != 1) {
+    if (!res_scale.IsNative()) {
         textures[1] = MakeHandle(target, mat->width, mat->height, levels, 1, DEFAULT_TUPLE,
                                  DebugName(true, true));
     }
@@ -480,9 +480,9 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
         .src_level = upload.texture_level,
         .dst_level = upload.texture_level,
         .src_rect = upload.texture_rect,
-        .dst_rect = upload.texture_rect * res_scale,
+        .dst_rect = Scaling().Rect(upload.texture_rect),
     };
-    if (res_scale != 1 && !runtime->blit_helper.Filter(*this, blit)) {
+    if (!res_scale.IsNative() && !runtime->blit_helper.Filter(*this, blit)) {
         BlitScale(blit, true);
     }
 }
@@ -516,7 +516,7 @@ void Surface::UploadCustom(const VideoCore::Material* material, u32 level) {
         .src_rect = filter_rect,
         .dst_rect = filter_rect,
     };
-    if (res_scale != 1 && !runtime->blit_helper.Filter(*this, blit)) {
+    if (!res_scale.IsNative() && !runtime->blit_helper.Filter(*this, blit)) {
         BlitScale(blit, true);
     }
     for (u32 i = 1; i < VideoCore::MAX_MAPS; i++) {
@@ -541,11 +541,11 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
     glPixelStorei(GL_UNPACK_ROW_LENGTH, unscaled_width);
 
     // Scale down upscaled data before downloading it
-    if (res_scale != 1) {
+    if (!res_scale.IsNative()) {
         const VideoCore::TextureBlit blit = {
             .src_level = download.texture_level,
             .dst_level = download.texture_level,
-            .src_rect = download.texture_rect * res_scale,
+            .src_rect = Scaling().Rect(download.texture_rect),
             .dst_rect = download.texture_rect,
         };
         BlitScale(blit, false);
@@ -638,13 +638,13 @@ void Surface::Attach(GLenum target, u32 level, u32 layer, u32 handle) {
     }
 }
 
-void Surface::ScaleUp(u32 new_scale, u8 new_sample_count) {
+void Surface::ScaleUp(Common::ResolutionScale new_scale, u8 new_sample_count) {
     const DebugScope scope(*runtime, Common::Vec4f{},
                            "Surface::ScaleUp (NewScale:{} NewSamples:{})", new_scale,
                            new_sample_count);
 
     const bool res_scale_modified = res_scale != new_scale;
-    if (res_scale_modified && new_scale > 1) {
+    if (res_scale_modified && !new_scale.IsNative()) {
         res_scale = new_scale;
         textures[1] = MakeHandle(GL_TEXTURE_2D, GetScaledWidth(), GetScaledHeight(), levels, 1,
                                  tuple, DebugName(true));
@@ -698,7 +698,7 @@ void Surface::BlitScale(const VideoCore::TextureBlit& blit, bool up_scale) {
 Framebuffer::Framebuffer(TextureRuntime& runtime, const VideoCore::FramebufferParams& params,
                          const Surface* color, const Surface* depth)
     : VideoCore::FramebufferParams{params},
-      res_scale{color ? color->res_scale : (depth ? depth->res_scale : 1u)},
+      res_scale{color ? color->res_scale : (depth ? depth->res_scale : Common::ResolutionScale{})},
       sample_count{color ? color->sample_count : (depth ? depth->sample_count : 1u)} {
 
     if (shadow_rendering && !color) {
@@ -729,9 +729,9 @@ Framebuffer::Framebuffer(TextureRuntime& runtime, const VideoCore::FramebufferPa
 
     if (shadow_rendering) {
         glFramebufferParameteri(GL_DRAW_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH,
-                                color->width * res_scale);
+                                color->GetScaledWidth());
         glFramebufferParameteri(GL_DRAW_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT,
-                                color->height * res_scale);
+                                color->GetScaledHeight());
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0,
                                0);

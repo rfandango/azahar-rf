@@ -4,6 +4,7 @@
 
 package org.citra.citra_emu.features.settings.model
 
+import kotlin.math.roundToInt
 import org.citra.citra_emu.display.PortraitScreenLayout
 import org.citra.citra_emu.display.ScreenLayout
 import org.citra.citra_emu.features.settings.SettingKeys
@@ -11,7 +12,9 @@ import org.citra.citra_emu.features.settings.SettingKeys
 enum class IntSetting(
     override val key: String,
     override val section: String,
-    override val defaultValue: Int
+    override val defaultValue: Int,
+    // Steps of the value here for each whole number in the file
+    private val stepsOfOne: Int = 1
 ) : AbstractSetting<Int> {
     FRAME_LIMIT(SettingKeys.frame_limit(), CitraSettings.SECTION_RENDERER, 100),
     EMULATED_REGION(SettingKeys.region_value(), CitraSettings.SECTION_SYSTEM, -1),
@@ -20,7 +23,8 @@ enum class IntSetting(
     CAMERA_OUTER_LEFT_FLIP(SettingKeys.camera_outer_left_flip(), CitraSettings.SECTION_CAMERA, 0),
     CAMERA_OUTER_RIGHT_FLIP(SettingKeys.camera_outer_right_flip(), CitraSettings.SECTION_CAMERA, 0),
     GRAPHICS_API(SettingKeys.graphics_api(), CitraSettings.SECTION_RENDERER, 2),
-    RESOLUTION_FACTOR(SettingKeys.resolution_factor(), CitraSettings.SECTION_RENDERER, 1),
+    // In quarters: 4 for the console's own resolution, 0 for one that goes by the screen
+    RESOLUTION_FACTOR(SettingKeys.resolution_factor(), CitraSettings.SECTION_RENDERER, 4, 4),
     STEREOSCOPIC_3D_MODE(SettingKeys.render_3d(), CitraSettings.SECTION_RENDERER, 2),
     STEREOSCOPIC_3D_DEPTH(SettingKeys.factor_3d(), CitraSettings.SECTION_RENDERER, 0),
     STEPS_PER_HOUR(SettingKeys.steps_per_hour(), CitraSettings.SECTION_SYSTEM, 0),
@@ -96,7 +100,17 @@ enum class IntSetting(
     ASPECT_RATIO(SettingKeys.aspect_ratio(), CitraSettings.SECTION_LAYOUT, 0),
     UPDATE_CHECK_CHANNEL(SettingKeys.update_check_channel(), CitraSettings.SECTION_MISC, 0);
 
+    override fun valueToString(value: Int): String = if (value % stepsOfOne == 0) {
+        (value / stepsOfOne).toString()
+    } else {
+        (value.toFloat() / stepsOfOne).toString()
+    }
+
     override fun valueFromString(string: String): Int? {
+        if (stepsOfOne != 1) {
+            return string.toFloatOrNull()?.let { (it * stepsOfOne).roundToInt() }
+        }
+
         var value = string.toIntOrNull()
         if (value == null) {
             value = when (string.trim().lowercase()) {

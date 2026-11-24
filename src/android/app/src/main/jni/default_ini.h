@@ -185,7 +185,7 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 
 # Resolution scale factor
 # 0: Auto (scales resolution to window size), 1: Native 3DS screen resolution, Otherwise a scale
-# factor for the 3DS resolution
+# factor for the 3DS resolution, in steps of 0.25 (4.5 for 1800x1080)
 )") DECLARE_KEY(resolution_factor) BOOST_HANA_STRING(R"(
 
 # Lower the resolution scale factor (to half of it at the most) while the GPU cannot keep up

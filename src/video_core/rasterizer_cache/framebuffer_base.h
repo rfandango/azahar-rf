@@ -14,11 +14,13 @@ namespace VideoCore {
 
 class SurfaceBase;
 
+/// Not in whole host pixels: where the scale is not a whole number, neither is the place of
+/// the viewport the game asks for
 struct ViewportInfo {
-    s32 x;
-    s32 y;
-    s32 width;
-    s32 height;
+    f32 x;
+    f32 y;
+    f32 width;
+    f32 height;
 };
 
 struct FramebufferParams {
@@ -102,11 +104,12 @@ public:
             std::clamp<s32>(static_cast<s32>(surfaces_rect.bottom) + viewport_scaled.bottom,
                             surfaces_rect.bottom, surfaces_rect.top);
 
-        // Update viewport
-        viewport.x = static_cast<s32>(surfaces_rect.left) + viewport_scaled.left;
-        viewport.y = static_cast<s32>(surfaces_rect.bottom) + viewport_scaled.bottom;
-        viewport.width = viewport_scaled.GetWidth();
-        viewport.height = viewport_scaled.GetHeight();
+        // Update viewport. (Its size is what the game says, whichever way round its corners
+        // end up.)
+        viewport.x = static_cast<f32>(surfaces_rect.left) + scale.BorderX(viewport_rect.left);
+        viewport.y = static_cast<f32>(surfaces_rect.bottom) + scale.BorderY(viewport_rect.bottom);
+        viewport.width = scale.BorderX(viewport_rect.GetWidth());
+        viewport.height = scale.BorderY(viewport_rect.GetHeight());
 
         // Scissor checks are window-, not viewport-relative, which means that if the cached texture
         // sub-rect changes, the scissor bounds also need to be updated.

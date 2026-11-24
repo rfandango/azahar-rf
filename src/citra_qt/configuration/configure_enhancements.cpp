@@ -6,15 +6,38 @@
 #include <QListView>
 #include "citra_qt/configuration/configuration_shared.h"
 #include "citra_qt/configuration/configure_enhancements.h"
+#include "common/resolution_scale.h"
 #include "common/settings.h"
 #include "ui_configure_enhancements.h"
 #ifdef ENABLE_OPENGL
 #include "video_core/renderer_opengl/post_processing_opengl.h"
 #endif
 
+namespace {
+
+// The resolution factors to choose from: by the size of the window, and from the console's own
+// resolution up to 18 times that in steps of a quarter
+constexpr u32 STEPS = Common::ResolutionScale::STEPS;
+constexpr int NUM_RESOLUTION_FACTORS = 1 + 17 * STEPS + 1;
+
+float ResolutionFactorAt(int index) {
+    return index == 0 ? 0.f : 1.f + static_cast<float>(index - 1) / static_cast<float>(STEPS);
+}
+
+int IndexOfResolutionFactor(float factor) {
+    return factor == 0.f
+               ? 0
+               : static_cast<int>(Common::ResolutionScale::Closest(factor).Steps() - STEPS) + 1;
+}
+
+} // Anonymous namespace
+
 ConfigureEnhancements::ConfigureEnhancements(QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureEnhancements>()) {
     ui->setupUi(this);
+    for (int index = 0; index < NUM_RESOLUTION_FACTORS; index++) {
+        ui->resolution_factor_combobox->addItem(ResolutionName(index));
+    }
 
     SetupPerGameUI();
     SetConfiguration();
@@ -56,8 +79,12 @@ ConfigureEnhancements::~ConfigureEnhancements() = default;
 void ConfigureEnhancements::SetConfiguration() {
 
     if (!Settings::IsConfiguringGlobal()) {
-        ConfigurationShared::SetPerGameSetting(ui->resolution_factor_combobox,
-                                               &Settings::values.resolution_factor);
+        const auto& resolution_factor = Settings::values.resolution_factor;
+        ui->resolution_factor_combobox->setCurrentIndex(
+            resolution_factor.UsingGlobal()
+                ? ConfigurationShared::USE_GLOBAL_INDEX
+                : IndexOfResolutionFactor(resolution_factor.GetValue()) +
+                      ConfigurationShared::USE_GLOBAL_OFFSET);
         ConfigurationShared::SetPerGameSetting(ui->antialiasing_combobox,
                                                &Settings::values.antialiasing);
         ConfigurationShared::SetPerGameSetting(ui->texture_filter_combobox,
@@ -66,7 +93,7 @@ void ConfigureEnhancements::SetConfiguration() {
                                           !Settings::values.texture_filter.UsingGlobal());
     } else {
         ui->resolution_factor_combobox->setCurrentIndex(
-            Settings::values.resolution_factor.GetValue());
+            IndexOfResolutionFactor(Settings::values.resolution_factor.GetValue()));
         ui->antialiasing_combobox->setCurrentIndex(
             static_cast<int>(Settings::values.antialiasing.GetValue()));
         ui->texture_filter_combobox->setCurrentIndex(
@@ -122,13 +149,29 @@ void ConfigureEnhancements::updateShaders(Settings::StereoRenderOption stereo_op
 #endif
 }
 
+QString ConfigureEnhancements::ResolutionName(int index) const {
+    const float factor = ResolutionFactorAt(index);
+    if (factor == 0.f) {
+        return tr("Auto (Window Size)");
+    }
+    if (factor == 1.f) {
+        return tr("Native (400x240)");
+    }
+    return tr("%1x Native (%2x%3)").arg(factor).arg(400.f * factor).arg(240.f * factor);
+}
+
 void ConfigureEnhancements::RetranslateUI() {
     ui->retranslateUi(this);
+    auto* const combobox = ui->resolution_factor_combobox;
+    const int first = combobox->count() - NUM_RESOLUTION_FACTORS;
+    for (int index = 0; index < NUM_RESOLUTION_FACTORS; index++) {
+        combobox->setItemText(first + index, ResolutionName(index));
+    }
 }
 
 void ConfigureEnhancements::ApplyConfiguration() {
     ConfigurationShared::ApplyPerGameSetting(&Settings::values.resolution_factor,
-                                             ui->resolution_factor_combobox);
+                                             ui->resolution_factor_combobox, ResolutionFactorAt);
     ConfigurationShared::ApplyPerGameSetting(&Settings::values.antialiasing,
                                              ui->antialiasing_combobox);
     Settings::values.render_3d =
@@ -208,7 +251,7 @@ void ConfigureEnhancements::SetupPerGameUI() {
 
     ConfigurationShared::SetColoredComboBox(
         ui->resolution_factor_combobox, ui->widget_resolution,
-        static_cast<int>(Settings::values.resolution_factor.GetValue(true)));
+        IndexOfResolutionFactor(Settings::values.resolution_factor.GetValue(true)));
 
     ConfigurationShared::SetColoredComboBox(
         ui->antialiasing_combobox, ui->widget_antialiasing,

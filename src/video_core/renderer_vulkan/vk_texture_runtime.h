@@ -347,7 +347,7 @@ public:
     }
 
     /// Returns resolution scale of the surface
-    u32 GetResScale() const noexcept {
+    Common::ResolutionScale GetResScale() const noexcept {
         return res_scale;
     }
 
@@ -466,7 +466,7 @@ public:
                   const VideoCore::StagingData& staging, bool wait = true);
 
     /// Scales up the surface to match the new resolution scale and sample-count.
-    void ScaleUp(u32 new_scale, u8 new_sample_count);
+    void ScaleUp(Common::ResolutionScale new_scale, u8 new_sample_count);
 
     /// Returns the bpp of the internal surface format
     u32 GetInternalBytesPerPixel() const;
@@ -609,7 +609,7 @@ public:
         return render_pass;
     }
 
-    u32 Scale() const noexcept {
+    Common::ResolutionScale Scale() const noexcept {
         return scale.res_scale;
     }
 

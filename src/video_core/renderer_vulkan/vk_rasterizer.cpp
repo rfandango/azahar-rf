@@ -757,7 +757,7 @@ bool RasterizerVulkan::SmallDrawMustShow(bool is_indexed) {
 Common::Rectangle<u32> RasterizerVulkan::WrittenBy(bool accelerate, bool is_indexed,
                                                    const Common::Rectangle<u32>& draw_rect,
                                                    const VideoCore::ViewportInfo& viewport,
-                                                   u32 res_scale) {
+                                                   Common::ResolutionScale res_scale) {
     // A game that scales an image down step by step inside one target (the levels of a glow,
     // side by side) draws a small quad at each step that samples what the step before drew.
     // For each of them the target's second image is brought up to date where the target was
@@ -798,10 +798,10 @@ Common::Rectangle<u32> RasterizerVulkan::WrittenBy(bool accelerate, bool is_inde
     // The viewport of the host puts -1 at its x and y and 1 at the far side, as the console's
     // does. The host shades the vertices itself and may end up a fraction of a pixel away from
     // where they were found here: a pixel of the console on every side covers that.
-    const auto along = [](f32 at, s32 start, s32 length) {
-        return static_cast<f32>(start) + (at + 1.f) * 0.5f * static_cast<f32>(length);
+    const auto along = [](f32 at, f32 start, f32 length) {
+        return start + (at + 1.f) * 0.5f * length;
     };
-    const s32 spare = static_cast<s32>(res_scale) + 1;
+    const s32 spare = static_cast<s32>(res_scale.RoundedUp()) + 1;
     const s32 x0 =
         static_cast<s32>(std::floor(along(box.left, viewport.x, viewport.width))) - spare;
     const s32 x1 =
@@ -1094,7 +1094,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
 
     // Configure viewport and scissor
     const auto viewport = fb_helper.Viewport();
-    pipeline_info.dynamic_info.viewport = Common::Rectangle<s32>{
+    pipeline_info.dynamic_info.viewport = Common::Rectangle<f32>{
         viewport.x,
         viewport.y,
         viewport.x + viewport.width,

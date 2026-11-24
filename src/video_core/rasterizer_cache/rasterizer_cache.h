@@ -36,6 +36,13 @@ constexpr auto RangeFromInterval(const auto& map, const auto& interval) {
     return boost::make_iterator_range(map.equal_range(interval));
 }
 
+/// Whether two rectangles of host pixels can be copied one to the other. Those of the same guest
+/// pixels in two surfaces of one scale mostly can; where the scale is not a whole number and the
+/// rectangle not one of whole tiles, its place decides whether it has a host pixel more or less.
+inline bool HasSameSize(const Common::Rectangle<u32>& a, const Common::Rectangle<u32>& b) {
+    return a.GetWidth() == b.GetWidth() && a.GetHeight() == b.GetHeight();
+}
+
 template <class T>
 RasterizerCache<T>::RasterizerCache(Memory::MemorySystem& memory_,
                                     CustomTexManager& custom_tex_manager_, Runtime& runtime_,
@@ -120,7 +127,7 @@ void RasterizerCache<T>::TickFrame() {
         UnregisterAll();
     }
 
-    const u32 scale_factor = renderer.GetResolutionScaleFactor();
+    const Common::ResolutionScale scale_factor = renderer.GetResolutionScaleFactor();
     const u32 samples = renderer.GetSampleCount();
     const bool resolution_scale_changed = resolution_scale_factor != scale_factor;
     const bool sample_count_changed = sample_count != samples;
@@ -253,15 +260,16 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
     src_params.size = ((src_params.height - 1) * src_params.stride) + src_params.width;
     src_params.end = src_params.addr + src_params.size;
 
-    const auto [src_surface_id, src_rect] = GetTexCopySurface(src_params);
+    const auto [src_surface_id, src_subrect] = GetTexCopySurface(src_params);
     if (!src_surface_id) {
         return false;
     }
 
     const SurfaceParams src_info = slot_surfaces[src_surface_id];
+    const Common::Rectangle<u32> src_rect = src_info.Scaling().Rect(src_subrect);
     NoteFullSizeUse(src_info);
-    const u32 copy_width = src_info.Scaling().GuestX(src_rect.GetWidth());
-    const u32 copy_height = src_info.Scaling().GuestY(src_rect.GetHeight());
+    const u32 copy_width = src_subrect.GetWidth();
+    const u32 copy_height = src_subrect.GetHeight();
     if (output_gap != 0 &&
         (output_width != src_info.BytesInPixels(copy_width) * (src_info.is_tiled ? 8 : 1) ||
          output_gap % src_info.BytesInPixels(src_info.is_tiled ? 64 : 1) != 0)) {
@@ -315,22 +323,30 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
         return false;
     }
 
-    if (src_rect.GetWidth() != dst_rect.GetWidth()) {
+    if (src_surface.Scaling() == dst_surface.Scaling() && !HasSameSize(src_rect, dst_rect)) {
+        const TextureBlit texture_blit = {
+            .src_level = src_surface.LevelOf(src_params.addr),
+            .dst_level = dst_surface.LevelOf(dst_params.addr),
+            .src_rect = src_rect,
+            .dst_rect = dst_rect,
+        };
+        runtime.BlitTextures(src_surface, dst_surface, texture_blit);
+    } else if (src_rect.GetWidth() != dst_rect.GetWidth()) {
         LOG_ERROR(
             HW_GPU,
             "Surface source and destination width mismatch, skipping... src_width={}, dst_width={}",
             src_rect.GetWidth(), dst_rect.GetHeight());
         return false;
+    } else {
+        const TextureCopy texture_copy = {
+            .src_level = src_surface.LevelOf(src_params.addr),
+            .dst_level = dst_surface.LevelOf(dst_params.addr),
+            .src_offset = {src_rect.left, src_rect.bottom},
+            .dst_offset = {dst_rect.left, dst_rect.bottom},
+            .extent = {src_rect.GetWidth(), src_rect.GetHeight()},
+        };
+        runtime.CopyTextures(src_surface, dst_surface, texture_copy);
     }
-
-    const TextureCopy texture_copy = {
-        .src_level = src_surface.LevelOf(src_params.addr),
-        .dst_level = dst_surface.LevelOf(dst_params.addr),
-        .src_offset = {src_rect.left, src_rect.bottom},
-        .dst_offset = {dst_rect.left, dst_rect.bottom},
-        .extent = {src_rect.GetWidth(), src_rect.GetHeight()},
-    };
-    runtime.CopyTextures(src_surface, dst_surface, texture_copy);
 
     if (rows_only) {
         CITRA_FRAME_DUMP("  texcopy: {} rows of {} bytes change owner, gaps left as they are",
@@ -427,7 +443,7 @@ bool RasterizerCache<T>::AccelerateFill(const Pica::MemoryFillConfig& config) {
     params.end = config.GetEndAddress();
     params.size = params.end - params.addr;
     params.type = SurfaceType::Fill;
-    params.res_scale = std::numeric_limits<u16>::max();
+    params.res_scale = Common::ResolutionScale::FromSteps(std::numeric_limits<u16>::max());
 
     SurfaceId fill_surface_id = slot_surfaces.insert(runtime, params);
     Surface& fill_surface = slot_surfaces[fill_surface_id];
@@ -539,8 +555,8 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
         NoteFullSizeUse(src_surface);
     }
 
-    const u32 src_scale = src_surface.res_scale;
-    const u32 dst_scale = dst_surface.res_scale;
+    const Common::ResolutionScale src_scale = src_surface.res_scale;
+    const Common::ResolutionScale dst_scale = dst_surface.res_scale;
     const u32 src_sample_count = src_surface.sample_count;
     const u32 dst_sample_count = dst_surface.sample_count;
     // A surface takes on the scale of what it is filled from, except a shadow map that is
@@ -552,8 +568,10 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
 
     const auto src_rect = src_surface.GetScaledSubRect(subrect_params);
     const auto dst_rect = dst_surface.GetScaledSubRect(subrect_params);
+    // Between surfaces of one scale that is a copy, unless the guest pixels lie where they come
+    // to a host pixel more in one of the two than in the other (see HasSameSize)
     if (src_scale == dst_scale && src_surface.half_scale_x == dst_surface.half_scale_x &&
-        src_surface.half_scale_y == dst_surface.half_scale_y) {
+        src_surface.half_scale_y == dst_surface.half_scale_y && HasSameSize(src_rect, dst_rect)) {
         const TextureCopy copy = {
             .src_level = src_surface.LevelOf(copy_addr),
             .dst_level = dst_surface.LevelOf(copy_addr),
@@ -713,7 +731,8 @@ SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo
     params.levels = max_level + 1;
     params.is_tiled = true;
     params.pixel_format = PixelFormatFromTextureFormat(info.format);
-    params.res_scale = filter != Settings::TextureFilter::NoFilter ? resolution_scale_factor : 1;
+    params.res_scale = filter != Settings::TextureFilter::NoFilter ? resolution_scale_factor
+                                                                   : Common::ResolutionScale{};
     SurfaceFlagBits initial_flags{};
     if (info.is_shadow_source) {
         initial_flags |= SurfaceFlagBits::ShadowSource;
@@ -777,7 +796,7 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
         };
         info.SetDefaultStride();
 
-        u32 res_scale = 1;
+        Common::ResolutionScale res_scale;
         for (u32 i = 0; i < addresses.size(); i++) {
             if (!addresses[i]) {
                 continue;
@@ -921,7 +940,7 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
     // them goes to main memory. It stays the size the game gave it, as on the console. The
     // game clears it with an ordinary draw before it renders into it, which is why the
     // buffers are remembered.
-    if (using_color_fb && resolution_scale_factor > 1) {
+    if (using_color_fb && !resolution_scale_factor.IsNative()) {
         static constexpr std::size_t MAX_SHADOW_MAP_TARGETS = 8;
         auto target =
             std::ranges::find(shadow_map_targets, color_params.addr, &ShadowMapTarget::addr);
@@ -939,7 +958,7 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
             if (!target->with_depth && sample_count == 1 &&
                 (Common::TraceMarkers::Experiments() &
                  Common::TraceMarkers::LegacyShadowMapScale) == 0) {
-                color_params.res_scale = 1;
+                color_params.res_scale = Common::ResolutionScale{};
             }
         }
     }
@@ -1133,8 +1152,9 @@ void RasterizerCache<T>::ApplyDownscaledTargetScale(SurfaceParams& color_params,
         target->shrunk_x = target->shrunk_xy = target->used_at_full_size = false;
     }
 
-    // With no upscaling the target keeps its native size.
-    if (resolution_scale_factor < 2 || sample_count != 1 || !runtime.SupportsHalfScaleTargets() ||
+    // With no upscaling, or too little of it to halve, the target keeps its size.
+    if (resolution_scale_factor < Common::ResolutionScale::Whole(2) || sample_count != 1 ||
+        !runtime.SupportsHalfScaleTargets() ||
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyFullScaleTargets)) {
         return;
     }
@@ -1165,7 +1185,7 @@ typename RasterizerCache<T>::SurfaceRect_Tuple RasterizerCache<T>::GetTexCopySur
             ASSERT(match_subrect.GetInterval() == params.GetInterval());
         }
 
-        rect = match_surface.GetScaledSubRect(match_subrect);
+        rect = match_surface.GetSubRect(match_subrect);
     }
 
     return std::make_pair(match_id, rect);
@@ -1220,7 +1240,7 @@ SurfaceId RasterizerCache<T>::FindMatch(const SurfaceParams& params, ScaleMatch 
                                         std::optional<SurfaceInterval> validate_interval) {
     SurfaceId match_id{};
     bool match_valid = false;
-    u32 match_scale = 0;
+    auto match_scale = Common::ResolutionScale::FromSteps(0);
     u8 match_sample_count = 0;
     SurfaceInterval match_interval{};
 
@@ -1498,7 +1518,7 @@ bool RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
     // Filtered mipmaps often look really bad. We can achieve better quality by
     // generating them from the base level.
     Surface& surface = slot_surfaces[surface_id];
-    if (surface.res_scale != 1 && level != 0) {
+    if (!surface.res_scale.IsNative() && level != 0) {
         runtime.GenerateMipmaps(surface);
     }
     return true;
@@ -1831,7 +1851,7 @@ bool RasterizerCache<T>::ValidateByRelayout(SurfaceId surface_id, const SurfaceI
 
 template <class T>
 bool RasterizerCache<T>::IsNativeScaleShadowMap(const SurfaceParams& surface) const {
-    if (surface.res_scale != 1 || resolution_scale_factor == 1 ||
+    if (!surface.res_scale.IsNative() || resolution_scale_factor.IsNative() ||
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyShadowMapScale)) {
         return false;
     }
@@ -1850,7 +1870,7 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
         if (boost::icl::is_empty(copy_interval & interval)) {
             return false;
         }
-        const u32 res_scale = src_surface.res_scale;
+        const Common::ResolutionScale res_scale = src_surface.res_scale;
         const u8 sample_count = src_surface.sample_count;
         if (res_scale > surface.res_scale && IsNativeScaleShadowMap(surface)) {
             return false;
@@ -1871,7 +1891,8 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
             .dst_level = surface.LevelOf(addr),
             .src_offset = {src_rect.left, src_rect.bottom},
             .dst_offset = {dst_rect.left, dst_rect.bottom},
-            .extent = {src_rect.GetWidth(), src_rect.GetHeight()},
+            .extent = {std::min(src_rect.GetWidth(), dst_rect.GetWidth()),
+                       std::min(src_rect.GetHeight(), dst_rect.GetHeight())},
         };
         return runtime.Reinterpret(src_surface, surface, reinterpret);
     }

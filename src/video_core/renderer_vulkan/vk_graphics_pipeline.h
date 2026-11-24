@@ -279,7 +279,7 @@ struct DynamicPipelineInfo {
     u8 stencil_write_mask;
 
     Common::Rectangle<u32> scissor;
-    Common::Rectangle<s32> viewport;
+    Common::Rectangle<f32> viewport;
     /// Viewport depth bounds; carry the PICA depth range when the shader does not write depth.
     float depth_min = 0.f;
     float depth_max = 1.f;

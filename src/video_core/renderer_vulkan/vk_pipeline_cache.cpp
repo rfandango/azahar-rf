@@ -532,10 +532,10 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, u32 vertic
             dynamic.depth_min != current_dynamic.depth_min ||
             dynamic.depth_max != current_dynamic.depth_max || is_dirty) {
             const vk::Viewport vk_viewport = {
-                .x = static_cast<f32>(dynamic.viewport.left),
-                .y = static_cast<f32>(dynamic.viewport.top),
-                .width = static_cast<f32>(dynamic.viewport.GetWidth()),
-                .height = static_cast<f32>(dynamic.viewport.GetHeight()),
+                .x = dynamic.viewport.left,
+                .y = dynamic.viewport.top,
+                .width = dynamic.viewport.right - dynamic.viewport.left,
+                .height = dynamic.viewport.bottom - dynamic.viewport.top,
                 .minDepth = dynamic.depth_min,
                 .maxDepth = dynamic.depth_max,
             };

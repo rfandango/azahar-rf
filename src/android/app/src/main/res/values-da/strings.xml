@@ -259,15 +259,7 @@
     <string name="internal_resolution_description">Angiver den opløsning, der bruges til renderingen. En høj opløsning vil forbedre den visuelle kvalitet meget, men kræver også stor ydelse og kan forårsage fejl i visse applikationer.</string>
     <string name="internal_resolution_setting_auto">Auto (skærmstørrelse)</string>
     <string name="internal_resolution_setting_1x">Indbygget (400x240)</string>
-    <string name="internal_resolution_setting_2x">2x indbygget (800 x 480)</string>
-    <string name="internal_resolution_setting_3x">3x indbygget (1200 x 720)</string>
-    <string name="internal_resolution_setting_4x">4x indbygget (1600 x 960)</string>
-    <string name="internal_resolution_setting_5x">5x indbygget (2000x1200)</string>
-    <string name="internal_resolution_setting_6x">6x indbygget (2400x1440)</string>
-    <string name="internal_resolution_setting_7x">7x indbygget (2800x1680)</string>
-    <string name="internal_resolution_setting_8x">8x indbygget (3200 x 1920)</string>
-    <string name="internal_resolution_setting_9x">9x indbygget (3600x2160)</string>
-    <string name="internal_resolution_setting_10x">10x indbygget (4000x2400)</string>
+    <string name="internal_resolution_setting_scaled">%1$sx indbygget (%2$d x %3$d)</string>
     <string name="performance_warning">Hvis du slår denne indstilling fra vil emuleringsydelsen reduceres betydeligt! For den bedste oplevelse anbefales det, at du lader denne indstilling være aktiveret.</string>
     <string name="debug_warning">Advarsel: Ændringer i disse indstillinger vil gøre emuleringen langsommere</string>
     <string name="stereoscopy">Stereoskopi</string>

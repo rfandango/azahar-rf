@@ -8,6 +8,7 @@
 #include <chrono>
 #include <optional>
 #include "common/common_types.h"
+#include "common/resolution_scale.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -69,7 +70,7 @@ public:
 
     /// Returns the resolution scale factor relative to the native 3DS screen resolution: the
     /// one asked for, or a lower one while the GPU cannot keep up with it, see GovernResolution
-    u32 GetResolutionScaleFactor();
+    Common::ResolutionScale GetResolutionScaleFactor();
 
     /// Returns the MSAA sample count
     u8 GetSampleCount() const;
@@ -176,7 +177,7 @@ protected:
 
 private:
     /// The resolution scale factor the settings ask for
-    u32 AskedResolutionScaleFactor();
+    Common::ResolutionScale AskedResolutionScaleFactor();
 
     void EndFrameParts(bool emulation, bool gpu);
 
@@ -187,7 +188,7 @@ private:
 
     u64 limited_game_frames = 0; /// Guest frame count at the last LimitFramesAheadOfGpu call
 
-    std::atomic<u32> scale_reduction{0}; /// Steps the resolution scale is lowered by
+    std::atomic<u32> scale_reduction{0}; /// Whole factors the resolution scale is lowered by
     // The stretch of VBlanks the GPU's load is being added up over
     bool load_window_open = false;
     std::chrono::steady_clock::time_point load_window_start{};

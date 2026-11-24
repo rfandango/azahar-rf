@@ -17,6 +17,9 @@ layout(push_constant, std140) uniform ComputeInfo {
 };
 
 void main() {
+    if (any(greaterThanEqual(ivec2(gl_GlobalInvocationID.xy), extent))) {
+        return;
+    }
     ivec2 src_coord = src_offset + ivec2(gl_GlobalInvocationID.xy);
     ivec2 dst_coord = dst_offset + ivec2(gl_GlobalInvocationID.xy);
 

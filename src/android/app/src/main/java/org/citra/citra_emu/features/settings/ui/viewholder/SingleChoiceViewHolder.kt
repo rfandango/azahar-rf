@@ -44,10 +44,9 @@ class SingleChoiceViewHolder(val binding: ListItemSettingBinding, adapter: Setti
         when (val item = setting) {
             is SingleChoiceSetting -> {
                 val resMgr = binding.textSettingDescription.context.resources
-                val values = resMgr.getIntArray(item.valuesId)
-                values.forEachIndexed { i: Int, value: Int ->
-                    if (value == (setting as SingleChoiceSetting).selectedValue) {
-                        return resMgr.getStringArray(item.choicesId)[i]
+                item.values(resMgr)?.forEachIndexed { i: Int, value: Int ->
+                    if (value == item.selectedValue) {
+                        return item.choices(resMgr)[i]
                     }
                 }
                 return ""

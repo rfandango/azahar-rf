@@ -599,11 +599,14 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
     state.draw.draw_framebuffer = framebuffer->Handle();
 
     // Sync the viewport
+    // (In whole pixels: glViewport takes no others)
     const auto viewport = fb_helper.Viewport();
-    state.viewport.x = static_cast<GLint>(viewport.x);
-    state.viewport.y = static_cast<GLint>(viewport.y);
-    state.viewport.width = static_cast<GLsizei>(viewport.width);
-    state.viewport.height = static_cast<GLsizei>(viewport.height);
+    state.viewport.x = static_cast<GLint>(std::lround(viewport.x));
+    state.viewport.y = static_cast<GLint>(std::lround(viewport.y));
+    state.viewport.width =
+        static_cast<GLsizei>(std::lround(viewport.x + viewport.width)) - state.viewport.x;
+    state.viewport.height =
+        static_cast<GLsizei>(std::lround(viewport.y + viewport.height)) - state.viewport.y;
 
     // Viewport can have negative offsets or larger dimensions than our framebuffer sub-rect.
     // Enable scissor test to prevent drawing outside of the framebuffer region

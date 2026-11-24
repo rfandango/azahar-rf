@@ -152,7 +152,7 @@ bool TwinPassRule::LeavesOut(DrawFacts& facts) {
             left_out_now = 0;
             twins = compared;
             leaving_out = compared && frames_alike >= FRAMES_ALIKE &&
-                          Settings::values.resolution_factor.GetValue() != 1 &&
+                          Settings::values.resolution_factor.GetValue() != 1.f &&
                           (Common::TraceMarkers::Experiments3() &
                            Common::TraceMarkers::KeepSecondScenePass) == 0;
         } else {

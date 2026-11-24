@@ -3802,7 +3802,8 @@ void GMainWindow::OnStartVideoDumping() {
 
 void GMainWindow::StartVideoDumping(const QString& path) {
     auto& renderer = system.GPU().Renderer();
-    const auto layout{Layout::FrameLayoutFromResolutionScale(renderer.GetResolutionScaleFactor())};
+    const auto layout{
+        Layout::FrameLayoutFromResolutionScale(renderer.GetResolutionScaleFactor().RoundedUp())};
 
     auto dumper = std::make_shared<VideoDumper::FFmpegBackend>(renderer);
     if (dumper->StartDumping(path.toStdString(), layout)) {

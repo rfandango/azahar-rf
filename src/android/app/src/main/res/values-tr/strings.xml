@@ -226,15 +226,7 @@
     <string name="internal_resolution_description">Render için kullanılan çözünürlüğü belirtir. Yüksek çözünürlük görsel kaliteyi çok artıracaktır ancak performans açısından da oldukça ağırdır ve bazı uygulamalarda aksaklıklara neden olabilir.</string>
     <string name="internal_resolution_setting_auto">Otomatik (Ekran Boyutu)</string>
     <string name="internal_resolution_setting_1x">Doğal (400x240)</string>
-    <string name="internal_resolution_setting_2x">2x Doğal (800x480)</string>
-    <string name="internal_resolution_setting_3x">3x Doğal (1200x720)</string>
-    <string name="internal_resolution_setting_4x">4x Doğal (1600x960)</string>
-    <string name="internal_resolution_setting_5x">5x Doğal (2000x1200)</string>
-    <string name="internal_resolution_setting_6x">6x Doğal (2400x1440)</string>
-    <string name="internal_resolution_setting_7x">7x Doğal (2800x1680)</string>
-    <string name="internal_resolution_setting_8x">8x Doğal (3200x1920)</string>
-    <string name="internal_resolution_setting_9x">9x Doğal (3600x2160)</string>
-    <string name="internal_resolution_setting_10x">10x Doğal (4000x2400)</string>
+    <string name="internal_resolution_setting_scaled">%1$sx Doğal (%2$dx%3$d)</string>
     <string name="performance_warning">Bu ayarın kapatılması emülasyon performansını önemli ölçüde düşürecektir! En iyi deneyim için bu ayarı etkin bırakmanız önerilir.</string>
     <string name="debug_warning">Uyarı: Bu ayarları değiştirmek emülasyonu yavaşlatacaktır</string>
     <string name="stereoscopy">Stereoskopi</string>

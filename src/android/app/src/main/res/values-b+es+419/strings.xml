@@ -254,15 +254,7 @@
     <string name="internal_resolution_description">Especifica la resolución de renderizado. Una alta resolución mejorará considerablemente la calidad visual, pero tendrá un gran impacto en el rendimiento y puede causar fallos en ciertas aplicaciones.</string>
     <string name="internal_resolution_setting_auto">Auto (Tamaño pantalla)</string>
     <string name="internal_resolution_setting_1x">Nativa (400x240)</string>
-    <string name="internal_resolution_setting_2x">2x Nativa (800x480)</string>
-    <string name="internal_resolution_setting_3x">3x Nativa (1200x720)</string>
-    <string name="internal_resolution_setting_4x">4x Nativa (1600x960)</string>
-    <string name="internal_resolution_setting_5x">5x Nativa (2000x1200)</string>
-    <string name="internal_resolution_setting_6x">6x Nativa (2400x1440)</string>
-    <string name="internal_resolution_setting_7x">7x Nativa (2800x1680)</string>
-    <string name="internal_resolution_setting_8x">8x Nativa (3200x1920)</string>
-    <string name="internal_resolution_setting_9x">9x Nativa (3600x2160)</string>
-    <string name="internal_resolution_setting_10x">10x Nativa (4000x2400)</string>
+    <string name="internal_resolution_setting_scaled">%1$sx Nativa (%2$dx%3$d)</string>
     <string name="performance_warning">¡Desactivar esta opción reducirá notablemente el rendimiento de la emulación! Para obtener la mejor experiencia, se recomienda dejarla activada.</string>
     <string name="debug_warning">Aviso: Modificar estos ajustes reducirá la velocidad de emulación.</string>
     <string name="stereoscopy">Estereoscopia</string>

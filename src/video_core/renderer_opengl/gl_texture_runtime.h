@@ -167,7 +167,7 @@ public:
     void Attach(GLenum target, u32 level, u32 layer, u32 handle = 1);
 
     /// Scales up the surface to match the new resolution scale and sample-count.
-    void ScaleUp(u32 new_scale, u8 new_sample_count);
+    void ScaleUp(Common::ResolutionScale new_scale, u8 new_sample_count);
 
     /// Returns the bpp of the internal surface format
     u32 GetInternalBytesPerPixel() const;
@@ -200,7 +200,7 @@ public:
     Framebuffer(Framebuffer&& o) noexcept = default;
     Framebuffer& operator=(Framebuffer&& o) noexcept = default;
 
-    [[nodiscard]] u32 Scale() const noexcept {
+    [[nodiscard]] Common::ResolutionScale Scale() const noexcept {
         return res_scale;
     }
 
@@ -226,7 +226,7 @@ public:
     }
 
 private:
-    u32 res_scale{1};
+    Common::ResolutionScale res_scale;
     u32 sample_count{1};
     std::array<GLuint, 4> attachments{};
     OGLFramebuffer framebuffer;

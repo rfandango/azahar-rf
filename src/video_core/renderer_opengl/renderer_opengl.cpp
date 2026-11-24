@@ -583,7 +583,7 @@ void RendererOpenGL::DrawSingleScreen(const ScreenInfo& screen_info, float x, fl
         break;
     }
 
-    const u32 scale_factor = GetResolutionScaleFactor();
+    const float scale_factor = GetResolutionScaleFactor().Factor();
     const GLuint sampler = samplers[Settings::values.filter_mode.GetValue()].handle;
     glUniform4f(uniform_i_resolution, static_cast<float>(screen_info.texture.width * scale_factor),
                 static_cast<float>(screen_info.texture.height * scale_factor),
@@ -653,7 +653,7 @@ void RendererOpenGL::DrawSingleScreenStereo(const ScreenInfo& screen_info_l,
         break;
     }
 
-    const u32 scale_factor = GetResolutionScaleFactor();
+    const float scale_factor = GetResolutionScaleFactor().Factor();
     const GLuint sampler = samplers[Settings::values.filter_mode.GetValue()].handle;
     glUniform4f(uniform_i_resolution,
                 static_cast<float>(screen_info_l.texture.width * scale_factor),

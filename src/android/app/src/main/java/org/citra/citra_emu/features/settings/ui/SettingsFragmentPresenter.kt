@@ -904,6 +904,19 @@ class SettingsFragmentPresenter(
         }
     }
 
+    private fun resolutionName(quarters: Int): String = when (quarters) {
+        0 -> settingsActivity.getString(R.string.internal_resolution_setting_auto)
+
+        4 -> settingsActivity.getString(R.string.internal_resolution_setting_1x)
+
+        else -> settingsActivity.getString(
+            R.string.internal_resolution_setting_scaled,
+            IntSetting.RESOLUTION_FACTOR.valueToString(quarters),
+            SCREEN_WIDTH * quarters / 4,
+            SCREEN_HEIGHT * quarters / 4
+        )
+    }
+
     private fun addGraphicsSettings(sl: ArrayList<SettingsItem>) {
         setSectionTitle(R.string.preferences_graphics)
         sl.apply {
@@ -958,10 +971,12 @@ class SettingsFragmentPresenter(
                     IntSetting.RESOLUTION_FACTOR,
                     R.string.internal_resolution,
                     R.string.internal_resolution_description,
-                    R.array.resolutionFactorNames,
-                    R.array.resolutionFactorValues,
+                    0,
+                    0,
                     IntSetting.RESOLUTION_FACTOR.key,
-                    IntSetting.RESOLUTION_FACTOR.defaultValue
+                    IntSetting.RESOLUTION_FACTOR.defaultValue,
+                    ownChoices = RESOLUTION_FACTORS.map { resolutionName(it) }.toTypedArray(),
+                    ownValues = RESOLUTION_FACTORS
                 )
             )
             add(
@@ -2116,5 +2131,13 @@ class SettingsFragmentPresenter(
                 )
             )
         }
+    }
+
+    companion object {
+        // In quarters, as IntSetting.RESOLUTION_FACTOR: by the screen, and from the console's
+        // own resolution up to 18 times that
+        private val RESOLUTION_FACTORS = intArrayOf(0) + (4..72).toList()
+        private const val SCREEN_WIDTH = 400
+        private const val SCREEN_HEIGHT = 240
     }
 }

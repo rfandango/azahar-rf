@@ -231,15 +231,7 @@
     <string name="internal_resolution_description">指定渲染使用的分辨率。高分辨率将大大提高视觉质量，但也会对性能造成很大影响，并可能导致某些应用出现故障。</string>
     <string name="internal_resolution_setting_auto">自动（屏幕大小）</string>
     <string name="internal_resolution_setting_1x">原生（400x240）</string>
-    <string name="internal_resolution_setting_2x">2 倍（800x480）</string>
-    <string name="internal_resolution_setting_3x">3 倍（1200x720）</string>
-    <string name="internal_resolution_setting_4x">4 倍（1600x960）</string>
-    <string name="internal_resolution_setting_5x">5 倍（2000x1200）</string>
-    <string name="internal_resolution_setting_6x">6 倍（2400x1440）</string>
-    <string name="internal_resolution_setting_7x">7 倍（2800x1680）</string>
-    <string name="internal_resolution_setting_8x">8 倍（3200x1920）</string>
-    <string name="internal_resolution_setting_9x">9 倍（3600x2160）</string>
-    <string name="internal_resolution_setting_10x">10 倍（4000x2400）</string>
+    <string name="internal_resolution_setting_scaled">%1$s 倍（%2$dx%3$d）</string>
     <string name="performance_warning">关闭此项将显著降低模拟性能！为了获得最佳体验，建议启用。</string>
     <string name="debug_warning">警告：更改这些设置将降低模拟速度！</string>
     <string name="stereoscopy">画面立体</string>

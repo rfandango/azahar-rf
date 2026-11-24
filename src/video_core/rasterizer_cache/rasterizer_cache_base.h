@@ -344,7 +344,7 @@ private:
         bool using_color{};
         bool using_depth{};
         bool shadow_rendering{};
-        u32 res_scale{};
+        Common::ResolutionScale res_scale;
         u32 sample_count{};
         u64 validity_epoch{};
         // Found
@@ -396,7 +396,7 @@ private:
     };
     std::vector<LateReadback> late_readbacks;
     u64 late_frame{};
-    u32 resolution_scale_factor;
+    Common::ResolutionScale resolution_scale_factor;
     u8 sample_count;
     FramebufferParams fb_params;
 

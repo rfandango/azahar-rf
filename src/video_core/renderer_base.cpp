@@ -59,30 +59,37 @@ constexpr float HELD_BACK = 0.10f;
 /// rather than too low.
 constexpr float ROOM_LOAD = 0.80f;
 
-/// The lowest scale the governor goes to from the one asked for: half of it, and never the
-/// console's own resolution
-constexpr u32 LowestGovernedScale(u32 asked) {
-    return asked <= 2 ? asked : (asked + 1) / 2;
+/// How far the governor lowers the scale asked for, in whole factors: to half of it, and never
+/// to the console's own resolution
+constexpr u32 MostReduction(Common::ResolutionScale asked) {
+    return asked <= Common::ResolutionScale::Whole(2)
+               ? 0
+               : asked.Steps() / (2 * Common::ResolutionScale::STEPS);
+}
+
+constexpr Common::ResolutionScale Reduced(Common::ResolutionScale asked, u32 reduction) {
+    return Common::ResolutionScale::FromSteps(asked.Steps() -
+                                              reduction * Common::ResolutionScale::STEPS);
 }
 
 } // Anonymous namespace
 
-u32 RendererBase::AskedResolutionScaleFactor() {
+Common::ResolutionScale RendererBase::AskedResolutionScaleFactor() {
     const auto graphics_api = Settings::GetWorkingGraphicsAPI();
     if (graphics_api == Settings::GraphicsAPI::Software) {
         // Software renderer always render at native resolution
-        return 1;
+        return {};
     }
 
-    const u32 scale_factor = Settings::values.resolution_factor.GetValue();
-    return scale_factor != 0 ? scale_factor
-                             : render_window.GetFramebufferLayout().GetScalingRatio();
+    const float scale_factor = Settings::values.resolution_factor.GetValue();
+    return scale_factor != 0.f ? Common::ResolutionScale::Closest(scale_factor)
+                               : render_window.GetFramebufferLayout().GetScalingRatio();
 }
 
-u32 RendererBase::GetResolutionScaleFactor() {
-    const u32 asked = AskedResolutionScaleFactor();
+Common::ResolutionScale RendererBase::GetResolutionScaleFactor() {
+    const Common::ResolutionScale asked = AskedResolutionScaleFactor();
     const u32 reduction = scale_reduction.load(std::memory_order_relaxed);
-    return asked - std::min(reduction, asked - LowestGovernedScale(asked));
+    return Reduced(asked, std::min(reduction, MostReduction(asked)));
 }
 
 void RendererBase::GovernResolution() {
@@ -167,15 +174,15 @@ void RendererBase::GovernResolution() {
         model_change_windows = 0;
     }
 
-    const u32 asked = AskedResolutionScaleFactor();
-    const u32 lowest = LowestGovernedScale(asked);
-    u32 reduction = std::min(scale_reduction.load(std::memory_order_relaxed), asked - lowest);
-    const u32 scale = asked - reduction;
+    const Common::ResolutionScale asked = AskedResolutionScaleFactor();
+    const u32 most_reduction = MostReduction(asked);
+    u32 reduction = std::min(scale_reduction.load(std::memory_order_relaxed), most_reduction);
+    const float scale = Reduced(asked, reduction).Factor();
     Common::Hitches::SetHostGpu({
         .load = load,
         .waited = waited,
         .scale = scale,
-        .asked_scale = asked,
+        .asked_scale = asked.Factor(),
     });
 
     // Only at the console's own speed: faster than that, the GPU is meant to be the limit
@@ -204,7 +211,7 @@ void RendererBase::GovernResolution() {
     // which it only waits does not take back what the others counted.
     if (waited >= HELD_BACK && load >= BUSY_LOAD) {
         roomy_windows = calm_windows = 0;
-        if (behind && ++overloaded_windows >= OVERLOADED_WINDOWS && scale > lowest) {
+        if (behind && ++overloaded_windows >= OVERLOADED_WINDOWS && reduction < most_reduction) {
             reduction++;
             scale_reduction.store(reduction, std::memory_order_relaxed);
             overloaded_windows = 0;
@@ -217,7 +224,7 @@ void RendererBase::GovernResolution() {
             LOG_INFO(Render,
                      "Resolution scale lowered to {}x of {}x: the GPU was at work {:.0f}% of "
                      "the time and the emulation waited for it {:.0f}%",
-                     asked - reduction, asked, 100.0f * load, 100.0f * waited);
+                     Reduced(asked, reduction), asked, 100.0f * load, 100.0f * waited);
         }
         return;
     }
@@ -229,8 +236,7 @@ void RendererBase::GovernResolution() {
 
     // Back up: at once if the load leaves room for the pixels of the next scale, and
     // otherwise after a while without the GPU holding anything back, as a try
-    const float pixels =
-        static_cast<float>((scale + 1) * (scale + 1)) / static_cast<float>(scale * scale);
+    const float pixels = ((scale + 1.f) * (scale + 1.f)) / (scale * scale);
     roomy_windows = load * pixels <= ROOM_LOAD ? roomy_windows + 1 : 0;
     calm_windows = waited < HELD_BACK ? calm_windows + 1 : 0;
     const bool room = roomy_windows >= ROOMY_WINDOWS;
@@ -244,7 +250,8 @@ void RendererBase::GovernResolution() {
         LOG_INFO(Render,
                  "Resolution scale raised to {}x of {}x ({}): the GPU was at work {:.0f}% of "
                  "the time",
-                 asked - reduction, asked, room ? "room for it" : "as a try", 100.0f * load);
+                 Reduced(asked, reduction), asked, room ? "room for it" : "as a try",
+                 100.0f * load);
     }
 }
 

@@ -16,12 +16,9 @@ static constexpr float TOP_SCREEN_ASPECT_RATIO =
 static constexpr float BOT_SCREEN_ASPECT_RATIO =
     static_cast<float>(Core::kScreenBottomHeight) / Core::kScreenBottomWidth;
 
-u32 FramebufferLayout::GetScalingRatio() const {
-    if (is_rotated) {
-        return static_cast<u32>(((top_screen.GetWidth() - 1) / Core::kScreenTopWidth) + 1);
-    } else {
-        return static_cast<u32>(((top_screen.GetWidth() - 1) / Core::kScreenTopHeight) + 1);
-    }
+Common::ResolutionScale FramebufferLayout::GetScalingRatio() const {
+    return Common::ResolutionScale::Covering(
+        top_screen.GetWidth(), is_rotated ? Core::kScreenTopWidth : Core::kScreenTopHeight);
 }
 
 bool FramebufferLayout::IsWithinTouchscreen(unsigned framebuffer_x, unsigned framebuffer_y) const {

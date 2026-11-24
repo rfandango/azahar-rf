@@ -36,6 +36,8 @@ public:
 private:
     void updateShaders(Settings::StereoRenderOption stereo_option);
     void updateTextureFilter(int index);
+    /// What the resolution factor at that place of the list is called
+    QString ResolutionName(int index) const;
 
     std::unique_ptr<Ui::ConfigureEnhancements> ui;
     ConfigurationShared::CheckState linear_filter;

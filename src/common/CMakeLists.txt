@@ -74,6 +74,7 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     polyfill_thread.h
     precompiled_headers.h
     quaternion.h
+    resolution_scale.h
     ring_buffer.h
     scm_rev.cpp
     scm_rev.h

@@ -182,7 +182,7 @@ void RPCServer::HandleTakeScreenshot(std::unique_ptr<Packet> packet, u32 res_sca
     }
 
     if (res_scale == 0) {
-        res_scale = renderer.GetResolutionScaleFactor();
+        res_scale = renderer.GetResolutionScaleFactor().RoundedUp();
     }
     const bool is_secondary = True(flags & ScreenshotFlags::SecondaryWindow);
     const auto layout = Layout::FrameLayoutFromResolutionScale(res_scale, is_secondary);

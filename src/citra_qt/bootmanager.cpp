@@ -768,7 +768,7 @@ void GRenderWindow::ReleaseRenderTarget() {
 void GRenderWindow::CaptureScreenshot(u32 res_scale, const QString& screenshot_path) {
     auto& renderer = system.GPU().Renderer();
     if (res_scale == 0) {
-        res_scale = renderer.GetResolutionScaleFactor();
+        res_scale = renderer.GetResolutionScaleFactor().RoundedUp();
     }
 
     const auto layout{Layout::FrameLayoutFromResolutionScale(res_scale, is_secondary)};

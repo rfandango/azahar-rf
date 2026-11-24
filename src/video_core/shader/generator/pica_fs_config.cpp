@@ -106,7 +106,7 @@ TextureConfig::TextureConfig(const Pica::TexturingRegs& regs) {
         }
     }
     // A resolution factor of 0 follows the window, which is above the console's as a rule
-    bool gpu_picks_level = Settings::values.resolution_factor.GetValue() != 1;
+    bool gpu_picks_level = Settings::values.resolution_factor.GetValue() != 1.f;
     if (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyTextureLod) {
         one_level = 0;
         gpu_picks_level = false;

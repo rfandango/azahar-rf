@@ -5,6 +5,7 @@
 #pragma once
 
 #include "common/math_util.h"
+#include "common/resolution_scale.h"
 #include "common/settings.h"
 
 namespace Layout {
@@ -46,7 +47,7 @@ struct FramebufferLayout {
      * Returns the ratio of pixel size of the top screen, compared to the native size of the 3DS
      * screen.
      */
-    u32 GetScalingRatio() const;
+    Common::ResolutionScale GetScalingRatio() const;
 
     /**
      * Check if the given x/y coordinates are within the touchpad specified by the framebuffer
