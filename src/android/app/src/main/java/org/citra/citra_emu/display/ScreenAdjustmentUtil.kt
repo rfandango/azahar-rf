@@ -111,6 +111,23 @@ class ScreenAdjustmentUtil(private val context: Context, private val windowManag
         )
     }
 
+    /**
+     * Shows the next frames so, without storing it: that is for [saveScreenUpscaling].
+     */
+    fun changeScreenUpscaling(upscaling: Int, sharpness: Int) {
+        val settings = CitraSettings.activeSettings
+        settings.setByCurrentState(IntSetting.SCREEN_UPSCALING, upscaling)
+        settings.setByCurrentState(IntSetting.SCREEN_UPSCALING_SHARPNESS, sharpness)
+        // (Only these, as reloading all settings interrupts the sound)
+        NativeLibrary.setScreenUpscaling(upscaling, sharpness)
+    }
+
+    fun saveScreenUpscaling() {
+        val settings = CitraSettings.activeSettings
+        SettingsFile.saveSetting(IntSetting.SCREEN_UPSCALING, settings)
+        SettingsFile.saveSetting(IntSetting.SCREEN_UPSCALING_SHARPNESS, settings)
+    }
+
     fun toggleScreenUpright() {
         val uprightBoolean = CitraSettings.activeSettings.get(BooleanSetting.UPRIGHT_SCREEN)
         CitraSettings.activeSettings.setByCurrentState(

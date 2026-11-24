@@ -11,7 +11,7 @@ layout (location = 0) out vec2 frag_tex_coord;
 
 layout (push_constant, std140) uniform DrawInfo {
     mat4 modelview_matrix;
-    vec4 i_resolution;
+    vec4 screen_area;
     vec4 o_resolution;
     int screen_id_l;
     int screen_id_r;

@@ -1022,6 +1022,35 @@ class SettingsFragmentPresenter(
                 )
             )
             add(
+                SingleChoiceSetting(
+                    editingSettings,
+                    IntSetting.SCREEN_UPSCALING,
+                    R.string.screen_upscaling,
+                    R.string.screen_upscaling_description,
+                    R.array.screenUpscalingNames,
+                    R.array.screenUpscalingValues,
+                    IntSetting.SCREEN_UPSCALING.key,
+                    IntSetting.SCREEN_UPSCALING.defaultValue,
+                    isEnabled =
+                        editingSettings.get(IntSetting.GRAPHICS_API) == GraphicsAPI.VULKAN.int
+                )
+            )
+            add(
+                SliderSetting(
+                    editingSettings,
+                    IntSetting.SCREEN_UPSCALING_SHARPNESS,
+                    R.string.screen_upscaling_sharpness,
+                    R.string.screen_upscaling_sharpness_description,
+                    0,
+                    200,
+                    "%",
+                    IntSetting.SCREEN_UPSCALING_SHARPNESS.key,
+                    IntSetting.SCREEN_UPSCALING_SHARPNESS.defaultValue.toFloat(),
+                    isEnabled =
+                        editingSettings.get(IntSetting.GRAPHICS_API) == GraphicsAPI.VULKAN.int
+                )
+            )
+            add(
                 SwitchSetting(
                     editingSettings,
                     BooleanSetting.SHADERS_ACCURATE_MUL,

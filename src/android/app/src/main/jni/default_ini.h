@@ -258,6 +258,15 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # 0: Nearest, 1 (default): Linear
 )") DECLARE_KEY(filter_mode) BOOST_HANA_STRING(R"(
 
+# How the screens are brought to the size they are shown in, where that is larger than they are drawn
+# 0 (default): Filtered as said above, 1: Snapdragon Game Super Resolution 1 (Vulkan only),
+# 2: The same with edge direction
+)") DECLARE_KEY(screen_upscaling) BOOST_HANA_STRING(R"(
+
+# How much Snapdragon Game Super Resolution sharpens, in percent
+# 0 - 200 (default: 200)
+)") DECLARE_KEY(screen_upscaling_sharpness) BOOST_HANA_STRING(R"(
+
 # Delays the game render thread by the specified amount of microseconds
 # Set to 0 for no delay, only useful in dynamic-fps games to simulate GPU delay.
 )") DECLARE_KEY(delay_game_render_thread_us) BOOST_HANA_STRING(R"(

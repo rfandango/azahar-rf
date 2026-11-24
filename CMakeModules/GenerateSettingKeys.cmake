@@ -104,6 +104,8 @@ foreach(KEY IN ITEMS
     "cardboard_x_shift"
     "cardboard_y_shift"
     "filter_mode"
+    "screen_upscaling"
+    "screen_upscaling_sharpness"
     "pp_shader_name"
     "anaglyph_shader_name"
     "dump_textures"

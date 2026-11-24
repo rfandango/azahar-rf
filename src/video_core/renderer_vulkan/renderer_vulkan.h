@@ -52,22 +52,31 @@ struct ScreenInfo {
     TextureInfo texture;
     Common::Rectangle<f32> texcoords;
     vk::ImageView image_view;
+    /// Pixels of the image the view is of
+    u32 image_width{};
+    u32 image_height{};
 };
 
 struct PresentUniformData {
     std::array<f32, 4 * 4> modelview;
-    Common::Vec4f i_resolution;
+    /// The part of the image that is the screen: its lowest and highest coordinates
+    Common::Vec4f screen_area;
     Common::Vec4f o_resolution;
     int screen_id_l = 0;
     int screen_id_r = 0;
     int layer = 0;
     int reverse_interlaced = 0;
+    /// Of Snapdragon Game Super Resolution, from 0 to 2
+    float edge_sharpness = 0.0f;
 };
-static_assert(sizeof(PresentUniformData) == 112,
+static_assert(sizeof(PresentUniformData) == 116,
               "PresentUniformData does not structure in shader!");
 
 class RendererVulkan : public VideoCore::RendererBase {
-    static constexpr std::size_t PRESENT_PIPELINES = 3;
+    static constexpr std::size_t PRESENT_PIPELINES = 5;
+    /// Of those, the ones that enlarge a screen with Snapdragon Game Super Resolution
+    static constexpr u32 SGSR_PIPELINE = 3;
+    static constexpr u32 SGSR_EDGE_PIPELINE = 4;
 
 public:
     explicit RendererVulkan(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window,
@@ -120,6 +129,9 @@ private:
 
     void DrawTopScreen(const Layout::FramebufferLayout& layout,
                        const Common::Rectangle<u32>& top_screen);
+    /// The pipeline a screen is drawn with that is shown `width` pixels along its 240 and `height`
+    /// along its length, with what that one wants to know
+    u32 ChoosePresentPipeline(const ScreenInfo& screen_info, float width, float height);
     void DrawSingleScreen(u32 screen_id, float x, float y, float w, float h,
                           Layout::DisplayOrientation orientation);
     void DrawSingleScreenStereo(u32 screen_id_l, u32 screen_id_r, float x, float y, float w,

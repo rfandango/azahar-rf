@@ -659,6 +659,13 @@ void Java_org_citra_citra_1emu_NativeLibrary_swapScreens([[maybe_unused]] JNIEnv
     Camera::NDK::g_rotation = rotation;
 }
 
+void Java_org_citra_citra_1emu_NativeLibrary_setScreenUpscaling([[maybe_unused]] JNIEnv* env,
+                                                                [[maybe_unused]] jobject obj,
+                                                                jint upscaling, jint sharpness) {
+    Settings::values.screen_upscaling = static_cast<Settings::ScreenUpscaling>(upscaling);
+    Settings::values.screen_upscaling_sharpness = static_cast<u32>(sharpness);
+}
+
 jboolean Java_org_citra_citra_1emu_NativeLibrary_areKeysAvailable([[maybe_unused]] JNIEnv* env,
                                                                   [[maybe_unused]] jobject obj) {
     HW::AES::InitKeys();

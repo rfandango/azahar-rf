@@ -28,8 +28,10 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.PopupMenu
+import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -49,8 +51,10 @@ import androidx.navigation.findNavController
 import androidx.navigation.fragment.navArgs
 import androidx.preference.PreferenceManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.radiobutton.MaterialRadioButton
 import com.google.android.material.slider.Slider
 import java.io.File
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import org.citra.citra_emu.CitraApplication
@@ -59,6 +63,7 @@ import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.R
 import org.citra.citra_emu.activities.EmulationActivity
 import org.citra.citra_emu.databinding.DialogCheckboxBinding
+import org.citra.citra_emu.databinding.DialogScreenUpscalingBinding
 import org.citra.citra_emu.databinding.DialogSliderBinding
 import org.citra.citra_emu.databinding.FragmentEmulationBinding
 import org.citra.citra_emu.display.PortraitScreenLayout
@@ -68,6 +73,7 @@ import org.citra.citra_emu.display.SecondaryDisplayLayout
 import org.citra.citra_emu.features.input.Hotkey
 import org.citra.citra_emu.features.settings.model.BooleanSetting
 import org.citra.citra_emu.features.settings.model.CitraSettings
+import org.citra.citra_emu.features.settings.model.GraphicsAPI
 import org.citra.citra_emu.features.settings.model.IntSetting
 import org.citra.citra_emu.features.settings.ui.SettingsActivity
 import org.citra.citra_emu.features.settings.utils.SettingsFile
@@ -274,6 +280,9 @@ class EmulationFragment :
             )
         }
 
+        binding.inGameMenu.menu.findItem(R.id.menu_screen_upscaling).isVisible =
+            activeSettings.get(IntSetting.GRAPHICS_API) == GraphicsAPI.VULKAN.int
+
         binding.inGameMenu.getHeaderView(0).apply {
             val titleView = findViewById<TextView>(R.id.text_game_title)
             val iconView = findViewById<ImageView>(R.id.game_icon)
@@ -343,6 +352,11 @@ class EmulationFragment :
 
                 R.id.menu_rotate_upright -> {
                     screenAdjustmentUtil.toggleScreenUpright()
+                    true
+                }
+
+                R.id.menu_screen_upscaling -> {
+                    showScreenUpscalingDialog()
                     true
                 }
 
@@ -1106,6 +1120,75 @@ class EmulationFragment :
         }
 
         popupMenu.show()
+    }
+
+    /**
+     * The upscalers and their sharpness, in a corner and without the menu or a dimmed picture, as what
+     * is chosen shows at once.
+     */
+    private fun showScreenUpscalingDialog() {
+        val dialogBinding = DialogScreenUpscalingBinding.inflate(layoutInflater)
+        val names = resources.getStringArray(R.array.screenUpscalingNames)
+        val values = resources.getIntArray(R.array.screenUpscalingValues)
+        var upscaling = activeSettings.get(IntSetting.SCREEN_UPSCALING)
+        var changed = false
+
+        dialogBinding.apply {
+            fun update() {
+                val sharpness = sliderSharpness.value.toInt()
+                textSharpness.text =
+                    getString(R.string.screen_upscaling_sharpness_value, sharpness)
+                textSharpness.isEnabled = upscaling != values.first()
+                sliderSharpness.isEnabled = upscaling != values.first()
+            }
+
+            fun applyChoice() {
+                changed = true
+                update()
+                screenAdjustmentUtil.changeScreenUpscaling(upscaling, sliderSharpness.value.toInt())
+            }
+
+            names.forEachIndexed { index, name ->
+                val button = MaterialRadioButton(upscalers.context).apply {
+                    id = View.generateViewId()
+                    text = name
+                    isChecked = values[index] == upscaling
+                }
+                upscalers.addView(
+                    button,
+                    RadioGroup.LayoutParams(0, RadioGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+            }
+            // (The slider only takes values that are on its steps)
+            val sharpness = activeSettings.get(IntSetting.SCREEN_UPSCALING_SHARPNESS)
+                .toFloat()
+                .coerceIn(sliderSharpness.valueFrom, sliderSharpness.valueTo)
+            sliderSharpness.value =
+                (sharpness / sliderSharpness.stepSize).roundToInt() * sliderSharpness.stepSize
+            update()
+
+            upscalers.setOnCheckedChangeListener { group, checkedId ->
+                upscaling = values[group.indexOfChild(group.findViewById(checkedId))]
+                applyChoice()
+            }
+            sliderSharpness.addOnChangeListener { _, _, _ -> applyChoice() }
+        }
+
+        binding.drawerLayout.close()
+        MaterialAlertDialogBuilder(requireContext())
+            .setView(dialogBinding.root)
+            .setPositiveButton(R.string.emulation_done, null)
+            .setOnDismissListener {
+                if (changed) {
+                    screenAdjustmentUtil.saveScreenUpscaling()
+                }
+            }
+            .create()
+            .apply {
+                window?.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                window?.setGravity(Gravity.BOTTOM or Gravity.START)
+                show()
+            }
     }
 
     private fun showSecondaryScreenLayoutMenu() {

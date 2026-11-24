@@ -111,6 +111,13 @@ class LicensesFragment : Fragment() {
                 R.string.license_mit
             ),
             License(
+                R.string.license_sgsr,
+                R.string.license_sgsr_description,
+                R.string.license_sgsr_link,
+                R.string.license_sgsr_copyright,
+                R.string.license_sgsr_text
+            ),
+            License(
                 R.string.license_teakra,
                 R.string.license_teakra_description,
                 R.string.license_teakra_link,

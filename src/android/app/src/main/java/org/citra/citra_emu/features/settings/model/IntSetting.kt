@@ -81,6 +81,12 @@ enum class IntSetting(
     CPU_CLOCK_SPEED(SettingKeys.cpu_clock_percentage(), CitraSettings.SECTION_CORE, 100),
     TEXTURE_FILTER(SettingKeys.texture_filter(), CitraSettings.SECTION_RENDERER, 0),
     TEXTURE_SAMPLING(SettingKeys.texture_sampling(), CitraSettings.SECTION_RENDERER, 0),
+    SCREEN_UPSCALING(SettingKeys.screen_upscaling(), CitraSettings.SECTION_RENDERER, 0),
+    SCREEN_UPSCALING_SHARPNESS(
+        SettingKeys.screen_upscaling_sharpness(),
+        CitraSettings.SECTION_RENDERER,
+        200
+    ),
     DELAY_RENDER_THREAD_US(
         SettingKeys.delay_game_render_thread_us(),
         CitraSettings.SECTION_RENDERER,

@@ -157,6 +157,13 @@ enum class TextureSampling : u32 {
     Linear = 2,
 };
 
+/// How the console's screens are brought to the size they are shown in
+enum class ScreenUpscaling : u32 {
+    Filter = 0,
+    SGSR1 = 1,
+    SGSR1Edge = 2,
+};
+
 enum class AspectRatio : u32 {
     Default = 0,
     R16_9 = 1,
@@ -659,6 +666,11 @@ struct Values {
     Setting<s32> cardboard_y_shift{0, Keys::cardboard_y_shift};
 
     SwitchableSetting<bool> filter_mode{true, Keys::filter_mode};
+    SwitchableSetting<ScreenUpscaling> screen_upscaling{ScreenUpscaling::Filter,
+                                                        Keys::screen_upscaling};
+    /// Percent of the edge sharpness of Snapdragon Game Super Resolution, whose default is 2
+    SwitchableSetting<u32, true> screen_upscaling_sharpness{200, 0, 200,
+                                                            Keys::screen_upscaling_sharpness};
     SwitchableSetting<std::string> pp_shader_name{"None (builtin)", Keys::pp_shader_name};
     SwitchableSetting<std::string> anaglyph_shader_name{"Dubois (builtin)",
                                                         Keys::anaglyph_shader_name};

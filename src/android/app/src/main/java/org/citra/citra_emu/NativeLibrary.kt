@@ -242,6 +242,11 @@ object NativeLibrary {
     external fun swapScreens(swapScreens: Boolean, rotation: Int)
 
     /**
+     * Sets how the screens are brought to the size they are shown in, from the next frame on.
+     */
+    external fun setScreenUpscaling(upscaling: Int, sharpness: Int)
+
+    /**
      * Opens Vulkan with the given driver in place of the system's, if there is one. With
      * [probeCustomDriver] that driver has to show that it works on this device first.
      * @return Whether the given driver was taken; the system's is used otherwise.

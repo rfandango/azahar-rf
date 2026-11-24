@@ -21,6 +21,7 @@
 #include "video_core/host_shaders/vulkan_present_anaglyph_frag.h"
 #include "video_core/host_shaders/vulkan_present_frag.h"
 #include "video_core/host_shaders/vulkan_present_interlaced_frag.h"
+#include "video_core/host_shaders/vulkan_present_sgsr1_frag.h"
 #include "video_core/host_shaders/vulkan_present_vert.h"
 
 #include "video_core/host_shaders/vulkan_cursor_frag.h"
@@ -219,7 +220,11 @@ void RendererVulkan::PrepareRendertarget() {
 }
 
 void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout) {
-    const auto sampler = present_samplers[!Settings::values.filter_mode.GetValue()];
+    // (Snapdragon Game Super Resolution starts from the filtered picture)
+    const bool linear =
+        Settings::values.filter_mode.GetValue() ||
+        Settings::values.screen_upscaling.GetValue() != Settings::ScreenUpscaling::Filter;
+    const auto sampler = present_samplers[!linear];
     const auto present_set = present_heap.Commit();
     for (u32 index = 0; index < screen_infos.size(); index++) {
         update_queue.AddImageSampler(present_set, 0, index, screen_infos[index].image_view,
@@ -328,6 +333,8 @@ void RendererVulkan::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
         // Reset the screen info's display texture to its own permanent texture
         screen_info.image_view = screen_info.texture.image_view;
         screen_info.texcoords = {0.f, 0.f, 1.f, 1.f};
+        screen_info.image_width = screen_info.texture.width;
+        screen_info.image_height = screen_info.texture.height;
 
         ASSERT(false);
     }
@@ -345,6 +352,12 @@ void RendererVulkan::CompileShaders() {
                                  vk::ShaderStageFlagBits::eFragment, device, preamble);
     present_shaders[2] = Compile(HostShaders::VULKAN_PRESENT_INTERLACED_FRAG,
                                  vk::ShaderStageFlagBits::eFragment, device, preamble);
+    present_shaders[SGSR_PIPELINE] = Compile(HostShaders::VULKAN_PRESENT_SGSR1_FRAG,
+                                             vk::ShaderStageFlagBits::eFragment, device, preamble);
+    const std::string edge_preamble = fmt::format("{}\n#define EDGE_DIRECTION", preamble);
+    present_shaders[SGSR_EDGE_PIPELINE] =
+        Compile(HostShaders::VULKAN_PRESENT_SGSR1_FRAG, vk::ShaderStageFlagBits::eFragment, device,
+                edge_preamble);
 
     cursor_vertex_shader =
         Compile(HostShaders::VULKAN_CURSOR_VERT, vk::ShaderStageFlagBits::eVertex, device);
@@ -784,10 +797,39 @@ void RendererVulkan::ReloadPipeline(Settings::StereoRenderOption render_3d) {
     }
 }
 
+u32 RendererVulkan::ChoosePresentPipeline(const ScreenInfo& screen_info, float width,
+                                          float height) {
+    // (The screens lie on their side in memory: left and right are along the image's height)
+    const auto& texcoords = screen_info.texcoords;
+    const Common::Vec4f area =
+        Common::MakeVec(std::min(texcoords.top, texcoords.bottom),
+                        std::min(texcoords.left, texcoords.right),
+                        std::max(texcoords.top, texcoords.bottom),
+                        std::max(texcoords.left, texcoords.right));
+    draw_info.screen_area = area;
+    draw_info.edge_sharpness =
+        static_cast<float>(Settings::values.screen_upscaling_sharpness.GetValue()) / 100.0f;
+    const auto upscaling = Settings::values.screen_upscaling.GetValue();
+    if (current_pipeline != 0 || upscaling == Settings::ScreenUpscaling::Filter) {
+        return current_pipeline;
+    }
+    // Only for a picture that is made larger: at its size, or smaller, there is nothing to add
+    const float pixels_across = (area.z - area.x) * static_cast<float>(screen_info.image_width);
+    const float pixels_along = (area.w - area.y) * static_cast<float>(screen_info.image_height);
+    const bool enlarged = width > pixels_across * 1.02f || height > pixels_along * 1.02f;
+    if (!enlarged) {
+        return current_pipeline;
+    }
+    return upscaling == Settings::ScreenUpscaling::SGSR1Edge ? SGSR_EDGE_PIPELINE : SGSR_PIPELINE;
+}
+
 void RendererVulkan::DrawSingleScreen(u32 screen_id, float x, float y, float w, float h,
                                       Layout::DisplayOrientation orientation) {
     const ScreenInfo& screen_info = screen_infos[screen_id];
     const auto& texcoords = screen_info.texcoords;
+    const bool upright = orientation == Layout::DisplayOrientation::Portrait ||
+                         orientation == Layout::DisplayOrientation::PortraitFlipped;
+    const u32 pipeline = ChoosePresentPipeline(screen_info, upright ? w : h, upright ? h : w);
 
     std::array<ScreenRectVertex, 4> vertices;
     switch (orientation) {
@@ -835,16 +877,12 @@ void RendererVulkan::DrawSingleScreen(u32 screen_id, float x, float y, float w, 
     std::memcpy(data, vertices.data(), size);
     vertex_buffer.Commit(size);
 
-    const f32 scale_factor = GetResolutionScaleFactor().Factor();
-    const f32 input_width = static_cast<f32>(screen_info.texture.width) * scale_factor;
-    const f32 input_height = static_cast<f32>(screen_info.texture.height) * scale_factor;
-    draw_info.i_resolution =
-        Common::MakeVec(input_width, input_height, 1.0f / input_width, 1.0f / input_height);
     draw_info.o_resolution = Common::MakeVec(h, w, 1.0f / h, 1.0f / w);
     draw_info.screen_id_l = screen_id;
 
-    scheduler.Record([this, offset = offset, info = draw_info](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, offset = offset, info = draw_info, pipeline](vk::CommandBuffer cmdbuf) {
         const u32 first_vertex = static_cast<u32>(offset) / sizeof(ScreenRectVertex);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, present_pipelines[pipeline]);
         cmdbuf.pushConstants(*present_pipeline_layout,
                              vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex,
                              0, sizeof(info), &info);
@@ -906,11 +944,6 @@ void RendererVulkan::DrawSingleScreenStereo(u32 screen_id_l, u32 screen_id_r, fl
     std::memcpy(data, vertices.data(), size);
     vertex_buffer.Commit(size);
 
-    const f32 scale_factor = GetResolutionScaleFactor().Factor();
-    const f32 input_width = static_cast<f32>(screen_info_l.texture.width) * scale_factor;
-    const f32 input_height = static_cast<f32>(screen_info_l.texture.height) * scale_factor;
-    draw_info.i_resolution =
-        Common::MakeVec(input_width, input_height, 1.0f / input_width, 1.0f / input_height);
     draw_info.o_resolution = Common::MakeVec(h, w, 1.0f / h, 1.0f / w);
     draw_info.screen_id_l = screen_id_l;
     draw_info.screen_id_r = screen_id_r;
