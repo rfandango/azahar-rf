@@ -100,6 +100,10 @@ struct PicaVSConfigState {
     void Init(const Pica::RegsInternal& regs, Pica::ShaderSetup& setup);
 
     u8 lighting_disable;
+    /// Made for a top screen shown at another shape than the console's (VSUniformData::wide).
+    /// (In what was a byte of padding, zero in every config kept from before, so those stay as
+    /// good as they were: not among the fields StructHash goes by.)
+    u8 wide_top_screen;
     /// Bool uniforms with their value compiled into the shader instead of read at run time,
     /// and those values. See Pica::ShaderSetup::GetBoolSpecialization.
     u16 bool_uniform_mask;

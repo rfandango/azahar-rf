@@ -105,7 +105,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
           DescriptorHeap{instance, scheduler.GetMasterSemaphore(), UTILITY_BINDINGS, 32}},
       trivial_vertex_shader{
           instance, vk::ShaderStageFlagBits::eVertex,
-          GLSL::GenerateTrivialVertexShader(instance.IsShaderClipDistanceSupported(), true)} {
+          GLSL::GenerateTrivialVertexShader(instance.IsShaderClipDistanceSupported(), true)},
+      wide_trivial_vertex_shader{instance, vk::ShaderStageFlagBits::eVertex,
+                                 GLSL::GenerateTrivialVertexShader(
+                                     instance.IsShaderClipDistanceSupported(), true, true)} {
     scheduler.RegisterOnDispatch([this] { update_queue.Flush(); });
     // Nothing waits for what the optimizer builds, so it gives way to everything else. It is
     // one thread, which this therefore runs on.
@@ -691,9 +694,10 @@ ExtraVSConfig PipelineCache::CalcExtraConfig(const PicaVSConfig& config) {
 
 bool PipelineCache::UseProgrammableVertexShader(const Pica::RegsInternal& regs,
                                                 Pica::ShaderSetup& setup,
-                                                const VertexLayout& layout) {
+                                                const VertexLayout& layout, bool wide_top_screen) {
 
-    auto res = curr_disk_cache->UseProgrammableVertexShader(regs, setup, layout);
+    auto res =
+        curr_disk_cache->UseProgrammableVertexShader(regs, setup, layout, wide_top_screen);
 
     if (res.has_value()) {
         current_shaders[ProgramType::VS] = (*res).second;
@@ -704,9 +708,11 @@ bool PipelineCache::UseProgrammableVertexShader(const Pica::RegsInternal& regs,
     return false;
 }
 
-void PipelineCache::UseTrivialVertexShader() {
-    current_shaders[ProgramType::VS] = &trivial_vertex_shader;
-    shader_hashes[ProgramType::VS] = 0;
+void PipelineCache::UseTrivialVertexShader(bool wide_top_screen) {
+    current_shaders[ProgramType::VS] =
+        wide_top_screen ? &wide_trivial_vertex_shader : &trivial_vertex_shader;
+    shader_hashes[ProgramType::VS] =
+        wide_top_screen ? WIDE_TRIVIAL_VERTEX_SHADER : TRIVIAL_VERTEX_SHADER;
 }
 
 bool PipelineCache::UseFixedGeometryShader(const Pica::RegsInternal& regs) {

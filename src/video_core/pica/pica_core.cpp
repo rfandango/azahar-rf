@@ -5,15 +5,19 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 #include <nihstro/shader_bytecode.h>
 #include "common/arch.h"
 #include "common/archives.h"
+#include "common/file_util.h"
 #include "common/hash.h"
 #include "common/hitch_tracker.h"
 #include "common/math_util.h"
@@ -1439,6 +1443,181 @@ const PicaCore::UniformSet& PicaCore::FloatUniformsZeroSign() {
     return ALL;
 }
 
+namespace {
+
+/// The clip axis along which a perspective projection among the float uniforms squeezes the
+/// picture for a wider screen, or -1 with none there. Looked for: four uniforms in a row, as
+/// the rows of a matrix, of which the last is (0, 0, 1 or -1, 0) and the first two hold one
+/// scale term each, on x and y, in the console's 5:3. The smaller term is the one for the
+/// picture's horizontal; its row is the clip axis. (The top screen is turned by a quarter, so
+/// that is mostly y; a target a game draws upright has it on x.) Projections for shadows and
+/// the like are not 5:3 and are left alone by that.
+s8 FindProjectionAxis(const Uniforms& uniforms, const std::array<f32, 4>& ratios) {
+    for (std::size_t base = 0; base + 3 < uniforms.f.size(); base++) {
+        const auto& last = uniforms.f[base + 3];
+        if (last.x.ToFloat32() != 0.f || last.y.ToFloat32() != 0.f ||
+            std::abs(std::abs(last.z.ToFloat32()) - 1.f) > 1e-3f || last.w.ToFloat32() != 0.f) {
+            continue;
+        }
+        const f32 first_x = uniforms.f[base].x.ToFloat32();
+        const f32 first_y = uniforms.f[base].y.ToFloat32();
+        const f32 second_x = uniforms.f[base + 1].x.ToFloat32();
+        const f32 second_y = uniforms.f[base + 1].y.ToFloat32();
+        const bool turned = first_x == 0.f && first_y != 0.f && second_x != 0.f && second_y == 0.f;
+        const bool upright = first_x != 0.f && first_y == 0.f && second_x == 0.f && second_y != 0.f;
+        if (!turned && !upright) {
+            continue;
+        }
+        const f32 one = std::abs(turned ? first_y : first_x);
+        const f32 other = std::abs(turned ? second_x : second_y);
+        const f32 ratio = std::max(one, other) / std::min(one, other);
+        const bool known = std::ranges::any_of(ratios, [ratio](f32 wanted) {
+            return wanted > 0.f && std::abs(ratio - wanted) <= 0.006f * wanted;
+        });
+        if (!known) {
+            continue;
+        }
+        return one < other ? s8{0} : s8{1};
+    }
+    return -1;
+}
+
+/// What the host's vertex stage does to a vertex's clip coordinates (ApplyWide in the
+/// generated shaders), for the tests made here of where a draw's vertices end up
+void WidenShaded(const PicaCore::WideScales& scales, OutputVertex& vertex) {
+    if (scales == PicaCore::WideScales{}) {
+        return;
+    }
+    if (std::abs(vertex.pos.w.ToFloat32() - 1.f) < 0.0001f) {
+        vertex.pos.y = f24::FromFloat32(vertex.pos.y.ToFloat32() * scales.flat);
+    } else {
+        vertex.pos.x = f24::FromFloat32(vertex.pos.x.ToFloat32() * scales.x);
+        vertex.pos.y = f24::FromFloat32(vertex.pos.y.ToFloat32() * scales.y);
+    }
+}
+
+} // Anonymous namespace
+
+PicaCore::WideScales PicaCore::DecideWideScales(bool is_indexed) {
+    WideScales scales;
+    const f32 factor = wide_factor.load(std::memory_order_relaxed);
+    draws_wide = factor != 1.f && wide_enabled;
+    if (!draws_wide) {
+        return scales;
+    }
+
+    if (wide_epoch_seen != vs_setup.uniforms_epoch) {
+        wide_epoch_seen = vs_setup.uniforms_epoch;
+        wide_axis = FindProjectionAxis(vs_setup.uniforms, wide_ratios);
+    }
+    if (wide_axis == 0) {
+        scales.x = factor;
+    } else if (wide_axis == 1) {
+        scales.y = factor;
+    }
+
+    const auto& rasterizer = regs.internal.rasterizer;
+    const bool whole_top_screen = f24::FromRaw(rasterizer.viewport_size_x).ToFloat32() == 120.f &&
+                                  f24::FromRaw(rasterizer.viewport_size_y).ToFloat32() == 200.f &&
+                                  rasterizer.viewport_corner.x == 0 &&
+                                  rasterizer.viewport_corner.y == 0;
+    if (wide_keeps_flat_shape && whole_top_screen) {
+        scales.flat = factor;
+        // A small draw may be the kind that fills the screen from side to side: a fade, a
+        // flash, a film. (Also asked of one while the game's projection is among the
+        // uniforms: games leave it there while they draw flat.)
+        if (regs.internal.pipeline.num_vertices <= 6) {
+            DrawBox box;
+            const WideScales before = std::exchange(wide_scales, WideScales{});
+            const bool boxed = SmallDrawBox(is_indexed, box);
+            wide_scales = before;
+            if (boxed && box.bottom <= -0.98f && box.top >= 0.98f) {
+                scales.flat = 1.f;
+                wide_counts[3]++;
+            }
+        }
+    }
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    wide_counts[1] += wide_axis >= 0;
+    wide_counts[2] += scales.flat != 1.f;
+    if (++wide_counts[0] == 16384) {
+        LOG_INFO(HW_GPU,
+                 "Top screen of another shape (factor {:.4f}): of the last {} draws {} carried "
+                 "the game's projection and have their vertices with perspective squeezed, {} "
+                 "onto the whole top screen have those without squeezed about the middle, {} "
+                 "small ones are left to fill the screen from side to side",
+                 factor, wide_counts[0], wide_counts[1], wide_counts[2], wide_counts[3]);
+        wide_counts = {};
+    }
+#endif
+    return scales;
+}
+
+void PicaCore::LoadWidePatch(u64 program_id) {
+    wide_enabled = true;
+    wide_keeps_flat_shape = true;
+    wide_epoch_seen = 0;
+    wide_ratios = {5.f / 3.f, 0.f, 0.f, 0.f};
+    // Games whose projection is not in the console's plain 5:3
+    struct KnownGame {
+        u64 program_id;
+        f32 ratio;
+    };
+    static constexpr std::array<KnownGame, 1> KNOWN_GAMES{{
+        // Luigi's Mansion: Dark Moon (USA) draws its scene in two halves, one above the
+        // other, each at twice the height
+        {0x0004000000055F00ull, 10.f / 3.f},
+    }};
+    for (const KnownGame& game : KNOWN_GAMES) {
+        if (game.program_id == program_id) {
+            wide_ratios[1] = game.ratio;
+        }
+    }
+    const std::string path =
+        fmt::format("{}mods/{:016X}/widescreen.txt",
+                    FileUtil::GetUserPath(FileUtil::UserPath::LoadDir), program_id);
+    std::string text;
+    if (FileUtil::ReadFileToString(true, path, text) == 0) {
+        return;
+    }
+    // Lines of "key = value"; what follows a '#' is a comment
+    std::size_t at = 0;
+    while (at < text.size()) {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        if (const std::size_t comment = line.find('#'); comment != std::string::npos) {
+            line.erase(comment);
+        }
+        std::string compact;
+        for (const char c : line) {
+            if (c != ' ' && c != '\t' && c != '\r') {
+                compact += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+        }
+        if (compact == "widen=off") {
+            wide_enabled = false;
+        } else if (compact == "hud=stretch") {
+            wide_keeps_flat_shape = false;
+        } else if (compact.starts_with("ratio=")) {
+            const f32 ratio = std::strtof(compact.c_str() + 6, nullptr);
+            // After the built-in ones, as many as there is room for
+            for (f32& entry : wide_ratios) {
+                if (ratio >= 1.f && entry == 0.f) {
+                    entry = ratio;
+                    break;
+                }
+            }
+        }
+    }
+    LOG_INFO(HW_GPU, "{}: the scene is {}, what is drawn flat {}", path,
+             wide_enabled ? "drawn for the shape the top screen is shown at" : "left as it is",
+             wide_enabled && wide_keeps_flat_shape ? "keeps its proportions" : "is stretched");
+}
+
 void PicaCore::FlushSoftwareBatch() {
     if (!sw_batch_open) {
         return;
@@ -2140,6 +2319,12 @@ void PicaCore::SubmitImmediate(u32 value) {
 void PicaCore::DrawImmediate() {
     CITRA_TRACE_COUNT(SwVertices);
 
+    // Vertices given one at a time are left as they are for a top screen of another shape
+    if (wide_scales != WideScales{}) {
+        FlushSoftwareBatch();
+        wide_scales = WideScales{};
+    }
+
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
@@ -2398,6 +2583,13 @@ void PicaCore::DrawArrays(bool is_indexed) {
         MeasureDrawSite(cmd_list.addr, cmd_list.current_index, regs.internal.reg_array);
     }
 
+    // The scales for a top screen shown at another shape than the console's. Draws shaded here
+    // that wait to be drawn together go out with the scales they were given.
+    if (const WideScales scales = DecideWideScales(is_indexed); scales != wide_scales) {
+        FlushSoftwareBatch();
+        wide_scales = scales;
+    }
+
     // A draw that need not be made is left out: one whose result nobody sees, one that only
     // makes over again what is there (VideoCore::WorkRules). The registers were written as
     // usual.
@@ -2576,7 +2768,8 @@ bool PicaCore::SmallDrawBox(bool is_indexed, DrawBox& box) {
         engine.Run(vs_setup, shader_unit);
         AttributeBuffer output;
         shader_unit.WriteOutput(regs.internal.vs, output);
-        const OutputVertex shaded{regs.internal.rasterizer, output};
+        OutputVertex shaded{regs.internal.rasterizer, output};
+        WidenShaded(wide_scales, shaded);
 
         // A triangle with a vertex behind the eye can reach anywhere
         const f32 w = shaded.pos.w.ToFloat32();
@@ -2652,7 +2845,8 @@ bool PicaCore::CoversViewport(bool is_indexed, bool* exactly) {
         engine.Run(vs_setup, shader_unit);
         AttributeBuffer output;
         shader_unit.WriteOutput(regs.internal.vs, output);
-        const OutputVertex shaded{regs.internal.rasterizer, output};
+        OutputVertex shaded{regs.internal.rasterizer, output};
+        WidenShaded(wide_scales, shaded);
 
         // What follows is the quick way, for two triangles with their corners at those of
         // the viewport, which is how nearly every full-screen pass is drawn. Two triangles
@@ -2910,7 +3104,8 @@ bool PicaCore::ForDrawnTriangles(bool is_indexed, u32 most_vertices, f32& width,
         engine.Run(vs_setup, shader_unit);
         AttributeBuffer output;
         shader_unit.WriteOutput(regs.internal.vs, output);
-        const OutputVertex shaded{regs.internal.rasterizer, output};
+        OutputVertex shaded{regs.internal.rasterizer, output};
+        WidenShaded(wide_scales, shaded);
         at[index] = ClipPoint{shaded.pos.x.ToFloat32(), shaded.pos.y.ToFloat32(),
                               shaded.pos.z.ToFloat32(), shaded.pos.w.ToFloat32()};
         if (!std::isfinite(at[index].x) || !std::isfinite(at[index].y) ||

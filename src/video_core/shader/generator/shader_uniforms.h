@@ -90,12 +90,17 @@ struct VSUniformData {
     };
     u32 freecam_skip_2d{1};
 #endif
+    /// For a top screen shown at another shape than the console's 5:3: what a vertex's clip
+    /// coordinates are multiplied by, x and y for one with perspective, z (applied to y) for
+    /// one without. All ones where nothing is to change. See Pica::PicaCore::DecideWideScales.
+    /// Last, as only shaders made for that have it.
+    alignas(16) Common::Vec4f wide{1.f, 1.f, 1.f, 0.f};
 };
 #ifdef ENABLE_FREECAM
-static_assert(sizeof(VSUniformData) == 112,
+static_assert(sizeof(VSUniformData) == 128,
               "The size of the VSUniformData does not match the structure in the shader");
 #else
-static_assert(sizeof(VSUniformData) == 32,
+static_assert(sizeof(VSUniformData) == 48,
               "The size of the VSUniformData does not match the structure in the shader");
 #endif
 static_assert(sizeof(VSUniformData) < 16384,

@@ -84,9 +84,11 @@ void ShaderDiskCache::Init(const std::atomic_bool& stop_loading,
 }
 
 std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseProgrammableVertexShader(
-    const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, const VertexLayout& layout) {
+    const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, const VertexLayout& layout,
+    bool wide_top_screen) {
 
     PicaVSConfig config{regs, setup};
+    config.state.wide_top_screen = wide_top_screen;
 
     // Transfer vertex attributes to the VS config
     config.state.used_input_vertex_attributes = layout.attribute_count;
@@ -1706,7 +1708,11 @@ bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
                       entry->pl_info.shader_ids[ProgramType::FS],
                       entry->pl_info.shader_ids[ProgramType::GS]);
 
-            if (entry->pl_info.shader_ids[ProgramType::VS]) {
+            if (entry->pl_info.shader_ids[ProgramType::VS] ==
+                PipelineCache::WIDE_TRIVIAL_VERTEX_SHADER) {
+                shaders[ProgramType::VS] = &parent.wide_trivial_vertex_shader;
+            } else if (entry->pl_info.shader_ids[ProgramType::VS] !=
+                       PipelineCache::TRIVIAL_VERTEX_SHADER) {
                 auto it_vs =
                     programmable_vertex_map.find(entry->pl_info.shader_ids[ProgramType::VS]);
                 if (it_vs == programmable_vertex_map.end()) {

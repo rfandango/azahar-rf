@@ -25,6 +25,11 @@ struct CardboardSettings {
     s32 user_x_shift;
 };
 
+/// Whether the top screen is shown in 16:9, or in the shape the aspect ratio setting says, and what
+/// a game draws for it is drawn for that shape (Pica::PicaCore::WideScales, with Vulkan). The bottom
+/// screen keeps its shape.
+bool IsTopScreenWide();
+
 /// Describes the layout of the window framebuffer (size and top/bottom screen positions)
 struct FramebufferLayout {
     u32 width;

@@ -2,6 +2,8 @@
 // Licensed under GPLv3 or any later version
 // Refer to the LICENSE.txt file included.
 
+#include <algorithm>
+#include <cmath>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/memory_detect.h"
@@ -1186,6 +1188,45 @@ void RendererVulkan::ComposeFrame(u64 vblank) {
     EndGpuFrame();
 }
 
+void RendererVulkan::UpdateWideFactor(const Layout::FramebufferLayout& main_layout) {
+    f32 wide_factor = 1.f;
+    // Where the top screen is shown: in the main window, or on the second display alone. (With
+    // both showing it, each in another shape, the one picture there is is drawn for the main one.)
+    const Layout::FramebufferLayout* shown = nullptr;
+    if (Layout::IsTopScreenWide()) {
+        if (main_layout.top_screen_enabled) {
+            shown = &main_layout;
+        } else if (secondary_window && secondaryWindowEnabled &&
+                   secondary_window->GetFramebufferLayout().top_screen_enabled) {
+            shown = &secondary_window->GetFramebufferLayout();
+        }
+    }
+    if (shown) {
+        const f32 width = static_cast<f32>(shown->top_screen.GetWidth());
+        const f32 height = static_cast<f32>(shown->top_screen.GetHeight());
+        if (width >= 1.f && height >= 1.f) {
+            const f32 shape = shown->is_rotated ? width / height : height / width;
+            const f32 wanted = (5.f / 3.f) / shape;
+            // (Not for a difference a rounded layout makes)
+            if (std::abs(wanted - 1.f) >= 0.004f) {
+                wide_factor = std::clamp(wanted, 0.5f, 1.5f);
+            }
+        }
+    }
+    rasterizer.SetWideFactor(wide_factor);
+    if (wide_factor != last_wide_factor) {
+        last_wide_factor = wide_factor;
+        const Layout::FramebufferLayout& where = shown ? *shown : main_layout;
+        LOG_INFO(Render_Vulkan,
+                 "Top screen at {}x{} of a {} of {}x{}, bottom screen at {}x{}: the picture is "
+                 "drawn for that shape with the factor {:.4f}",
+                 where.top_screen.GetWidth(), where.top_screen.GetHeight(),
+                 &where == &main_layout ? "main window" : "second display", where.width,
+                 where.height, where.bottom_screen.GetWidth(), where.bottom_screen.GetHeight(),
+                 wide_factor);
+    }
+}
+
 void RendererVulkan::Compose() {
     system.perf_stats->StartSwap();
     screenRendered = false;
@@ -1209,6 +1250,7 @@ void RendererVulkan::Compose() {
 #endif
 
     const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
+    UpdateWideFactor(layout);
     // The image of the last VBlank again would be composed and queued a second time for
     // nothing, and in the queue it gets in the way of the images that differ: it delays the
     // next one or takes the place of the one before.

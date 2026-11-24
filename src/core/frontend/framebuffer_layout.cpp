@@ -16,7 +16,23 @@ static constexpr float TOP_SCREEN_ASPECT_RATIO =
 static constexpr float BOT_SCREEN_ASPECT_RATIO =
     static_cast<float>(Core::kScreenBottomHeight) / Core::kScreenBottomWidth;
 
+bool IsTopScreenWide() {
+    return Settings::values.wide_top_screen.GetValue() &&
+           Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::Vulkan;
+}
+
+/// The width the top screen is shown in for its height of 240: its own, or that of 16:9
+static u32 TopScreenWidth() {
+    static constexpr u32 WIDE_WIDTH = (Core::kScreenTopHeight * 16 + 8) / 9;
+    return IsTopScreenWide() ? WIDE_WIDTH : Core::kScreenTopWidth;
+}
+
 Common::ResolutionScale FramebufferLayout::GetScalingRatio() const {
+    // Shown wider than it is, it is drawn in what its height needs, 4.5 times at 1080 lines and
+    // not 4.8 times for the width: that falls short of the display by as much as it is stretched
+    if (IsTopScreenWide() && is_rotated) {
+        return Common::ResolutionScale::Covering(top_screen.GetHeight(), Core::kScreenTopHeight);
+    }
     return Common::ResolutionScale::Covering(
         top_screen.GetWidth(), is_rotated ? Core::kScreenTopWidth : Core::kScreenTopHeight);
 }
@@ -95,7 +111,10 @@ FramebufferLayout DefaultFrameLayout(u32 width, u32 height, bool swapped, bool u
 FramebufferLayout PortraitTopFullFrameLayout(u32 width, u32 height, bool swapped, bool upright) {
     ASSERT(width > 0);
     ASSERT(height > 0);
-    const float scale_factor = swapped ? 1.25f : 0.8f;
+    // Both screens in the same width
+    const float scale_factor = swapped
+                                   ? static_cast<float>(TopScreenWidth()) / Core::kScreenBottomWidth
+                                   : static_cast<float>(Core::kScreenBottomWidth) / TopScreenWidth();
     FramebufferLayout res = LargeFrameLayout(width, height, swapped, upright, scale_factor,
                                              Settings::SmallScreenPosition::BelowLarge);
     const int shiftY = -(int)(swapped ? res.bottom_screen.top : res.top_screen.top);
@@ -127,8 +146,11 @@ FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool swapped, bool up
     FramebufferLayout res{width, height, !swapped, swapped, {}, {}, !upright};
 
     Common::Rectangle<u32> screen_window_area{0, 0, width, height};
-    Common::Rectangle<u32> top_screen{0, 0, Core::kScreenTopWidth, Core::kScreenTopHeight};
+    const bool wide = IsTopScreenWide();
+    Common::Rectangle<u32> top_screen{0, 0, TopScreenWidth(), Core::kScreenTopHeight};
     Common::Rectangle<u32> bot_screen{0, 0, Core::kScreenBottomWidth, Core::kScreenBottomHeight};
+    const Common::Rectangle<u32> bot_screen_as_it_is =
+        MaxRectangle(screen_window_area, bot_screen, Settings::values.use_integer_scaling.GetValue());
 
     const float window_aspect_ratio = static_cast<float>(height) / static_cast<float>(width);
     const auto aspect_ratio_setting = Settings::values.aspect_ratio.GetValue();
@@ -137,10 +159,16 @@ FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool swapped, bool up
     case Settings::AspectRatio::Default:
         // this is the only one where we allow integer scaling to apply
         // also the only option on desktop
-        top_screen = MaxRectangle(screen_window_area, top_screen,
-                                  Settings::values.use_integer_scaling.GetValue());
-        bot_screen = MaxRectangle(screen_window_area, bot_screen,
-                                  Settings::values.use_integer_scaling.GetValue());
+        if (wide && !Settings::values.use_integer_scaling.GetValue()) {
+            // (To the pixel: 240 lines have no whole width in 16:9)
+            top_screen = MaxRectangle(
+                screen_window_area,
+                FramebufferLayout::GetAspectRatioValue(Settings::AspectRatio::R16_9));
+        } else {
+            top_screen = MaxRectangle(screen_window_area, top_screen,
+                                      Settings::values.use_integer_scaling.GetValue());
+        }
+        bot_screen = bot_screen_as_it_is;
         break;
     case Settings::AspectRatio::Stretch:
         top_screen = MaxRectangle(screen_window_area, window_aspect_ratio);
@@ -150,6 +178,10 @@ FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool swapped, bool up
         float emulation_aspect_ratio = FramebufferLayout::GetAspectRatioValue(aspect_ratio_setting);
         top_screen = MaxRectangle(screen_window_area, emulation_aspect_ratio);
         bot_screen = MaxRectangle(screen_window_area, emulation_aspect_ratio);
+    }
+    if (wide) {
+        // The shape is the top screen's: the bottom screen, on a second display say, keeps its own
+        bot_screen = bot_screen_as_it_is;
     }
 
     const bool stretched = (Settings::values.screen_top_stretch.GetValue() && !swapped) ||
@@ -197,8 +229,8 @@ FramebufferLayout LargeFrameLayout(u32 width, u32 height, bool swapped, bool upr
     u32 large_height = swapped ? Core::kScreenBottomHeight : Core::kScreenTopHeight;
     u32 small_height = static_cast<u32>(swapped ? Core::kScreenTopHeight / scale_factor
                                                 : Core::kScreenBottomHeight / scale_factor);
-    u32 large_width = swapped ? Core::kScreenBottomWidth : Core::kScreenTopWidth;
-    u32 small_width = static_cast<u32>(swapped ? Core::kScreenTopWidth / scale_factor
+    u32 large_width = swapped ? Core::kScreenBottomWidth : TopScreenWidth();
+    u32 small_width = static_cast<u32>(swapped ? TopScreenWidth() / scale_factor
                                                : Core::kScreenBottomWidth / scale_factor);
 
     u32 emulation_width;
@@ -309,7 +341,11 @@ FramebufferLayout HybridScreenLayout(u32 width, u32 height, bool swapped, bool u
     }
 
     // use Large Screen layout with these specific ratios to get two of the pieces
-    const float scale_factor = swapped ? 2.25 : 1.8;
+    // (2.25 and 1.8 for the top screen in its own shape: the column beside the large screen then
+    // has room for both screens, each in its shape)
+    const float scale_factor =
+        swapped ? 1.f + static_cast<float>(TopScreenWidth()) / Core::kScreenBottomWidth
+                : 1.f + static_cast<float>(Core::kScreenBottomWidth) / TopScreenWidth();
     const Settings::SmallScreenPosition pos = swapped ? Settings::SmallScreenPosition::TopRight
                                                       : Settings::SmallScreenPosition::BottomRight;
     // always pass false as the upright value here, as it is being handled here not there
@@ -442,17 +478,19 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
 
             break;
         case Settings::PortraitLayoutOption::PortraitTopFullWidth:
-            width = Core::kScreenTopWidth * res_scale;
-            // clang-format off
-            height = (static_cast<int>(Core::kScreenTopHeight + Core::kScreenBottomHeight * 1.25) *
-                     res_scale) + gap;
-            // clang-format on
+            width = TopScreenWidth() * res_scale;
+            height = (static_cast<u32>(Core::kScreenTopHeight + Core::kScreenBottomHeight *
+                                                                    static_cast<double>(width) /
+                                                                    res_scale /
+                                                                    Core::kScreenBottomWidth) *
+                      res_scale) +
+                     gap;
             layout =
                 PortraitTopFullFrameLayout(width, height, Settings::values.swap_screen.GetValue(),
                                            Settings::values.upright_screen.GetValue());
             break;
         case Settings::PortraitLayoutOption::PortraitOriginal:
-            width = Core::kScreenTopWidth * res_scale;
+            width = TopScreenWidth() * res_scale;
             height = (Core::kScreenTopHeight + Core::kScreenBottomHeight) * res_scale;
             layout = PortraitOriginalLayout(width, height, Settings::values.swap_screen.GetValue());
             break;
@@ -478,7 +516,7 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
                 width = Core::kScreenBottomWidth * res_scale;
                 height = Core::kScreenBottomHeight * res_scale;
             } else {
-                width = Core::kScreenTopWidth * res_scale;
+                width = TopScreenWidth() * res_scale;
                 height = Core::kScreenTopHeight * res_scale;
             }
             if (Settings::values.upright_screen.GetValue()) {
@@ -492,10 +530,11 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
 
         case Settings::LayoutOption::LargeScreen: {
             const bool swapped = Settings::values.swap_screen.GetValue();
-            const int largeWidth = swapped ? Core::kScreenBottomWidth : Core::kScreenTopWidth;
+            const int topWidth = static_cast<int>(TopScreenWidth());
+            const int largeWidth = swapped ? Core::kScreenBottomWidth : topWidth;
             const int largeHeight = swapped ? Core::kScreenBottomHeight : Core::kScreenTopHeight;
             const int smallWidth =
-                static_cast<int>((swapped ? Core::kScreenTopWidth : Core::kScreenBottomWidth) /
+                static_cast<int>((swapped ? topWidth : Core::kScreenBottomWidth) /
                                  Settings::values.large_screen_proportion.GetValue());
             const int smallHeight =
                 static_cast<int>((swapped ? Core::kScreenTopHeight : Core::kScreenBottomHeight) /
@@ -523,7 +562,7 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
             break;
         }
         case Settings::LayoutOption::SideScreen:
-            width = (Core::kScreenTopWidth + Core::kScreenBottomWidth) * res_scale + gap;
+            width = (TopScreenWidth() + Core::kScreenBottomWidth) * res_scale + gap;
             height = Core::kScreenTopHeight * res_scale;
 
             if (Settings::values.upright_screen.GetValue()) {
@@ -539,10 +578,13 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
             if (Settings::values.swap_screen.GetValue()) {
                 width = Core::kScreenBottomWidth;
             } else {
-                width = Core::kScreenTopWidth;
+                width = TopScreenWidth();
             }
-            // 2.25f comes from HybridScreenLayout's scale_factor value.
-            width = static_cast<int>((width + (Core::kScreenTopWidth / 2.25f)) * res_scale);
+            // The column beside the large screen, as in HybridScreenLayout
+            width = static_cast<int>(
+                (width + (TopScreenWidth() /
+                          (1.f + static_cast<float>(TopScreenWidth()) / Core::kScreenBottomWidth))) *
+                res_scale);
 
             if (Settings::values.upright_screen.GetValue()) {
                 std::swap(width, height);
@@ -553,7 +595,7 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
             break;
         case Settings::LayoutOption::Default:
         default:
-            width = Core::kScreenTopWidth * res_scale;
+            width = TopScreenWidth() * res_scale;
             height = (Core::kScreenTopHeight + Core::kScreenBottomHeight) * res_scale + gap;
 
             if (Settings::values.upright_screen.GetValue()) {

@@ -26,6 +26,7 @@ import org.citra.citra_emu.features.input.GamepadHelper
 import org.citra.citra_emu.features.settings.model.BooleanSetting
 import org.citra.citra_emu.features.settings.model.CitraSettings
 import org.citra.citra_emu.features.settings.model.FloatSetting
+import org.citra.citra_emu.features.settings.model.GraphicsAPI
 import org.citra.citra_emu.features.settings.model.InputMappingSetting
 import org.citra.citra_emu.features.settings.model.IntListSetting
 import org.citra.citra_emu.features.settings.model.IntSetting
@@ -1355,6 +1356,18 @@ class SettingsFragmentPresenter(
                     IntSetting.SECONDARY_DISPLAY_LAYOUT.key,
                     IntSetting.SECONDARY_DISPLAY_LAYOUT.defaultValue,
                     editingSettings.get(BooleanSetting.ENABLE_SECONDARY_DISPLAY)
+                )
+            )
+            add(
+                SwitchSetting(
+                    editingSettings,
+                    BooleanSetting.WIDE_TOP_SCREEN,
+                    R.string.wide_top_screen,
+                    R.string.wide_top_screen_description,
+                    BooleanSetting.WIDE_TOP_SCREEN.key,
+                    BooleanSetting.WIDE_TOP_SCREEN.defaultValue,
+                    isEnabled =
+                        editingSettings.get(IntSetting.GRAPHICS_API) == GraphicsAPI.VULKAN.int
                 )
             )
             add(

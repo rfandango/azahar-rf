@@ -82,10 +82,10 @@ public:
 
     /// Binds a PICA decompiled vertex shader
     bool UseProgrammableVertexShader(const Pica::RegsInternal& regs, Pica::ShaderSetup& setup,
-                                     const VertexLayout& layout);
+                                     const VertexLayout& layout, bool wide_top_screen);
 
     /// Binds a passthrough vertex shader
-    void UseTrivialVertexShader();
+    void UseTrivialVertexShader(bool wide_top_screen);
 
     /// Binds a PICA decompiled geometry shader
     bool UseFixedGeometryShader(const Pica::RegsInternal& regs);
@@ -228,7 +228,12 @@ private:
     std::array<u64, MAX_SHADER_STAGES> shader_hashes;
     std::array<Shader*, MAX_SHADER_STAGES> current_shaders;
 
+    /// The passthrough vertex shader, and the one for a top screen of another shape, by the ids
+    /// pipelines know them by
+    static constexpr u64 TRIVIAL_VERTEX_SHADER = 0;
+    static constexpr u64 WIDE_TRIVIAL_VERTEX_SHADER = 1;
     Shader trivial_vertex_shader;
+    Shader wide_trivial_vertex_shader;
 
     u64 current_program_id{0};
     std::vector<std::shared_ptr<ShaderDiskCache>> disk_caches;

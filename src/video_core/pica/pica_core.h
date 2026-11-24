@@ -128,6 +128,43 @@ public:
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// A top screen that is shown at another shape than the console's 5:3 (16:9, say) is
+    /// drawn for that shape, not stretched. The factor is the console's shape over the one
+    /// shown, 15/16 for 16:9, and 1 where nothing is to change; the renderer gives it every
+    /// frame. A draw then has its clip coordinates multiplied in the host's vertex stage:
+    ///  - x or y of vertices with perspective, where the vertex shader's float uniforms hold
+    ///    the game's perspective projection in the console's shape (which of the two says
+    ///    which way the picture is turned): the scene shows as much more to the sides as the
+    ///    screen is wider. The game goes on deciding what is in view by its own 5:3.
+    ///  - y of vertices without, for draws onto the whole top screen: what is drawn flat (the
+    ///    HUD, positions the game worked out for the screen) keeps its proportions about the
+    ///    middle. Not a draw of up to two triangles from one side to the other: a fade, a
+    ///    background, a film, which goes on filling the screen.
+    /// A file for a game, load/mods/<title id>/widescreen.txt, can say "widen = off",
+    /// "hud = stretch" and "ratio = 3.3333": a further ratio the two scale terms of its
+    /// projection are in (a game that draws its scene in two halves has them in 10:3). Games
+    /// known to need that have it built in (LoadWidePatch).
+    struct WideScales {
+        f32 x{1.f};
+        f32 y{1.f};
+        f32 flat{1.f};
+        bool operator==(const WideScales&) const = default;
+    };
+    void SetWideFactor(f32 factor) noexcept {
+        wide_factor.store(factor, std::memory_order_relaxed);
+    }
+    /// The scales of the draw that is being carried out
+    [[nodiscard]] const WideScales& GetWideScales() const noexcept {
+        return wide_scales;
+    }
+    /// Whether draws are made for a top screen of another shape at all, as of the last one:
+    /// what chooses the vertex shaders that can be scaled
+    [[nodiscard]] bool DrawsWide() const noexcept {
+        return draws_wide;
+    }
+    /// Reads the game's file, if it has one. With no draw under way.
+    void LoadWidePatch(u64 program_id);
+
     void SetInterruptHandler(Service::GSP::InterruptHandler& signal_interrupt);
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
@@ -262,6 +299,25 @@ private:
     /// geometry shader's only decide what the triangles are), a draw that is not added to
     /// them, or the end of the list.
     void FlushSoftwareBatch();
+
+    /// The scales for the draw about to be carried out, see WideScales
+    WideScales DecideWideScales(bool is_indexed);
+    std::atomic<f32> wide_factor{1.f};
+    bool draws_wide{};
+    WideScales wide_scales;
+    /// The clip axis the projection among the float uniforms is to be squeezed along (0 or 1),
+    /// -1 with none there, and the count of changes of the uniforms that is of
+    s8 wide_axis{-1};
+    u32 wide_epoch_seen{};
+    bool wide_enabled{true};
+    bool wide_keeps_flat_shape{true};
+    /// The ratios a projection's scale terms may be in; zero for an entry not in use
+    std::array<f32, 4> wide_ratios{5.f / 3.f, 0.f, 0.f, 0.f};
+    /// For the log of profiling builds: draws decided on, those given a scale for vertices
+    /// with perspective, those given one for vertices without, small ones left to fill the
+    /// screen from side to side
+    std::array<u32, 4> wide_counts{};
+
     static constexpr u32 FIRST_VERTEX_REG = 0x200;
     static constexpr u32 MAX_BATCHED_DRAWS = 128;
     bool sw_batch_open{};

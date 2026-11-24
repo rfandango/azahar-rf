@@ -309,6 +309,11 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # 5: Stretch
 )") DECLARE_KEY(aspect_ratio) BOOST_HANA_STRING(R"(
 
+# Whether the top screen is shown in 16:9, with games drawing a wider scene for it (Vulkan only).
+# The aspect ratio above, where it is not the default, is then the top screen's alone.
+# 0 (default): Off, 1: On
+)") DECLARE_KEY(wide_top_screen) BOOST_HANA_STRING(R"(
+
 # Whether or not the performance overlay should be displayed
 # 0 (default): Hidden, 1: Shown
 )") DECLARE_KEY(performance_overlay_enable) BOOST_HANA_STRING(R"(

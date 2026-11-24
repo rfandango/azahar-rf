@@ -76,6 +76,7 @@ foreach(KEY IN ITEMS
     "custom_bottom_height"
     "custom_second_layer_opacity"
     "aspect_ratio"
+    "wide_top_screen"
     "screen_top_stretch"
     "screen_top_leftright_padding"
     "screen_top_topbottom_padding"

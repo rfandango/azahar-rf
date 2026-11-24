@@ -27,7 +27,7 @@ layout (binding = 0, std140) uniform vs_pica_data {
 )";
 
 // clang-format off
-constexpr std::string_view VSUniformBlockDef = R"(
+constexpr std::string_view VSUniformBlockHead = R"(
 #ifdef VULKAN
 layout (set = 0, binding = 1, std140) uniform vs_data {
 #else
@@ -42,7 +42,9 @@ R"(    mat4 freecam_matrix;
     bool freecam_skip_2d;
 )"
 #endif
-R"(};
+;
+
+constexpr std::string_view VSUniformBlockTail = R"(};
 
 const vec2 EPSILON_Z = vec2(0.000001f, -1.00001f);
 
@@ -68,15 +70,46 @@ vec4 ApplyFreeCam(vec4 clip_pos) {
 )"
 #endif
 ;
+
+constexpr std::string_view WideFunction = R"(
+// A top screen shown at another shape than the console's: the picture is drawn squeezed by as
+// much as showing it stretches it. A vertex without perspective (w of one) is what a game draws
+// flat, its HUD: that is squeezed about the middle of the screen.
+vec4 ApplyWide(vec4 clip_pos) {
+    if (abs(clip_pos.w - 1.0) < 0.0001) {
+        clip_pos.y *= wide.z;
+    } else {
+        clip_pos.xy *= wide.xy;
+    }
+    return clip_pos;
+}
+)";
 // clang-format on
 
+/// The block of VSUniformData and what goes by it. A shader that is not made for a top screen of
+/// another shape is as if there were none, and those kept from before stay good.
+static std::string VSUniformBlockDef(bool wide) {
+    std::string out{VSUniformBlockHead};
+    if (wide) {
+        out += "    vec4 wide;\n";
+    }
+    out += VSUniformBlockTail;
+    if (wide) {
+        out += WideFunction;
+    }
+    return out;
+}
+
+static std::string PositionOutput(bool wide) {
+    std::string position = "vec4(vtx_pos.x, vtx_pos.y, -vtx_pos.z, vtx_pos.w)";
 #ifdef ENABLE_FREECAM
-constexpr std::string_view PositionOutput =
-    "    gl_Position = ApplyFreeCam(vec4(vtx_pos.x, vtx_pos.y, -vtx_pos.z, vtx_pos.w));\n";
-#else
-constexpr std::string_view PositionOutput =
-    "    gl_Position = vec4(vtx_pos.x, vtx_pos.y, -vtx_pos.z, vtx_pos.w);\n";
+    position = "ApplyFreeCam(" + position + ")";
 #endif
+    if (wide) {
+        position = "ApplyWide(" + position + ")";
+    }
+    return "    gl_Position = " + position + ";\n";
+}
 
 static std::string GetVertexInterfaceDeclaration(bool is_output, bool use_clip_planes,
                                                  bool separable_shader) {
@@ -116,7 +149,7 @@ static std::string GetVertexInterfaceDeclaration(bool is_output, bool use_clip_p
     return out;
 }
 
-std::string GenerateTrivialVertexShader(bool use_clip_planes, bool separable_shader) {
+std::string GenerateTrivialVertexShader(bool use_clip_planes, bool separable_shader, bool wide) {
     std::string out;
     if (separable_shader) {
         out += "#extension GL_ARB_separate_shader_objects : enable\n";
@@ -135,7 +168,7 @@ std::string GenerateTrivialVertexShader(bool use_clip_planes, bool separable_sha
                     ATTRIBUTE_TEXCOORD2, ATTRIBUTE_TEXCOORD0_W, ATTRIBUTE_NORMQUAT, ATTRIBUTE_VIEW);
 
     out += GetVertexInterfaceDeclaration(true, use_clip_planes, separable_shader);
-    out += VSUniformBlockDef;
+    out += VSUniformBlockDef(wide);
 
     out += R"(
 void main() {
@@ -151,7 +184,7 @@ void main() {
         vtx_pos.y = -vtx_pos.y;
     }
 )";
-    out += PositionOutput;
+    out += PositionOutput(wide);
     if (use_clip_planes) {
         out += R"(
         gl_ClipDistance[0] = -vtx_pos.z; // fixed PICA clipping plane z <= 0
@@ -188,8 +221,9 @@ std::string GenerateVertexShader(const ShaderSetup& setup, const PicaVSConfig& c
         out += "#extension GL_ARB_separate_shader_objects : enable\n";
     }
 
+    const bool wide = config.state.wide_top_screen != 0;
     out += VSPicaUniformBlockDef;
-    out += VSUniformBlockDef;
+    out += VSUniformBlockDef(wide);
 
     std::array<bool, 16> used_regs{};
     const auto get_input_reg = [&used_regs](u32 reg) {
@@ -273,7 +307,7 @@ std::string GenerateVertexShader(const ShaderSetup& setup, const PicaVSConfig& c
         out += "    if (flip_viewport) {\n";
         out += "        vtx_pos.y = -vtx_pos.y;\n";
         out += "    }\n";
-        out += PositionOutput;
+        out += PositionOutput(wide);
         if (extra.use_clip_planes) {
             out += "    gl_ClipDistance[0] = -vtx_pos.z;\n"; // fixed PICA clipping plane z <= 0
             out += "    if (enable_clip1) {\n";
@@ -330,7 +364,7 @@ static std::string GetGSCommonSource(const PicaGSConfigState& state,
                                      const ExtraFixedGSConfig& extra) {
     std::string out =
         GetVertexInterfaceDeclaration(true, extra.use_clip_planes, extra.separable_shader);
-    out += VSUniformBlockDef;
+    out += VSUniformBlockDef(true);
 
     out += '\n';
     for (u32 i = 0; i < state.vs_output_attributes_count; ++i) {
@@ -375,7 +409,7 @@ struct Vertex {
     out += "    if (flip_viewport) {\n";
     out += "        vtx_pos.y = -vtx_pos.y;\n";
     out += "    }\n";
-    out += PositionOutput;
+    out += PositionOutput(true);
     if (extra.use_clip_planes) {
         out += "    gl_ClipDistance[0] = -vtx_pos.z;\n"; // fixed PICA clipping plane z <= 0
         out += "    if (enable_clip1) {\n";

@@ -180,6 +180,8 @@ public:
     u32 entry_point{};
     const void* cached_shader{};
     bool uniforms_dirty = true;
+    /// Counts the changes of float uniforms, for what is worked out from their values
+    u32 uniforms_epoch = 1;
 
     // bool requires_fixup = false;
     // bool has_fixup = false;
@@ -226,6 +228,7 @@ private:
         // ar & has_fixup;
         if (Archive::is_loading::value) {
             uniforms_dirty = true;
+            uniforms_epoch++;
         }
     }
 };

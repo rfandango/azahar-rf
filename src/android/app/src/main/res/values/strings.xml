@@ -530,6 +530,8 @@
     <string name="emulation_open_settings">Open Settings</string>
     <string name="emulation_open_cheats">Open Cheats</string>
     <string name="emulation_aspect_ratio">Aspect Ratio</string>
+    <string name="wide_top_screen">16:9 Top Screen</string>
+    <string name="wide_top_screen_description">Shows the top screen in 16:9 on whichever display it is, with more of the scene to the sides where the game allows it. The bottom screen keeps its shape. Vulkan only.</string>
     <string name="emulation_switch_screen_layout">Landscape Screen Layout</string>
     <string name="emulation_switch_portrait_layout">Portrait Screen Layout</string>
     <string name="emulation_secondary_display_enable">Enable Secondary Display</string>

@@ -622,6 +622,7 @@ struct Values {
     Setting<u16> custom_bottom_height{480, Keys::custom_bottom_height};
     Setting<u16> custom_second_layer_opacity{100, Keys::custom_second_layer_opacity};
     SwitchableSetting<AspectRatio> aspect_ratio{AspectRatio::Default, Keys::aspect_ratio};
+    SwitchableSetting<bool> wide_top_screen{false, Keys::wide_top_screen};
     SwitchableSetting<bool> screen_top_stretch{false, Keys::screen_top_stretch};
     Setting<u16> screen_top_leftright_padding{0, Keys::screen_top_leftright_padding};
     Setting<u16> screen_top_topbottom_padding{0, Keys::screen_top_topbottom_padding};

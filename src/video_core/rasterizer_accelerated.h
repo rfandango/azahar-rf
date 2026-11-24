@@ -27,6 +27,10 @@ public:
     void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                      const Pica::OutputVertex& v2) override;
 
+    /// The console's shape of the top screen over the shape it is shown at, see
+    /// Pica::PicaCore::WideScales
+    void SetWideFactor(f32 factor);
+
 #ifdef ENABLE_FREECAM
     void SetFreeCam(const std::array<f32, 16>& matrix, bool skip_2d) override;
 #endif

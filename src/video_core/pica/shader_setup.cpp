@@ -68,7 +68,9 @@ std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 val
 
     const u32 index = uniform_setup.index.Value();
     const auto prev = std::exchange(uniforms.f[index], uniform);
-    uniforms_dirty |= prev != uniform;
+    const bool changed = prev != uniform;
+    uniforms_dirty |= changed;
+    uniforms_epoch += changed;
     uniform_setup.index.Assign(index + 1);
     return index;
 }
@@ -100,7 +102,9 @@ std::optional<ShaderSetup::UniformWriteRange> ShaderSetup::WriteUniformFloatRegR
 
         const u32 index = uniform_setup.index.Value();
         const auto prev = std::exchange(uniforms.f[index], uniform);
-        uniforms_dirty |= prev != uniform;
+        const bool changed = prev != uniform;
+        uniforms_dirty |= changed;
+        uniforms_epoch += changed;
         uniform_setup.index.Assign(index + 1);
 
         if (!first_index) {

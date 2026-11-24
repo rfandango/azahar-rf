@@ -176,6 +176,8 @@ private:
         u64 vs_code_hash{};
         u64 vs_swizzle_hash{};
         const void* shader_cache{};
+        /// Pica::PicaCore::DrawsWide
+        bool wide{};
         Pica::Shader::UserConfig user_config{};
         PipelineCache::ChosenShader vs;
         PipelineCache::ChosenShader gs;

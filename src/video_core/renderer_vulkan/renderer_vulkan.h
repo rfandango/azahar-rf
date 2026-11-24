@@ -95,6 +95,9 @@ private:
     void ConfigureFramebufferTexture(TextureInfo& texture,
                                      const Pica::FramebufferConfig& framebuffer);
     void ConfigureRenderPipeline();
+    /// Tells the rasterizer which shape the top screen is shown in, for the game's picture to be
+    /// drawn for it (Pica::PicaCore::WideScales)
+    void UpdateWideFactor(const Layout::FramebufferLayout& main_layout);
     /// Composes the image of the VBlank `composing_vblank` and hands it to the window
     void Compose();
     u64 composing_vblank{};
@@ -164,6 +167,9 @@ private:
     vk::UniquePipelineLayout cursor_pipeline_layout{};
     bool isSecondaryWindow;
     bool secondaryWindowEnabled;
+    /// The factor last given to the rasterizer for a top screen shown at another shape than
+    /// the console's, for saying so when it changes
+    f32 last_wide_factor{1.f};
     bool screenRendered;
     u64 previous_game_frame_tick{};
 };

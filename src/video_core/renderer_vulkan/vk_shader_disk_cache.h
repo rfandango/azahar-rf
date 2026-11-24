@@ -32,7 +32,8 @@ public:
               const VideoCore::DiskResourceLoadCallback& callback);
 
     std::optional<std::pair<u64, Shader* const>> UseProgrammableVertexShader(
-        const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, const VertexLayout& layout);
+        const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, const VertexLayout& layout,
+        bool wide_top_screen);
     std::optional<std::pair<u64, Shader* const>> UseFragmentShader(
         const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
         bool depth_from_viewport, bool host_scissor, bool color_unused);

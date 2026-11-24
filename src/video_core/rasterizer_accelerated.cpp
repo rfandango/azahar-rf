@@ -250,8 +250,19 @@ void RasterizerAccelerated::SetFreeCam(const std::array<f32, 16>& matrix, bool s
 }
 #endif
 
+void RasterizerAccelerated::SetWideFactor(f32 factor) {
+    pica.SetWideFactor(factor);
+}
+
 void RasterizerAccelerated::SyncDrawUniforms() {
     auto& dirty = pica.dirty_regs;
+
+    // How this draw is scaled for a top screen shown at another shape than the console's
+    const auto& wide = pica.GetWideScales();
+    if (const Common::Vec4f scales{wide.x, wide.y, wide.flat, 0.f}; scales != vs_data.wide) {
+        vs_data.wide = scales;
+        vs_data_dirty = true;
+    }
 
     // The register that contains the flip bit also contains the framebuffer dimentions
     // that we don't depend on. So avoid the dirty table and check manually

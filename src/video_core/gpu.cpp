@@ -1389,6 +1389,7 @@ void GPU::ApplyPerProgramSettings(u64 program_ID) {
         }
     }
     impl->rasterizer->SetAccurateMul(use_accurate_mul);
+    impl->pica.LoadWidePatch(program_ID);
 }
 
 namespace {

@@ -39,7 +39,8 @@ namespace Pica::Shader::Generator::GLSL {
  * and directly passes them to the fragment shader.
  * @returns String of the shader source code
  */
-std::string GenerateTrivialVertexShader(bool use_clip_planes, bool separable_shader);
+std::string GenerateTrivialVertexShader(bool use_clip_planes, bool separable_shader,
+                                        bool wide = false);
 
 /**
  * Generates the GLSL vertex shader program source code for the given VS program

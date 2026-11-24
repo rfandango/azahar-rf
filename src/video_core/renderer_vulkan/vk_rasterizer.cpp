@@ -523,6 +523,7 @@ void RasterizerVulkan::LookUpDrawSite() {
     const u64 code_hash = pica.vs_setup.GetProgramCodeHash();
     const u64 swizzle_hash = pica.vs_setup.GetSwizzleDataHash();
     const void* const shader_cache = pipeline_cache.DiskCacheIdentity();
+    const bool wide = pica.DrawsWide();
     const u64 slot =
         (shaping ^ (code_hash * 0x9E3779B97F4A7C15ull) ^ (swizzle_hash * 0xC2B2AE3D27D4EB4Full)) *
         0xD6E8FEB86659FD93ull;
@@ -531,6 +532,7 @@ void RasterizerVulkan::LookUpDrawSite() {
 
     if (entry.filled && entry.shaping == shaping && entry.vs_code_hash == code_hash &&
         entry.vs_swizzle_hash == swizzle_hash && entry.shader_cache == shader_cache &&
+        entry.wide == wide &&
         std::memcmp(&entry.user_config, &user_config, sizeof(user_config)) == 0) {
         site_matches = true;
         return;
@@ -541,6 +543,7 @@ void RasterizerVulkan::LookUpDrawSite() {
     entry.vs_code_hash = code_hash;
     entry.vs_swizzle_hash = swizzle_hash;
     entry.shader_cache = shader_cache;
+    entry.wide = wide;
     entry.user_config = user_config;
 }
 
@@ -551,7 +554,7 @@ bool RasterizerVulkan::SetupVertexShader() {
         return true;
     }
     const bool usable = pipeline_cache.UseProgrammableVertexShader(
-        regs, pica.vs_setup, pipeline_info.state.vertex_layout);
+        regs, pica.vs_setup, pipeline_info.state.vertex_layout, pica.DrawsWide());
     if (usable && site) {
         site->vs = pipeline_cache.ChosenFor(ProgramType::VS);
         site->has_vs = true;
@@ -892,7 +895,7 @@ void RasterizerVulkan::DrawTriangles() {
     pipeline_info.state.rasterization.topology.Assign(Pica::PipelineRegs::TriangleTopology::List);
     pipeline_info.state.vertex_layout = software_layout;
 
-    pipeline_cache.UseTrivialVertexShader();
+    pipeline_cache.UseTrivialVertexShader(pica.DrawsWide());
     pipeline_cache.UseTrivialGeometryShader();
 
     Draw(false, false);
