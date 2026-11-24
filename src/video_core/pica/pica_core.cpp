@@ -542,8 +542,17 @@ void PicaCore::ForTwinRegisters(bool clears, Func&& func) const {
     }
     // The lights; where the vertices and indices are and how many; the stages after the
     // vertex shader; the vertex shader's configuration
-    if (!regs.internal.lighting.disable) {
-        func(0x140, 0x1C5);
+    if (const auto& lighting = regs.internal.lighting; !lighting.disable) {
+        // The lights that are on, as with the texture units (Metal Gear Solid: Snake Eater 3D
+        // draws most of a scene with the first of two, and the second holds what the frame
+        // before or this frame last set)
+        for (u32 index = 0; index <= lighting.max_light_index; index++) {
+            const u32 light = 0x140 + lighting.light_enable.GetNum(index) * 0x10;
+            func(light, light + 0x0C);
+        }
+        func(0x1C0, 0x1C5);
+        func(0x1D0, 0x1D3);
+        func(0x1D9, 0x1DA);
     }
     func(0x200, 0x22B);
     func(0x242, 0x243);

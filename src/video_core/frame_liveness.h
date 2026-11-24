@@ -112,6 +112,15 @@ private:
  * reads what it wrote before that is replaced. Frames repeat, so what comes after the last
  * frame is taken to be those frames again.
  *
+ * Not all that is not needed is work for an image nobody sees. A game draws a shadow map that
+ * nothing in a menu samples, or one step more of a blur than this scene takes from: nothing
+ * reads it, now. It is made for what may come, and that comes with the next scene, in the very
+ * frame that would find it left out. Draws and fills of that kind are carried out. Left out
+ * are those that go into an image that is not shown (as large as one that is, or put where
+ * the image of the other eye goes) or are made from one, a fill that is filled over before
+ * anything else is done, and the copies and transfers nothing reads, for what they cost, with
+ * the draws that make one image of a whole screen from another.
+ *
  * Work that was not needed for a while is left out from then on. It is recognized by what it
  * reads and writes and by which copy, transfer or fill came before it, not by its position in
  * the frame, so that a scene with more or fewer objects in it remains the same frame. Copies,
@@ -149,6 +158,7 @@ public:
     Vote OnDraw(DrawFacts& facts) override;
     Vote OnFill(const FillFacts& facts) override;
     Vote OnTransfer(const TransferFacts& facts) override;
+    void OnDone() override;
     void OnFrameEnd(const FrameFacts& facts) override;
 
     /// Titles that are known not to cope with a missing right eye are left alone
@@ -169,7 +179,8 @@ public:
     /// draw cannot be left out any more.
     /// overwrites_colour, overwrites_depth: the draw writes every pixel of the rows it is
     /// confined to anew, the colour or depth and stencil of it, whatever those held: its
-    /// triangles cover its viewport, the viewport is as wide as the target, and no test or
+    /// triangles cover its viewport, the viewport is as wide as the target (for the colour, as
+    /// what is in use of it), and no test or
     /// blending lets through what was there (a clear done by drawing, also one that tests
     /// nothing but still writes depth, which replaces_target does not take in).
     bool ShouldAllowDraw(const Pica::RegsInternal& regs, bool replaces_target,
@@ -245,6 +256,8 @@ private:
         bool renews{};
         /// Its result is on display or goes to the game
         bool shown{};
+        /// Its result is an image, on display or not
+        bool is_image{};
         bool operator==(const Step&) const = default;
     };
 
@@ -274,6 +287,7 @@ private:
         u64 key{};
         bool valid{};
         bool carried_out{};
+        bool kept_for_later{};
     };
 
     struct Verdict {
@@ -284,7 +298,11 @@ private:
         /// Bookkeeping of the look at the last frames that is under way
         u32 look{};
         bool needed_in_look{};
+        bool kept_in_look{};
         bool updated_in_look{};
+        /// The last look found nothing that reads it, and no image it goes into: it is
+        /// carried out for what may come
+        bool kept_for_later{};
     };
 
     struct ShownPlace {
@@ -309,8 +327,12 @@ private:
     /// step gets a read for a texture
     bool SamplesWritten(const Pica::RegsInternal& regs) const;
     bool IsShown(const MemoryRange& range) const;
+    /// Whether what is put there by a copy, transfer or fill is the image of a screen
+    bool IsImage(Kind kind, const MemoryRange& range) const;
     /// Finishes a step, decides whether it is carried out and notes it
     bool Submit(Step& step);
+    /// What a step that is carried out makes of what is stale
+    void CarryOut(const Step& step);
     void AddRead(Step& step, const MemoryRange& range) const;
     void AddRead(Step& step, const MemoryRange& range, const Link& link) const;
     /// Rows of one of the buffers of a draw, as memory
@@ -331,6 +353,20 @@ private:
     void GuestRead(const MemoryRange& range);
     void Mispredicted(const char* reader, const MemoryRange& range);
     void LookAtLastFrames();
+    const Step& StepAt(std::size_t index) const {
+        return index < previous.size() ? previous[index] : current[index - previous.size()];
+    }
+    /// Goes through the last two frames backwards from what is on display or read by the
+    /// game, with `images` from what is an image at all, and finds the steps that go into
+    /// it. False if that did not come to an end.
+    bool GoBack(bool images, std::vector<bool>& found) const;
+    /// Takes the steps that are not needed, go into no image and may yet be read one day for
+    /// needed, and finds them
+    void KeepForLater();
+    /// Whether the memory a fill fills is filled again with nothing done but fills in between
+    bool IsFilledAgain(std::size_t index) const;
+    /// Whether a step makes one image from another, a draw one at least as large as a screen
+    static bool IsCopy(const Step& step);
     /// Writes to the log what the frame that just ended was made of, see EndFrame
     void LogOutline() const;
     /// Whether the game drew with the stencil test on lately (see OnDraw)
@@ -340,6 +376,38 @@ private:
     static constexpr u32 STENCIL_FORGOTTEN_AFTER = 600;
     bool stencil_seen = false;
     u32 stencil_last_frame = 0;
+    /// How many columns of a colour buffer are in use. Games draw a screen, which has 240,
+    /// into a buffer of 256, and what nothing the GPU does ever reaches is in nobody's way: a
+    /// draw that covers the columns in use replaces what the buffer held.
+    struct ColumnUse {
+        MemoryRange buffer;
+        /// As far as draws reached in the stretch of frames under way and in the one before
+        u32 now{};
+        u32 before{};
+        u32 stretch{};
+        /// The last frame in which something other than its draws wrote there
+        u32 whole_frame{};
+        u32 last_frame{};
+    };
+    std::array<ColumnUse, 8> column_uses{};
+    /// The last draw noted: many draws follow each other into the same buffers
+    struct ColumnDraw {
+        PAddr colour{};
+        PAddr depth{};
+        u32 size{};
+        u32 formats{};
+        u32 right{};
+        u32 frame{};
+        bool operator==(const ColumnDraw&) const = default;
+    };
+    ColumnDraw last_column_draw;
+    /// Notes how far a draw reaches into its colour buffer
+    void NoteColumns(const Pica::RegsInternal& regs);
+    /// Memory written by something other than draws into the colour buffer that begins there
+    void NoteWholeWrite(const MemoryRange& range, PAddr but = 0);
+    /// Whether the viewport of a draw is as wide as what is in use of its colour buffer
+    bool ViewportSpansColumnsInUse(const Pica::RegsInternal& regs) const;
+    static constexpr u32 COLUMN_STRETCH = 64;
     /// Which colour buffer a depth buffer was last drawn with, and when that last changed
     struct DepthUse {
         PAddr depth = 0;
@@ -380,6 +448,9 @@ private:
     /// Whether the last step noted was carried out
     bool last_carried_out = false;
     std::vector<bool> needed;
+    /// The steps that go into an image, and those that are carried out for what may come
+    std::vector<bool> in_image;
+    std::vector<bool> for_later;
 
     /// The last copy, transfer or fill, which the draws after it go with
     u64 anchor = 0;
@@ -430,8 +501,14 @@ private:
         std::vector<Step> after;
         u64 before_hash{};
         u64 after_hash{};
-        /// For each kind of work in the two frames: whether any of its steps was needed
-        std::vector<std::pair<u64, bool>> outcome;
+        /// For each kind of work in the two frames: whether any of its steps was needed, and
+        /// whether that is for what may come
+        struct Outcome {
+            u64 key;
+            bool needed;
+            bool kept_for_later;
+        };
+        std::vector<Outcome> outcome;
         std::vector<bool> needed;
         bool valid{};
     };
@@ -461,13 +538,24 @@ private:
     /// Memory that does not hold what it should: what work left out would have written, and
     /// what was made from that
     MemoryRanges stale;
-    /// Framebuffers that were on display lately
-    boost::container::small_vector<ShownPlace, 8> shown_places;
+    /// What it was before the step just left out, for the case that another rule finds its
+    /// result to be there already (OnDone)
+    MemoryRanges stale_before;
+    bool just_left_out = false;
+    /// Framebuffers that were on display lately, and those of the eye that is not
+    using Places = boost::container::small_vector<ShownPlace, 8>;
+    Places shown_places;
+    Places unseen_places;
+    void NotePlace(Places& places, const MemoryRange& place) const;
 
     /// Steps of this frame and how many of them were left out, by kind
     std::array<u32, static_cast<std::size_t>(Kind::Count)> seen{};
     std::array<u32, static_cast<std::size_t>(Kind::Count)> left_out{};
+    /// Steps of this frame that nothing reads and that go into no image, carried out
+    std::array<u32, static_cast<std::size_t>(Kind::Count)> kept_for_later{};
     bool leaving_out = false;
+    /// How far it has come to be the other way round
+    u32 leaving_out_changing = 0;
     u32 frames_since_status = 0;
 };
 

@@ -36,6 +36,7 @@
 #include "video_core/video_core.h"
 #include "video_core/work_rules.h"
 #include "video_core/work_rules/repeated_eye_rule.h"
+#include "video_core/work_rules/repeated_run_rule.h"
 #include "video_core/work_rules/twin_pass_rule.h"
 
 namespace VideoCore {
@@ -154,6 +155,7 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
     // a new rule is a class behind VideoCore::WorkRule and a line here. Their order does not
     // matter, each is told of everything and votes.
     work_rules->Add(std::make_unique<RepeatedEyeRule>());
+    work_rules->Add(std::make_unique<RepeatedRunRule>());
     work_rules->Add(std::make_unique<TwinPassRule>());
 
     impl->vblank_event = impl->timing.RegisterEvent(

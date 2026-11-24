@@ -143,8 +143,13 @@ public:
     /// Get a surface that matches a "texture copy" display transfer config
     SurfaceRect_Tuple GetTexCopySurface(const SurfaceParams& params);
 
-    /// Write any cached resources overlapping the region back to memory (if dirty)
-    void FlushRegion(PAddr addr, u32 size, SurfaceId flush_surface = {});
+    /// Write any cached resources overlapping the region back to memory (if dirty), for it to be
+    /// read from there: by the game, or by what reads guest memory for a draw
+    void FlushRegion(PAddr addr, u32 size);
+
+    /// The same without anybody reading it: for the cache itself, which brings memory into a
+    /// surface that way, or gets a surface out of the way
+    void WriteBack(PAddr addr, u32 size, SurfaceId flush_surface = {});
 
     /// Mark region as being invalidated by region_owner (nullptr if 3DS memory)
     void InvalidateRegion(PAddr addr, u32 size, SurfaceId region_owner = {});

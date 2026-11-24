@@ -33,12 +33,14 @@ Vote WorkRules::AskAll(u32 Counts::*kind, Ask&& ask) {
     // Every rule is asked, also once one has voted: each follows what the game does by
     // what it is told here
     Vote result = Vote::Carry;
+    bool done = false;
     last_why = "";
     for (auto& entry : entries) {
         const Vote vote = ask(*entry);
         if (vote == Vote::Carry) {
             continue;
         }
+        done = done || vote == Vote::Redundant;
         entry->frame.*kind += 1;
         if (kind == &Counts::draws) {
             entry->draws_taken.fetch_add(1, std::memory_order_relaxed);
@@ -46,6 +48,11 @@ Vote WorkRules::AskAll(u32 Counts::*kind, Ask&& ask) {
         if (result == Vote::Carry) {
             result = vote;
             last_why = entry->rule->Why();
+        }
+    }
+    if (done) {
+        for (auto& entry : entries) {
+            entry->rule->OnDone();
         }
     }
     seen.*kind += 1;

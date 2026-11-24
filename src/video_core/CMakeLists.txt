@@ -108,8 +108,11 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     work_rules.cpp
     work_rules.h
     work_rules/draw_record.h
+    work_rules/eye_buffers.h
     work_rules/repeated_eye_rule.cpp
     work_rules/repeated_eye_rule.h
+    work_rules/repeated_run_rule.cpp
+    work_rules/repeated_run_rule.h
     work_rules/twin_pass_rule.cpp
     work_rules/twin_pass_rule.h
 )

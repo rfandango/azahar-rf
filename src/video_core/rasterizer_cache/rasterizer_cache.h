@@ -1486,7 +1486,8 @@ bool RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
                              surface.res_scale, static_cast<u32>(surface.type), params.addr,
                              surface.is_tiled, surface.stride, surface.levels, surface.width,
                              surface.height, surface.addr);
-            FlushRegion(params.addr, params.size);
+            // (The draw or copy this is for has been noted with what it reads)
+            WriteBack(params.addr, params.size);
             if (!use_custom_textures || !UploadCustomSurface(surface_id, interval)) {
                 UploadSurface(slot_surfaces[surface_id], interval);
             }
@@ -1908,7 +1909,7 @@ void RasterizerCache<T>::ClearAll(bool flush) {
     const auto flush_interval = PageMap::interval_type::right_open(0x0, 0xFFFFFFFF);
     // Force flush all surfaces from the cache
     if (flush) {
-        FlushRegion(0x0, 0xFFFFFFFF);
+        WriteBack(0x0, 0xFFFFFFFF);
     }
     // Unmark all of the marked pages
     for (auto& pair : RangeFromInterval(cached_pages, flush_interval)) {
@@ -1933,15 +1934,15 @@ void RasterizerCache<T>::ClearAll(bool flush) {
 }
 
 template <class T>
-void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surface_id) {
+void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size) {
+    FrameLiveness::NoteGuestRead(addr, size);
+    WriteBack(addr, size);
+}
+
+template <class T>
+void RasterizerCache<T>::WriteBack(PAddr addr, u32 size, SurfaceId flush_surface_id) {
     if (size == 0) [[unlikely]] {
         return;
-    }
-
-    // What is in guest memory after this gets read. Putting everything there, as before a
-    // save state, is not the game reading it.
-    if (size != 0xFFFFFFFF) {
-        FrameLiveness::NoteGuestRead(addr, size);
     }
 
     const SurfaceInterval flush_interval(addr, addr + size);
@@ -1991,7 +1992,8 @@ void RasterizerCache<T>::FlushRegion(PAddr addr, u32 size, SurfaceId flush_surfa
 
 template <class T>
 void RasterizerCache<T>::FlushAll() {
-    FlushRegion(0, 0xFFFFFFFF);
+    // (Putting everything into guest memory, as before a save state, is nobody reading it)
+    WriteBack(0, 0xFFFFFFFF);
 }
 
 template <class T>
@@ -2023,7 +2025,7 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
         // If the CPU is invalidating this region we want to remove it
         // to (likely) mark the memory pages as uncached
         if (!region_owner_id && size <= 8) {
-            FlushRegion(surface.addr, surface.size, surface_id);
+            WriteBack(surface.addr, surface.size, surface_id);
             remove_surfaces.push_back(surface_id);
             return;
         }

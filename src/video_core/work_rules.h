@@ -45,7 +45,8 @@ struct RegsInternal;
  *    rule left out had been carried out, which holds for Redundant by what that means. The
  *    watch over stale memory, for the case that a guess of Unseen was wrong, is kept by the
  *    one rule that votes Unseen (FrameLiveness); a second rule of that kind has to report
- *    what it leaves stale to that watch, which is not provided for yet.
+ *    what it leaves stale to that watch, which is not provided for yet. Where one rule votes
+ *    Unseen and another Redundant, nothing is stale: all of them are told (OnDone).
  *  - What rules want to know about a draw comes from DrawFacts. What costs something there
  *    (whether the triangles cover the viewport, which shades the vertices; a hash over the
  *    registers) is worked out when first asked for and kept for the rules that ask after,
@@ -182,6 +183,9 @@ public:
     virtual Vote OnTransfer([[maybe_unused]] const TransferFacts& facts) {
         return Vote::Carry;
     }
+    /// The piece of work just voted on counts as done, whatever this rule made of it: one of
+    /// the rules found its result to be there already
+    virtual void OnDone() {}
     virtual void OnFrameEnd([[maybe_unused]] const FrameFacts& facts) {}
 };
 

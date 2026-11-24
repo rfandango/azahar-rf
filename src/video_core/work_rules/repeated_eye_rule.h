@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include "video_core/work_rules/draw_record.h"
+#include "video_core/work_rules/eye_buffers.h"
 
 namespace VideoCore {
 
@@ -41,9 +42,8 @@ namespace VideoCore {
  * frame has shown the two runs to be alike and in every frame from then on; the second run's
  * backdrop is known by having the registers of the first.
  *
- * Not covered: runs that begin with a fill and not with a clear that is drawn (the fill of
- * the second run would have to be left out before the run is known to repeat), and eyes that
- * are drawn to two targets.
+ * Runs that begin with a fill and not with a clear that is drawn, and that draw to several
+ * targets, are those of RepeatedRunRule.
  *
  * Votes Redundant. Off with KeepRepeatedPass; ExplainScenePasses has it say more on why a
  * second run was no repetition.
@@ -111,13 +111,7 @@ private:
     bool too_many_sampled{};
     /// Where the first run's image was transferred to
     PAddr first_went_to{};
-    /// The buffers the top screen showed to the left eye lately, and those it showed to the
-    /// right eye that were not also the left eye's (a game goes through two or three of each
-    /// in turn)
-    std::array<PAddr, 8> left_shown{};
-    std::array<PAddr, 8> right_shown{};
-    u32 left_next{};
-    u32 right_next{};
+    EyeBuffers eyes;
     /// The place in the second run; whether every draw of it so far repeated the first;
     /// whether those that do are left out; how many were
     u32 at{};

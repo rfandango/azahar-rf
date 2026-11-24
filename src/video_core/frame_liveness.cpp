@@ -42,6 +42,11 @@ constexpr std::size_t MAX_SHOWN_PLACES = 16;
 constexpr u32 MAX_OCCURRENCES = 255;
 /// Rows are kept in memory eight at a time, in tiles
 constexpr u32 TILE_ROWS = 8;
+/// Pixels of the smaller of the two screens
+constexpr u32 SCREEN_PIXELS = 240 * 320;
+/// Frames in which work is left out, or none is, by which they have to outnumber the others
+/// for that to be written to the log: a game may go from one to the other within frames
+constexpr u32 CHANGE_HELD_FOR = 60;
 /// What a row worked out from texture coordinates may be off by, in rows
 constexpr f32 ROW_SLACK = 1.f / 32.f;
 
@@ -196,6 +201,9 @@ void FrameLiveness::Forget() {
     written_coarse.fill(0);
     stale.Clear();
     shown_places.clear();
+    unseen_places.clear();
+    column_uses = {};
+    last_column_draw = {};
     events++;
     draw_memo = DrawMemo{};
     for (KeptLook& kept : kept_looks) {
@@ -204,7 +212,9 @@ void FrameLiveness::Forget() {
     previous_hash = 0;
     seen.fill(0);
     left_out.fill(0);
+    kept_for_later.fill(0);
     leaving_out = false;
+    leaving_out_changing = 0;
     distrust = 0;
 }
 
@@ -212,6 +222,20 @@ bool FrameLiveness::IsShown(const MemoryRange& range) const {
     return !range.Empty() && std::ranges::any_of(shown_places, [&range](const ShownPlace& place) {
         return place.range.Overlaps(range);
     });
+}
+
+bool FrameLiveness::IsImage(Kind kind, const MemoryRange& range) const {
+    if (range.Empty() || kind == Kind::Draw) {
+        return false;
+    }
+    // A game need not say where the image of the other eye goes while it is not asked for
+    if (kind == Kind::Transfer && std::ranges::any_of(shown_places, [&range](const auto& place) {
+            return place.range.end - place.range.start == range.end - range.start;
+        })) {
+        return true;
+    }
+    return std::ranges::any_of(
+        unseen_places, [&range](const ShownPlace& place) { return place.range.Overlaps(range); });
 }
 
 void FrameLiveness::AddRead(Step& step, const MemoryRange& range) const {
@@ -528,12 +552,24 @@ FrameLiveness::DrawSignature FrameLiveness::SignatureOf(const Pica::RegsInternal
     return signature;
 }
 
+void FrameLiveness::OnDone() {
+    if (!active || !just_left_out || too_many_steps || current.empty()) {
+        return;
+    }
+    just_left_out = false;
+    stale = stale_before;
+    last_carried_out = true;
+    CarryOut(current.back());
+}
+
 Vote FrameLiveness::OnDraw(DrawFacts& facts) {
+    just_left_out = false;
     if (!active) {
         return Vote::Carry;
     }
     const Pica::RegsInternal& regs = facts.Regs();
     const bool shared_depth = NoteDepthUse(regs);
+    NoteColumns(regs);
     if (facts.IsImmediate()) {
         // Its vertices are with the rasterizer already: carried out in any case
         ShouldAllowDraw(regs, false, false);
@@ -551,9 +587,10 @@ Vote FrameLiveness::OnDraw(DrawFacts& facts) {
     DrawTextureRows texture_rows;
     const bool rows_known = WantsTextureRows(regs) && facts.TextureRows(texture_rows);
     // A draw that covers its viewport writes every pixel of the rows it is confined to if
-    // the viewport is as wide as the target
+    // the viewport is as wide as the target, or as what is in use of it
     const bool overwrites_colour =
-        facts.MayOverwriteColour() && facts.ViewportSpansTarget() && covers();
+        facts.MayOverwriteColour() &&
+        (facts.ViewportSpansTarget() || ViewportSpansColumnsInUse(regs)) && covers();
     // Depth and stencil are one buffer. A draw that renews the depth of every pixel but
     // leaves the stencil renews the buffer as far as anything goes that work left out could
     // have changed, as long as the game draws nothing with the stencil test on: only such
@@ -566,6 +603,94 @@ Vote FrameLiveness::OnDraw(DrawFacts& facts) {
                            overwrites_colour, overwrites_depth)
                ? Vote::Carry
                : Vote::Unseen;
+}
+
+void FrameLiveness::NoteColumns(const Pica::RegsInternal& regs) {
+    const auto& framebuffer = regs.framebuffer.framebuffer;
+    const auto& rasterizer = regs.rasterizer;
+    const PAddr colour = framebuffer.GetColorBufferPhysicalAddress();
+    f32 right = static_cast<f32>(rasterizer.viewport_corner.x) +
+                Pica::f24::FromRaw(rasterizer.viewport_size_x).ToFloat32() * 2.f;
+    if (rasterizer.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Include) {
+        right = std::min(right, static_cast<f32>(rasterizer.scissor_test.x2) + 1.f);
+    }
+    const u32 width = framebuffer.GetWidth();
+    const u32 columns =
+        right > 0.f ? std::min(static_cast<u32>(std::min(std::ceil(right), 65535.f)), width) : 0;
+    const ColumnDraw draw{
+        .colour = framebuffer.allow_color_write != 0 ? colour : 0,
+        .depth = framebuffer.allow_depth_stencil_write != 0
+                     ? framebuffer.GetDepthBufferPhysicalAddress()
+                     : 0,
+        .size = (width << 16) | framebuffer.GetHeight(),
+        .formats = (static_cast<u32>(framebuffer.color_format.Value()) << 8) |
+                   static_cast<u32>(framebuffer.depth_format.Value()),
+        .right = columns,
+        .frame = frame,
+    };
+    if (draw == last_column_draw) {
+        return;
+    }
+    last_column_draw = draw;
+
+    const u32 pixels = width * framebuffer.GetHeight();
+    if (draw.depth != 0) {
+        NoteWholeWrite({draw.depth, draw.depth + pixels * Pica::FramebufferRegs::BytesPerDepthPixel(
+                                                              framebuffer.depth_format)});
+    }
+    if (draw.colour == 0) {
+        return;
+    }
+    const u32 bytes = Pica::FramebufferRegs::BytesPerColorPixel(framebuffer.color_format);
+    const MemoryRange buffer{colour, colour + pixels * bytes,
+                             MemoryLayout::Make(MemoryLayout::Colour, width, bytes * 8)};
+    ColumnUse* use = nullptr;
+    for (ColumnUse& known : column_uses) {
+        if (known.buffer.start == buffer.start && known.buffer.layout == buffer.layout) {
+            use = &known;
+        }
+    }
+    // The same memory as a surface with other rows: its columns are not those of this one
+    NoteWholeWrite(buffer, use != nullptr ? colour : 0);
+    const u32 stretch = frame / COLUMN_STRETCH;
+    if (use == nullptr) {
+        use = &*std::ranges::min_element(column_uses, {}, &ColumnUse::last_frame);
+        *use = ColumnUse{.buffer = buffer, .stretch = stretch, .whole_frame = frame};
+    }
+    if (use->stretch != stretch) {
+        use->before = use->stretch + 1 == stretch ? use->now : 0;
+        use->now = 0;
+        use->stretch = stretch;
+    }
+    use->buffer.end = std::max(use->buffer.end, buffer.end);
+    use->now = std::max(use->now, columns);
+    use->last_frame = frame;
+}
+
+void FrameLiveness::NoteWholeWrite(const MemoryRange& range, PAddr but) {
+    for (ColumnUse& use : column_uses) {
+        if (use.buffer.Overlaps(range) &&
+            (but == 0 || use.buffer.start != but || use.buffer.layout != range.layout)) {
+            use.whole_frame = frame;
+        }
+    }
+}
+
+bool FrameLiveness::ViewportSpansColumnsInUse(const Pica::RegsInternal& regs) const {
+    // Known for a while: what reached further before that is no part of what goes on now
+    const auto& framebuffer = regs.framebuffer.framebuffer;
+    const auto& rasterizer = regs.rasterizer;
+    const PAddr colour = framebuffer.GetColorBufferPhysicalAddress();
+    const u32 bytes = Pica::FramebufferRegs::BytesPerColorPixel(framebuffer.color_format);
+    const u32 layout = MemoryLayout::Make(MemoryLayout::Colour, framebuffer.GetWidth(), bytes * 8);
+    const auto use = std::ranges::find_if(column_uses, [&](const ColumnUse& known) {
+        return known.buffer.start == colour && known.buffer.layout == layout;
+    });
+    return use != column_uses.end() && use->before != 0 &&
+           frame - use->whole_frame > COLUMN_STRETCH && rasterizer.viewport_corner.x <= 0 &&
+           static_cast<f32>(rasterizer.viewport_corner.x) +
+                   Pica::f24::FromRaw(rasterizer.viewport_size_x).ToFloat32() * 2.f >=
+               static_cast<f32>(std::max(use->now, use->before));
 }
 
 bool FrameLiveness::NoteDepthUse(const Pica::RegsInternal& regs) {
@@ -640,6 +765,8 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
             seen[static_cast<std::size_t>(Kind::Draw)]++;
             if (!draw_memo.carried_out) {
                 left_out[static_cast<std::size_t>(Kind::Draw)]++;
+            } else if (draw_memo.kept_for_later) {
+                kept_for_later[static_cast<std::size_t>(Kind::Draw)]++;
             }
             last_carried_out = draw_memo.carried_out;
             return draw_memo.carried_out;
@@ -835,6 +962,7 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
         }
     }
     step.key = key;
+    const u32 kept_before = kept_for_later[static_cast<std::size_t>(Kind::Draw)];
     const bool carried_out = Submit(step);
     if (compare && (key != memo_before.key || carried_out != memo_before.carried_out)) {
         if (memo_differences++ == 0) {
@@ -849,10 +977,12 @@ bool FrameLiveness::ShouldAllowDraw(const Pica::RegsInternal& regs, bool replace
     draw_memo.events = events;
     draw_memo.key = key;
     draw_memo.carried_out = carried_out;
+    draw_memo.kept_for_later = kept_for_later[static_cast<std::size_t>(Kind::Draw)] != kept_before;
     return carried_out;
 }
 
 bool FrameLiveness::ShouldAllowTransfer(const Pica::DisplayTransferConfig& config) {
+    just_left_out = false;
     if (!active) {
         return true;
     }
@@ -913,6 +1043,7 @@ bool FrameLiveness::ShouldAllowTransfer(const Pica::DisplayTransferConfig& confi
     }
     step.writes[0] = destination;
     NoteWritten(destination);
+    NoteWholeWrite(destination);
     AddRead(step, source);
 
     u64 base = Mix(static_cast<u64>(step.kind), (static_cast<u64>(input) << 32) | output);
@@ -933,6 +1064,7 @@ bool FrameLiveness::ShouldAllowTransfer(const Pica::DisplayTransferConfig& confi
 }
 
 bool FrameLiveness::ShouldAllowFill(const Pica::MemoryFillConfig& config) {
+    just_left_out = false;
     if (!active) {
         return true;
     }
@@ -945,6 +1077,7 @@ bool FrameLiveness::ShouldAllowFill(const Pica::MemoryFillConfig& config) {
         return true;
     }
     NoteWritten(step.writes[0]);
+    NoteWholeWrite(step.writes[0]);
 
     const u64 base = Mix(static_cast<u64>(Kind::Fill),
                          (static_cast<u64>(step.writes[0].start) << 32) | step.writes[0].end);
@@ -957,65 +1090,29 @@ bool FrameLiveness::Submit(Step& step) {
     events++;
     const auto kind = static_cast<std::size_t>(step.kind);
     step.shown = step.shown || IsShown(step.writes[0]);
+    step.is_image = step.shown || IsImage(step.kind, step.writes[0]);
 
     bool leave_out = false;
-    if (distrust == 0 && !step.shown) {
+    if (!step.shown) {
         const auto it = verdicts.find(step.key);
-        leave_out = it != verdicts.end() && it->second.unneeded_streak >= REQUIRED_UNNEEDED;
+        if (it != verdicts.end()) {
+            leave_out = distrust == 0 && it->second.unneeded_streak >= REQUIRED_UNNEEDED;
+            if (it->second.kept_for_later) {
+                kept_for_later[kind]++;
+            }
+        }
     }
 
     seen[kind]++;
     if (leave_out) {
         left_out[kind]++;
+        stale_before = stale;
+        just_left_out = true;
         for (const MemoryRange& write : step.writes) {
             stale.Add(write);
         }
-    } else if (!stale.Empty()) {
-        static constexpr std::array<const char*, static_cast<std::size_t>(Kind::Count)> names{
-            "a draw for display", "a texture copy for display", "a display transfer to a screen",
-            "a memory fill", "the game"};
-        const auto stale_read = std::ranges::find_if(
-            step.reads, [this](const MemoryRange& read) { return stale.Intersects(read); });
-        u32 first_stale = 0;
-        u32 last_stale = 0;
-        const MemoryRange* stale_for_rows = nullptr;
-        if (step.last_row != 0) {
-            // A draw: only the rows made from stale memory come out stale
-            if (!StaleRows(step, first_stale, last_stale, stale_for_rows)) {
-                if (step.renews) {
-                    stale.Remove(step.writes[0]);
-                }
-                if (step.replaces_depth) {
-                    stale.Remove(step.writes[1]);
-                }
-            } else if (step.shown) {
-                Mispredicted(names[kind], *stale_for_rows);
-            } else {
-                if (step.renews) {
-                    stale.Remove(step.writes[0]);
-                }
-                if (step.replaces_depth) {
-                    stale.Remove(step.writes[1]);
-                }
-                for (u32 buffer = 0; buffer < 2; buffer++) {
-                    if (!step.writes[buffer].Empty()) {
-                        stale.Add(RowsOf(step, buffer, first_stale, last_stale));
-                    }
-                }
-            }
-        } else if (stale_read == step.reads.end()) {
-            if (step.renews) {
-                stale.Remove(step.writes[0]);
-            }
-        } else if (step.shown) {
-            Mispredicted(names[kind], *stale_read);
-        } else {
-            // What is made from stale memory is stale as well. New work for an image nobody
-            // sees does this until it is found not to be needed either.
-            for (const MemoryRange& write : step.writes) {
-                stale.Add(write);
-            }
-        }
+    } else {
+        CarryOut(step);
     }
     last_carried_out = !leave_out;
 
@@ -1029,6 +1126,56 @@ bool FrameLiveness::Submit(Step& step) {
         too_many_steps = true;
     }
     return !leave_out;
+}
+
+void FrameLiveness::CarryOut(const Step& step) {
+    if (stale.Empty()) {
+        return;
+    }
+    static constexpr std::array<const char*, static_cast<std::size_t>(Kind::Count)> names{
+        "a draw for display", "a texture copy for display", "a display transfer to a screen",
+        "a memory fill", "the game"};
+    const auto kind = static_cast<std::size_t>(step.kind);
+    const auto renew = [this, &step] {
+        if (step.renews) {
+            stale.Remove(step.writes[0]);
+        }
+        if (step.last_row != 0 && step.replaces_depth) {
+            stale.Remove(step.writes[1]);
+        }
+    };
+    if (step.last_row != 0) {
+        // A draw: only the rows made from stale memory come out stale
+        u32 first_stale = 0;
+        u32 last_stale = 0;
+        const MemoryRange* stale_for_rows = nullptr;
+        if (!StaleRows(step, first_stale, last_stale, stale_for_rows)) {
+            renew();
+        } else if (step.shown) {
+            Mispredicted(names[kind], *stale_for_rows);
+        } else {
+            renew();
+            for (u32 buffer = 0; buffer < 2; buffer++) {
+                if (!step.writes[buffer].Empty()) {
+                    stale.Add(RowsOf(step, buffer, first_stale, last_stale));
+                }
+            }
+        }
+        return;
+    }
+    const auto stale_read = std::ranges::find_if(
+        step.reads, [this](const MemoryRange& read) { return stale.Intersects(read); });
+    if (stale_read == step.reads.end()) {
+        renew();
+    } else if (step.shown) {
+        Mispredicted(names[kind], *stale_read);
+    } else {
+        // What is made from stale memory is stale as well. New work for an image nobody
+        // sees does this until it is found not to be needed either.
+        for (const MemoryRange& write : step.writes) {
+            stale.Add(write);
+        }
+    }
 }
 
 void FrameLiveness::NoteGuestRead(PAddr start, u32 size) {
@@ -1065,6 +1212,7 @@ void FrameLiveness::GuestRead(const MemoryRange& range) {
     step.key = Mix(static_cast<u64>(Kind::GuestRead), 0);
     step.reads.push_back(range);
     step.shown = true;
+    step.is_image = true;
     events++;
     seen[static_cast<std::size_t>(Kind::GuestRead)]++;
     if (current.size() < MAX_STEPS) {
@@ -1101,16 +1249,30 @@ void FrameLiveness::NoteDisplay() {
             Mispredicted("the display", place);
         }
         // Games swap between a few framebuffers: what goes into any of them is for display
-        const auto known = std::ranges::find_if(
-            shown_places, [&place](const ShownPlace& other) { return other.range == place; });
-        if (known != shown_places.end()) {
-            known->last_frame = frame;
-        } else if (shown_places.size() < MAX_SHOWN_PLACES) {
-            shown_places.push_back(ShownPlace{place, frame});
-        } else {
-            *std::ranges::min_element(shown_places, {}, &ShownPlace::last_frame) =
-                ShownPlace{place, frame};
+        NotePlace(shown_places, place);
+        if (screen == 0) {
+            // The image of the other eye goes elsewhere, if the game has one
+            const PAddr other =
+                framebuffer.active_fb == 0
+                    ? (right ? framebuffer.address_left1 : framebuffer.address_right1)
+                    : (right ? framebuffer.address_left2 : framebuffer.address_right2);
+            if (other != 0 && other != address) {
+                NotePlace(unseen_places,
+                          MemoryRange{other, other + framebuffer.stride * framebuffer.height});
+            }
         }
+    }
+}
+
+void FrameLiveness::NotePlace(Places& places, const MemoryRange& place) const {
+    const auto known = std::ranges::find_if(
+        places, [&place](const ShownPlace& other) { return other.range == place; });
+    if (known != places.end()) {
+        known->last_frame = frame;
+    } else if (places.size() < MAX_SHOWN_PLACES) {
+        places.push_back(ShownPlace{place, frame});
+    } else {
+        *std::ranges::min_element(places, {}, &ShownPlace::last_frame) = ShownPlace{place, frame};
     }
 }
 
@@ -1136,6 +1298,150 @@ void FrameLiveness::Mispredicted(const char* reader, const MemoryRange& range) {
     events++;
     for (auto& [key, verdict] : verdicts) {
         verdict.unneeded_streak = 0;
+    }
+}
+
+bool FrameLiveness::GoBack(bool images, std::vector<bool>& found) const {
+    // A step goes into what is asked for if it is that itself, or if it writes what a step
+    // after it that does so reads. What is read after the last step is what turned out to be
+    // read before the first, as the frames after these look like these.
+    const std::size_t total = previous.size() + current.size();
+    found.assign(total, false);
+    MemoryRanges live;
+    for (int round = 0; round < MAX_ROUNDS; round++) {
+        const MemoryRanges at_end = live;
+        for (std::size_t index = total; index-- > 0;) {
+            const Step& step = StepAt(index);
+            if (step.last_row != 0) {
+                // A draw: what it reads depends on which of its rows are needed
+                u32 first = 0;
+                u32 last = 0;
+                found[index] = NeededRows(step, live, first, last);
+                if (!found[index]) {
+                    continue;
+                }
+                if (step.replaces) {
+                    live.Remove(step.writes[0]);
+                }
+                if (step.replaces_depth) {
+                    live.Remove(step.writes[1]);
+                }
+                AddReadsFor(step, first, last, live);
+                continue;
+            }
+            found[index] = (images ? step.is_image : step.shown) ||
+                           live.Intersects(step.writes[0]) || live.Intersects(step.writes[1]);
+            if (!found[index]) {
+                continue;
+            }
+            if (step.replaces) {
+                live.Remove(step.writes[0]);
+            }
+            for (const MemoryRange& read : step.reads) {
+                live.Add(read);
+            }
+        }
+        if (live == at_end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FrameLiveness::IsFilledAgain(std::size_t index) const {
+    const MemoryRange& filled = StepAt(index).writes[0];
+    const std::size_t total = previous.size() + current.size();
+    // What follows the last step is what the frame began with
+    for (std::size_t after = 1; after <= current.size(); after++) {
+        const std::size_t next = index + after;
+        const Step& step = StepAt(next < total ? next : next - current.size());
+        if (step.kind != Kind::Fill) {
+            return false;
+        }
+        if (step.writes[0].start <= filled.start && step.writes[0].end >= filled.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FrameLiveness::IsCopy(const Step& step) {
+    if (step.kind != Kind::Draw) {
+        return step.kind == Kind::Copy || step.kind == Kind::Transfer;
+    }
+    const u32 row_pixels = step.buffer_layout[0] & 0xFFFF;
+    return !step.writes[0].Empty() &&
+           (step.last_row - step.first_row) * row_pixels >= SCREEN_PIXELS &&
+           std::ranges::any_of(step.links,
+                               [](const Link& link) { return link.how != Link::How::Rows; });
+}
+
+void FrameLiveness::KeepForLater() {
+    // What is made from an image nobody sees goes with it, though it goes into no image itself:
+    // with the image left out there is nothing to make it from. Twice through the frames, for
+    // what is made from the image of the frame before.
+    const std::size_t total = needed.size();
+    for_later.assign(total, false);
+    MemoryRanges unseen;
+    for (int round = 0; round < 2; round++) {
+        for (std::size_t index = 0; index < total; index++) {
+            const Step& step = StepAt(index);
+            if (!needed[index] &&
+                (in_image[index] ||
+                 std::ranges::any_of(step.reads, [&unseen](const MemoryRange& read) {
+                     return unseen.Intersects(read);
+                 }))) {
+                for_later[index] = false;
+                for (const MemoryRange& write : step.writes) {
+                    unseen.Add(write);
+                }
+                continue;
+            }
+            for_later[index] = !needed[index];
+            if (step.renews) {
+                unseen.Remove(step.writes[0]);
+            }
+            if (step.replaces_depth) {
+                unseen.Remove(step.writes[1]);
+            }
+        }
+    }
+    // A copy stays only if what stays of the rest reads what it makes
+    MemoryRanges read_later;
+    for (std::size_t index = 0; index < total; index++) {
+        const Step& step = StepAt(index);
+        if (!for_later[index] || IsCopy(step)) {
+            continue;
+        }
+        if (step.kind == Kind::Fill && IsFilledAgain(index)) {
+            for_later[index] = false;
+            continue;
+        }
+        for (const MemoryRange& read : step.reads) {
+            read_later.Add(read);
+        }
+    }
+    for (bool again = true; again;) {
+        again = false;
+        for (std::size_t index = 0; index < total; index++) {
+            const Step& step = StepAt(index);
+            if (!for_later[index] || needed[index] || !IsCopy(step) ||
+                !read_later.Intersects(step.writes[0])) {
+                continue;
+            }
+            needed[index] = true;
+            again = true;
+            for (const MemoryRange& read : step.reads) {
+                read_later.Add(read);
+            }
+        }
+    }
+    for (std::size_t index = 0; index < total; index++) {
+        if (for_later[index] && IsCopy(StepAt(index))) {
+            for_later[index] = needed[index];
+        } else if (for_later[index]) {
+            needed[index] = true;
+        }
     }
 }
 
@@ -1165,10 +1471,11 @@ void FrameLiveness::LookAtLastFrames() {
         looks_repeated++;
         looks_in_a_row = 0;
         needed = kept.needed;
-        for (const auto& [key, was_needed] : kept.outcome) {
-            Verdict& verdict = verdicts[key];
+        for (const KeptLook::Outcome& outcome : kept.outcome) {
+            Verdict& verdict = verdicts[outcome.key];
             verdict.last_frame = frame;
-            if (was_needed) {
+            verdict.kept_for_later = outcome.kept_for_later;
+            if (outcome.needed) {
                 verdict.unneeded_streak = 0;
             } else if (verdict.unneeded_streak < std::numeric_limits<u16>::max()) {
                 verdict.unneeded_streak++;
@@ -1185,75 +1492,34 @@ void FrameLiveness::LookAtLastFrames() {
         NoteDifference();
     }
 #endif
-    const auto step_at = [this](std::size_t index) -> const Step& {
-        return index < previous.size() ? previous[index] : current[index - previous.size()];
-    };
-
-    // Backwards from the end: a step is needed if it is for display or the game, or if it
-    // writes what a needed step after it reads. What is needed after the last step is what
-    // turned out to be needed before the first, as the frames after these look like these.
-    needed.assign(total, false);
-    MemoryRanges live;
-    bool settled = false;
-    for (int round = 0; round < MAX_ROUNDS && !settled; round++) {
-        const MemoryRanges at_end = live;
-        for (std::size_t index = total; index-- > 0;) {
-            const Step& step = step_at(index);
-            if (step.last_row != 0) {
-                // A draw: what it reads depends on which of its rows are needed
-                u32 first = 0;
-                u32 last = 0;
-                needed[index] = NeededRows(step, live, first, last);
-                if (!needed[index]) {
-                    continue;
-                }
-                if (step.replaces) {
-                    live.Remove(step.writes[0]);
-                }
-                if (step.replaces_depth) {
-                    live.Remove(step.writes[1]);
-                }
-                AddReadsFor(step, first, last, live);
-                continue;
-            }
-            const bool is_needed =
-                step.shown || live.Intersects(step.writes[0]) || live.Intersects(step.writes[1]);
-            needed[index] = is_needed;
-            if (!is_needed) {
-                continue;
-            }
-            if (step.replaces) {
-                live.Remove(step.writes[0]);
-            }
-            for (const MemoryRange& read : step.reads) {
-                live.Add(read);
-            }
-        }
-        settled = live == at_end;
-    }
-    if (!settled) {
+    // A step is needed if it goes into what is on display or read by the game
+    if (!GoBack(false, needed) || !GoBack(true, in_image)) {
         start_over();
         return;
     }
+    KeepForLater();
 
     // A kind of work is not needed if none of its steps was
     look++;
     for (std::size_t index = 0; index < total; index++) {
-        Verdict& verdict = verdicts[step_at(index).key];
+        Verdict& verdict = verdicts[StepAt(index).key];
         if (verdict.look != look) {
             verdict.look = look;
             verdict.needed_in_look = false;
+            verdict.kept_in_look = false;
             verdict.updated_in_look = false;
         }
         verdict.needed_in_look |= needed[index];
+        verdict.kept_in_look |= for_later[index];
     }
     for (std::size_t index = 0; index < total; index++) {
-        Verdict& verdict = verdicts[step_at(index).key];
+        Verdict& verdict = verdicts[StepAt(index).key];
         if (verdict.updated_in_look) {
             continue;
         }
         verdict.updated_in_look = true;
         verdict.last_frame = frame;
+        verdict.kept_for_later = verdict.kept_in_look;
         if (verdict.needed_in_look) {
             verdict.unneeded_streak = 0;
         } else if (verdict.unneeded_streak < std::numeric_limits<u16>::max()) {
@@ -1273,11 +1539,11 @@ void FrameLiveness::LookAtLastFrames() {
     // (Each kind of work once: the look number marks the ones entered)
     look++;
     for (std::size_t index = 0; index < total; index++) {
-        const u64 key = step_at(index).key;
+        const u64 key = StepAt(index).key;
         Verdict& verdict = verdicts[key];
         if (verdict.look != look) {
             verdict.look = look;
-            kept.outcome.emplace_back(key, verdict.needed_in_look);
+            kept.outcome.push_back({key, verdict.needed_in_look, verdict.kept_in_look});
         }
     }
     kept.valid = true;
@@ -1388,7 +1654,10 @@ void FrameLiveness::EndFrame() {
     constexpr auto index = [](Kind kind) { return static_cast<std::size_t>(kind); };
     const u32 total_left_out = left_out[index(Kind::Draw)] + left_out[index(Kind::Copy)] +
                                left_out[index(Kind::Transfer)] + left_out[index(Kind::Fill)];
-    if ((total_left_out != 0) != leaving_out) {
+    if ((total_left_out != 0) == leaving_out) {
+        leaving_out_changing -= std::min(leaving_out_changing, 1u);
+    } else if (++leaving_out_changing >= CHANGE_HELD_FOR) {
+        leaving_out_changing = 0;
         leaving_out = total_left_out != 0;
         if (leaving_out) {
             LOG_INFO(HW_GPU,
@@ -1407,16 +1676,18 @@ void FrameLiveness::EndFrame() {
         frames_since_status = 0;
         LOG_INFO(HW_GPU,
                  "Unseen work: left out {} of {} draws, {} of {} copies, {} of {} transfers, "
-                 "{} of {} fills; {} reads by the game, {} kinds of work known, {} stale "
+                 "{} of {} fills; not left out though nothing reads it: {} draws, {} copies, {} "
+                 "fills; {} reads by the game, {} kinds of work known, {} stale "
                  "places, {} frames of distrust left, {} wrong guesses; in the last 300 frames "
                  "{} of {} draws were the draw before again ({} compared, {} of them another "
                  "one after all), {} of {} looks at the last frames were the look before again",
                  left_out[index(Kind::Draw)], seen[index(Kind::Draw)], left_out[index(Kind::Copy)],
                  seen[index(Kind::Copy)], left_out[index(Kind::Transfer)],
                  seen[index(Kind::Transfer)], left_out[index(Kind::Fill)], seen[index(Kind::Fill)],
-                 seen[index(Kind::GuestRead)], verdicts.size(), stale.Size(), distrust,
-                 wrong_guesses, draws_repeated, draws_asked, memo_checks / 64, memo_differences,
-                 looks_repeated, looks_repeated + looks_made);
+                 kept_for_later[index(Kind::Draw)], kept_for_later[index(Kind::Copy)],
+                 kept_for_later[index(Kind::Fill)], seen[index(Kind::GuestRead)], verdicts.size(),
+                 stale.Size(), distrust, wrong_guesses, draws_repeated, draws_asked,
+                 memo_checks / 64, memo_differences, looks_repeated, looks_repeated + looks_made);
         static constexpr std::array<const char*, static_cast<std::size_t>(Kind::Count) + 1> kinds{
             "a draw", "a copy", "a transfer", "a fill", "a read by the game", "no step"};
         LOG_INFO(HW_GPU,
@@ -1458,11 +1729,13 @@ void FrameLiveness::EndFrame() {
         std::erase_if(verdicts, [this](const auto& entry) {
             return frame - entry.second.last_frame > FORGET_AFTER;
         });
-        shown_places.erase(std::remove_if(shown_places.begin(), shown_places.end(),
-                                          [this](const ShownPlace& place) {
-                                              return frame - place.last_frame > FORGET_AFTER;
-                                          }),
-                           shown_places.end());
+        for (Places* places : {&shown_places, &unseen_places}) {
+            places->erase(std::remove_if(places->begin(), places->end(),
+                                         [this](const ShownPlace& place) {
+                                             return frame - place.last_frame > FORGET_AFTER;
+                                         }),
+                          places->end());
+        }
     }
 
     previous_hash = HashOf(current);
@@ -1487,6 +1760,7 @@ void FrameLiveness::EndFrame() {
     stretch_began_in_frame = false;
     seen.fill(0);
     left_out.fill(0);
+    kept_for_later.fill(0);
 }
 
 } // namespace VideoCore

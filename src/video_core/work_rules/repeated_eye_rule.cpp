@@ -40,34 +40,8 @@ void RepeatedEyeRule::EndPass(const char* why) {
 }
 
 std::string RepeatedEyeRule::DifferingRegister(DrawFacts& facts) const {
-    std::string text{"registers or the vertex shader differ"};
-    if (at >= first_registers.size()) {
-        return text;
-    }
-    const std::vector<u32>& kept = first_registers[at];
-    const Pica::RegsInternal& regs = facts.Regs();
-    std::size_t place = 0;
-    u32 found = 0;
-    bool same_stretches = true;
-    facts.ForStateRegisters(false, [&](u32 from, u32 to) {
-        for (u32 id = from; id < to; id++, place++) {
-            if (place >= kept.size()) {
-                same_stretches = false;
-                return;
-            }
-            if (kept[place] != regs.reg_array[id] && found < 4) {
-                text += fmt::format("{} register {:03X} was {:08X} and is {:08X}",
-                                    found == 0 ? ":" : ",", id, kept[place], regs.reg_array[id]);
-                found++;
-            }
-        }
-    });
-    if (!same_stretches || place != kept.size()) {
-        text += ": not the same registers are gone by (a texture unit or the lights on or off)";
-    } else if (found == 0) {
-        text += ": no register, so the vertex shader's program or its operand table";
-    }
-    return text;
+    return at < first_registers.size() ? DifferingRegisters(facts, first_registers[at])
+                                       : std::string{"registers or the vertex shader differ"};
 }
 
 bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
@@ -191,10 +165,7 @@ bool RepeatedEyeRule::LeavesOut(DrawFacts& facts) {
         first.emplace_back(facts, false);
         if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) !=
             0) {
-            std::vector<u32>& kept = first_registers.emplace_back();
-            facts.ForStateRegisters(false, [&](u32 from, u32 to) {
-                kept.insert(kept.end(), &regs.reg_array[from], &regs.reg_array[to]);
-            });
+            KeepStateRegisters(facts, first_registers.emplace_back());
         }
         if (with_output) {
             first.back().has_output = facts.OutputHash(first.back().output);
@@ -267,16 +238,9 @@ Vote RepeatedEyeRule::OnTransfer(const TransferFacts& facts) {
     // The image is taken out of the target. The two runs that are the same image are those
     // of the two eyes: the first goes to a buffer the top screen shows to the left eye, the
     // second to one it shows to the right eye.
-    // (A buffer an eye is shown need not begin where the transfer writes: New Super Mario
-    // Bros. 2 has the screen read from sixteen rows into what its transfers fill)
     const PAddr dest = facts.dest;
-    const auto holds_one_of = [&](const std::array<PAddr, 8>& shown) {
-        return std::ranges::any_of(shown, [&](PAddr address) {
-            return address != 0 && address >= facts.dest && address < facts.dest_end;
-        });
-    };
-    const bool left_eyes = dest != 0 && holds_one_of(left_shown);
-    const bool right_eyes = dest != 0 && !left_eyes && holds_one_of(right_shown);
+    const bool left_eyes = eyes.IsLeft(dest, facts.dest_end);
+    const bool right_eyes = eyes.IsRight(dest, facts.dest_end);
     if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) != 0 &&
         explained_eyes < 8 && !left_eyes && !right_eyes) {
         explained_eyes++;
@@ -292,8 +256,8 @@ Vote RepeatedEyeRule::OnTransfer(const TransferFacts& facts) {
         LOG_INFO(HW_GPU,
                  "The image of a run of {} draws at {:08X} is taken to {:08X}-{:08X}, which is "
                  "no buffer of either eye as the rule knows them: left{}; right{}",
-                 first.size(), target, facts.dest, facts.dest_end, list(left_shown),
-                 list(right_shown));
+                 first.size(), target, facts.dest, facts.dest_end, list(eyes.left),
+                 list(eyes.right));
     }
     switch (phase) {
     case Phase::First:
@@ -365,20 +329,7 @@ void RepeatedEyeRule::OnFrameEnd(const FrameFacts& facts) {
     frame_number++;
     // Runs are not paired across frames
     phase = Phase::Idle;
-
-    // Which buffers each eye is shown
-    const auto remember = [](std::array<PAddr, 8>& shown, u32& next, PAddr buffer) {
-        if (buffer != 0 && std::ranges::find(shown, buffer) == shown.end()) {
-            shown[next++ % shown.size()] = buffer;
-        }
-    };
-    remember(left_shown, left_next, facts.top_screen.address_left1);
-    remember(left_shown, left_next, facts.top_screen.address_left2);
-    for (const PAddr right : {facts.top_screen.address_right1, facts.top_screen.address_right2}) {
-        if (std::ranges::find(left_shown, right) == left_shown.end()) {
-            remember(right_shown, right_next, right);
-        }
-    }
+    eyes.Remember(facts.top_screen);
 }
 
 } // namespace VideoCore

@@ -9,6 +9,10 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <vector>
+#include <fmt/format.h>
+#include "video_core/pica/regs_internal.h"
 #include "video_core/work_rules.h"
 
 namespace VideoCore {
@@ -25,8 +29,13 @@ struct DrawRecord {
     u64 output{};
 
     DrawRecord() = default;
-    DrawRecord(DrawFacts& facts, bool as_clear)
-        : state{facts.StateHash(as_clear)}, clear{as_clear} {
+    DrawRecord(DrawFacts& facts, bool as_clear) {
+        Set(facts, as_clear);
+    }
+    void Set(DrawFacts& facts, bool as_clear) {
+        state = facts.StateHash(as_clear);
+        clear = as_clear;
+        has_output = false;
         if (!as_clear) {
             std::memcpy(uniforms.data(), facts.Uniforms().data(), sizeof(uniforms));
         }
@@ -103,6 +112,41 @@ inline UniformDifference CompareUniforms(const DrawRecord& record, DrawFacts& fa
         }
     }
     return difference;
+}
+
+/// For the log: the registers a draw goes by, and which of them another draw has differently
+inline void KeepStateRegisters(DrawFacts& facts, std::vector<u32>& kept) {
+    kept.clear();
+    facts.ForStateRegisters(false, [&](u32 from, u32 to) {
+        kept.insert(kept.end(), &facts.Regs().reg_array[from], &facts.Regs().reg_array[to]);
+    });
+}
+
+inline std::string DifferingRegisters(DrawFacts& facts, const std::vector<u32>& kept) {
+    std::string text{"registers or the vertex shader differ"};
+    const Pica::RegsInternal& regs = facts.Regs();
+    std::size_t place = 0;
+    u32 found = 0;
+    bool same_stretches = true;
+    facts.ForStateRegisters(false, [&](u32 from, u32 to) {
+        for (u32 id = from; id < to; id++, place++) {
+            if (place >= kept.size()) {
+                same_stretches = false;
+                return;
+            }
+            if (kept[place] != regs.reg_array[id] && found < 4) {
+                text += fmt::format("{} register {:03X} was {:08X} and is {:08X}",
+                                    found == 0 ? ":" : ",", id, kept[place], regs.reg_array[id]);
+                found++;
+            }
+        }
+    });
+    if (!same_stretches || place != kept.size()) {
+        text += ": not the same registers are gone by (a texture unit or the lights on or off)";
+    } else if (found == 0) {
+        text += ": no register, so the vertex shader's program or its operand table";
+    }
+    return text;
 }
 
 } // namespace VideoCore
