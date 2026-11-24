@@ -365,6 +365,17 @@ public:
     /// The marks of pages are changed by one thread at a time: the decoder's cache, and the
     /// emulation thread arming pages and mapping memory
     std::mutex mark_mutex;
+
+    /// Whether a page that was found to be plain and without a pointer, which none is, is so all
+    /// the same. The marks of a page are changed by the thread that decodes GPU commands, the
+    /// type and the pointer one after the other, and another thread may come to see the second
+    /// change before the first. They are to be believed while nobody changes them.
+    bool IsPlainWithoutPointer(PageTable& page_table, VAddr vaddr) {
+        std::scoped_lock lock{mark_mutex};
+        const std::size_t page = vaddr >> CITRA_PAGE_BITS;
+        return page_table.pointers[page] == nullptr &&
+               page_table.attributes[page] == PageType::Memory;
+    }
     std::atomic<bool> track_references{false};
     std::mutex reference_mutex;
     /// Pages noted since the last arming, by their place in surface_cells (under the mutex):
@@ -1473,10 +1484,7 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
         }
     }
     case PageType::Memory:
-        // The marks of a page are changed by the thread that decodes GPU commands: between
-        // the look at the pointer and the look at the type this one became plain again
-        if (page_table->pointers[vaddr >> CITRA_PAGE_BITS] != nullptr ||
-            page_table->attributes[vaddr >> CITRA_PAGE_BITS] != PageType::Memory) {
+        if (!impl->IsPlainWithoutPointer(*page_table, vaddr)) {
             return Read<T>(page_table, vaddr);
         }
         ASSERT_MSG(false, "Mapped memory page without a pointer @ {:08X}", vaddr);
@@ -1573,10 +1581,7 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
         (void)UnmappedAccess<T>(vaddr, data, false);
         return;
     case PageType::Memory:
-        // The marks of a page are changed by the thread that decodes GPU commands: between
-        // the look at the pointer and the look at the type this one became plain again
-        if (page_table->pointers[vaddr >> CITRA_PAGE_BITS] != nullptr ||
-            page_table->attributes[vaddr >> CITRA_PAGE_BITS] != PageType::Memory) {
+        if (!impl->IsPlainWithoutPointer(*page_table, vaddr)) {
             Write<T>(page_table, vaddr, data);
             return;
         }
@@ -1635,10 +1640,7 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
         (void)UnmappedAccess<T>(vaddr, data, false);
         return true;
     case PageType::Memory:
-        // The marks of a page are changed by the thread that decodes GPU commands: between
-        // the look at the pointer and the look at the type this one became plain again
-        if (impl->current_page_table->pointers[vaddr >> CITRA_PAGE_BITS] != nullptr ||
-            impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] != PageType::Memory) {
+        if (!impl->IsPlainWithoutPointer(*impl->current_page_table, vaddr)) {
             return WriteExclusive<T>(vaddr, data, expected);
         }
         ASSERT_MSG(false, "Mapped memory page without a pointer @ {:08X}", vaddr);
