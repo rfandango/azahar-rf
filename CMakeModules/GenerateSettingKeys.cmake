@@ -286,6 +286,7 @@ if (ANDROID)
         "performance_overlay_position"
         "enable_secondary_display"
         "combo_button_buttons"
+        "swap_left_stick_dpad"
         "button_a"
         "button_b"
         "button_x"
@@ -319,6 +320,7 @@ if (ANDROID)
         "hotkey_quickload"
         "hotkey_enable"
         "hotkey_combo_button"
+        "hotkey_swap_left_stick_dpad"
     )
         string(REPLACE "_" "_1" KEY_JNI_ESCAPED ${KEY})
         set(SETTING_KEY_LIST "${SETTING_KEY_LIST}\n\"${KEY}\",")

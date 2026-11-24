@@ -138,6 +138,11 @@ enum class BooleanSetting(
         CitraSettings.SECTION_CONTROLS,
         false
     ),
+    SWAP_LEFT_STICK_DPAD(
+        SettingKeys.swap_left_stick_dpad(),
+        CitraSettings.SECTION_CONTROLS,
+        false
+    ),
     UPRIGHT_SCREEN(SettingKeys.upright_screen(), CitraSettings.SECTION_LAYOUT, false),
     COMPRESS_INSTALLED_CIA_CONTENT(
         SettingKeys.compress_cia_installs(),

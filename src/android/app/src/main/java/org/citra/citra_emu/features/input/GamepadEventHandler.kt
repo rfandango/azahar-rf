@@ -12,6 +12,9 @@ import kotlin.math.abs
 import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.R
 import org.citra.citra_emu.display.ScreenAdjustmentUtil
+import org.citra.citra_emu.features.settings.model.BooleanSetting
+import org.citra.citra_emu.features.settings.model.CitraSettings
+import org.citra.citra_emu.features.settings.utils.SettingsFile
 import org.citra.citra_emu.utils.ComboHelper
 import org.citra.citra_emu.utils.EmulationLifecycleUtil
 import org.citra.citra_emu.utils.Log
@@ -34,10 +37,13 @@ class GamepadEventHandler(
     /** Buttons that are currently being pressed by axes. This stores the (inAxis, inDir) pair. */
     private val heldAxisButtons = HashSet<Pair<Int, Int>>()
 
+    private val stickDpadSwap = StickDpadSwap()
+
     /** Handles the press of an input key */
     fun handleKeyPress(event: KeyEvent): Boolean {
         val key = if (event.keyCode == 0) event.scanCode else event.keyCode
         val descriptor = event.device.descriptor
+        updateStickDpadSwap(descriptor)
         val axes = InputMappingManager.getOutAxesForKey(key)
         val buttons = InputMappingManager.getOutButtonsForKey(key)
         var handled = handleOutButtonsPress(buttons, descriptor)
@@ -60,16 +66,16 @@ class GamepadEventHandler(
 
         for (button in buttons) {
             Log.debug("Button pressed: " + button)
-            currentlyPressedButtons.add(button)
+            val firstPress = currentlyPressedButtons.add(button)
             if (button == Hotkey.ENABLE.button) {
                 handled = true
             } else if (hotkeyButtons.contains(button)) {
                 if (hotkeyIsEnabled) {
-                    handled = handleHotkey(button) || handled
+                    handled = handleHotkey(button, firstPress) || handled
                 }
             } else {
                 if (!thisKeyIsHotkey || !hotkeyIsEnabled) {
-                    handled = NativeLibrary.onGamePadEvent(
+                    handled = stickDpadSwap.onButton(
                         descriptor,
                         button,
                         NativeLibrary.ButtonState.PRESSED
@@ -84,6 +90,7 @@ class GamepadEventHandler(
     fun handleKeyRelease(event: KeyEvent): Boolean {
         val key = if (event.keyCode == 0) event.scanCode else event.keyCode
         val descriptor = event.device.descriptor
+        updateStickDpadSwap(descriptor)
         val buttons = InputMappingManager.getOutButtonsForKey(key)
         val axes = InputMappingManager.getOutAxesForKey(key)
         var handled = handleOutButtonsRelease(buttons, descriptor)
@@ -127,7 +134,7 @@ class GamepadEventHandler(
                         button
                     )
                 ) {
-                    handled = NativeLibrary.onGamePadEvent(
+                    handled = stickDpadSwap.onButton(
                         descriptor,
                         button,
                         NativeLibrary.ButtonState.RELEASED
@@ -147,7 +154,8 @@ class GamepadEventHandler(
         return true
     }
 
-    fun handleHotkey(bindedButton: Int): Boolean {
+    /** [firstPress] is false for the presses that follow while a button is held down */
+    fun handleHotkey(bindedButton: Int, firstPress: Boolean = true): Boolean {
         Log.debug("Handling hotkey button press: " + bindedButton)
         when (bindedButton) {
             Hotkey.SWAP_SCREEN.button -> screenAdjustmentUtil.swapScreen()
@@ -189,10 +197,34 @@ class GamepadEventHandler(
                 ComboHelper.comboActivate(NativeLibrary.ButtonState.PRESSED)
             }
 
+            Hotkey.SWAP_LEFT_STICK_DPAD.button -> if (firstPress) toggleStickDpadSwap()
+
             else -> {}
         }
         hotkeyIsPressed = true
         return true
+    }
+
+    private fun toggleStickDpadSwap() {
+        val setting = BooleanSetting.SWAP_LEFT_STICK_DPAD
+        val swapped = !CitraSettings.activeSettings.get(setting)
+        CitraSettings.activeSettings.setByCurrentState(setting, swapped)
+        updateStickDpadSwap("")
+        SettingsFile.saveSetting(setting, CitraSettings.activeSettings)
+        val message = if (swapped) {
+            R.string.left_stick_dpad_swapped_toast
+        } else {
+            R.string.left_stick_dpad_normal_toast
+        }
+        Toast.makeText(context, context.getString(message), Toast.LENGTH_SHORT).show()
+    }
+
+    /** Takes over what the setting is now, which can also be changed in the settings */
+    private fun updateStickDpadSwap(descriptor: String) {
+        stickDpadSwap.setSwapped(
+            descriptor,
+            CitraSettings.activeSettings.get(BooleanSetting.SWAP_LEFT_STICK_DPAD)
+        )
     }
 
     /** takes a list of OUTPUT axes (outaxis, outdir) that are associated with an input key and tracks them */
@@ -251,7 +283,7 @@ class GamepadEventHandler(
         var handled = false
         stickAccumulator.forEach { (joystickType, value) ->
             handled =
-                NativeLibrary.onGamePadMoveEvent(
+                stickDpadSwap.onStick(
                     descriptor,
                     joystickType,
                     value.first,
@@ -269,6 +301,7 @@ class GamepadEventHandler(
         }
         val device = event.device ?: return false
         val descriptor = device.descriptor
+        updateStickDpadSwap(descriptor)
         val stickAccumulator = HashMap<Int, Pair<Float, Float>>()
 
         for (range in device.motionRanges) {
@@ -305,7 +338,7 @@ class GamepadEventHandler(
             }
         }
         stickAccumulator.forEach { (outAxis, value) ->
-            NativeLibrary.onGamePadMoveEvent(
+            stickDpadSwap.onStick(
                 device.descriptor,
                 outAxis,
                 value.first,
@@ -328,5 +361,6 @@ class GamepadEventHandler(
             sendAxisState("", heldKeyAxes.toList())
         }
         heldKeyAxes.clear()
+        stickDpadSwap.reset()
     }
 }

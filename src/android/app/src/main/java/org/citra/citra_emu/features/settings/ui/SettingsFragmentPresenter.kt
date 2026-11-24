@@ -881,6 +881,17 @@ class SettingsFragmentPresenter(
             add(
                 SwitchSetting(
                     editingSettings,
+                    BooleanSetting.SWAP_LEFT_STICK_DPAD,
+                    R.string.swap_left_stick_dpad,
+                    R.string.swap_left_stick_dpad_description,
+                    BooleanSetting.SWAP_LEFT_STICK_DPAD.key,
+                    BooleanSetting.SWAP_LEFT_STICK_DPAD.defaultValue
+                )
+            )
+
+            add(
+                SwitchSetting(
+                    editingSettings,
                     BooleanSetting.USE_ARTIC_BASE_CONTROLLER,
                     R.string.use_artic_base_controller,
                     R.string.use_artic_base_controller_description,

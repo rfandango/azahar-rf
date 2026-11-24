@@ -377,7 +377,8 @@ object GamepadHelper {
         InputMappingSetting.HOTKEY_QUICKLOAD,
         InputMappingSetting.HOTKEY_TURBO_TOGGLE,
         InputMappingSetting.HOTKEY_TURBO_HOLD,
-        InputMappingSetting.HOTKEY_COMBO_BUTTON
+        InputMappingSetting.HOTKEY_COMBO_BUTTON,
+        InputMappingSetting.HOTKEY_SWAP_LEFT_STICK_DPAD
     )
     val hotkeyTitles = listOf(
         R.string.controller_hotkey_enable_button,
@@ -389,7 +390,8 @@ object GamepadHelper {
         R.string.emulation_quickload,
         R.string.turbo_toggle_hotkey,
         R.string.turbo_hold_hotkey,
-        R.string.button_combo
+        R.string.button_combo,
+        R.string.swap_left_stick_dpad
     )
 
     // These keys are no longer used in active code with new installs. Preserved here solely

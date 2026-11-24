@@ -184,6 +184,10 @@
     <string name="turbo_hold_hotkey">Turbo (Hold)</string>
     <string name="turbo_enabled_toast">Turbo Speed Enabled</string>
     <string name="turbo_disabled_toast">Turbo Speed Disabled</string>
+    <string name="swap_left_stick_dpad">Swap Left Stick and D-Pad</string>
+    <string name="swap_left_stick_dpad_description">The D-pad of the controller moves the Circle Pad, and its left stick presses the D-Pad. On-screen controls stay as they are.</string>
+    <string name="left_stick_dpad_swapped_toast">Left Stick and D-Pad Swapped</string>
+    <string name="left_stick_dpad_normal_toast">Left Stick and D-Pad Back to Normal</string>
     <string name="combo_button_settings">Configure Combo Button</string>
     <string name="combo_button_settings_description">Select which buttons are triggered by the Combo Button.</string>
 

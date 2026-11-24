@@ -191,6 +191,11 @@ enum class InputMappingSetting(
         key = SettingKeys.hotkey_combo_button(),
         CitraSettings.SECTION_CONTROLS,
         outKey = Hotkey.COMBO_BUTTON.button
+    ),
+    HOTKEY_SWAP_LEFT_STICK_DPAD(
+        SettingKeys.hotkey_swap_left_stick_dpad(),
+        CitraSettings.SECTION_CONTROLS,
+        outKey = Hotkey.SWAP_LEFT_STICK_DPAD.button
     );
 
     /** Parse a configuration string into an input binding */

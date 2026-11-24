@@ -14,5 +14,6 @@ enum class Hotkey(val button: Int) {
     TURBO_TOGGLE(10007),
     ENABLE(10008),
     TURBO_HOLD(10009),
-    COMBO_BUTTON(10010)
+    COMBO_BUTTON(10010),
+    SWAP_LEFT_STICK_DPAD(10011)
 }

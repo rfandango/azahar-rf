@@ -81,6 +81,10 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # List of buttons which will be triggered by the combo button. (Default [] or empty)
 )") DECLARE_KEY(combo_button_buttons) BOOST_HANA_STRING(R"(
 
+# Whether a controller's left stick and D-pad take each other's place.
+# 0 (default): Off, 1: On
+)") DECLARE_KEY(swap_left_stick_dpad) BOOST_HANA_STRING(R"(
+
 # Configuration strings for 3ds buttons and axes. On Android, all such strings use "engine:gamepad" once bound. Default unbound.
 )") DECLARE_KEY(button_a) BOOST_HANA_STRING(R"(
 )") DECLARE_KEY(button_b) BOOST_HANA_STRING(R"(
@@ -115,6 +119,7 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 )") DECLARE_KEY(hotkey_turbo_toggle) BOOST_HANA_STRING(R"(
 )") DECLARE_KEY(hotkey_turbo_hold) BOOST_HANA_STRING(R"(
 )") DECLARE_KEY(hotkey_combo_button) BOOST_HANA_STRING(R"(
+)") DECLARE_KEY(hotkey_swap_left_stick_dpad) BOOST_HANA_STRING(R"(
 
 [Core]
 # Whether to use the Just-In-Time (JIT) compiler for CPU emulation

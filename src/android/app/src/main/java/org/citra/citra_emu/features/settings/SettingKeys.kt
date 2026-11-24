@@ -155,6 +155,7 @@ object SettingKeys {
     external fun performance_overlay_position(): String
     external fun enable_secondary_display(): String
     external fun combo_button_buttons(): String
+    external fun swap_left_stick_dpad(): String
 
     // Inputs
     external fun button_a(): String
@@ -190,4 +191,5 @@ object SettingKeys {
     external fun hotkey_quickload(): String
     external fun hotkey_enable(): String
     external fun hotkey_combo_button(): String
+    external fun hotkey_swap_left_stick_dpad(): String
 }
