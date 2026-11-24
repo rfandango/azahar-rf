@@ -1812,9 +1812,20 @@ bool RasterizerCache<T>::ValidateByRelayout(SurfaceId surface_id, const SurfaceI
             continue;
         }
         const Surface& owner = slot_surfaces[owner_id];
+        // A fill that could not be taken as a clear: its value is no pixel of this surface, or it
+        // ends inside a row of it. It has no image to convert and no format, so no pixel size
+        // either. Its bytes are written to guest memory, without a wait for the GPU.
+        if (owner.type == SurfaceType::Fill) {
+            CITRA_FRAME_DUMP("cache no relayout to {} {}x{} @{:08X}: [{:08X}-{:08X}] is a fill of "
+                             "{} bytes",
+                             PixelFormatAsString(surface.pixel_format), surface.width,
+                             surface.height, surface.addr, part.lower(), part.upper(),
+                             owner.fill_size);
+            return false;
+        }
         // A source with pixels of another size is gone through by the byte, wherever it starts
         const bool same_pixel_size = owner.BytesInPixels(1) == pixel_size;
-        if (owner.type == SurfaceType::Fill || owner.levels != 1 || owner.stride != owner.width ||
+        if (owner.levels != 1 || owner.stride != owner.width ||
             owner.texture_type != TextureType::Texture2D ||
             (same_pixel_size && !pixel_aligned(owner.addr)) || !pixel_aligned(part.lower()) ||
             !pixel_aligned(part.upper()) || !runtime.CanRelayoutTextures(owner, surface)) {
