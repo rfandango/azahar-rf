@@ -136,10 +136,11 @@ MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(1
 
 /// Whether the commands a game sends are decoded on a thread of their own while the game goes
 /// on. The way it is done where it has run, Android on arm64; elsewhere not until it has been
-/// tried there.
+/// tried there. Not with OpenGL, whose calls work only on the thread that has its context.
 static bool WantsDecoderThread() {
 #if defined(__ANDROID__) && defined(__aarch64__)
-    return (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyGpuDecoding) == 0;
+    return Settings::GetWorkingGraphicsAPI() != Settings::GraphicsAPI::OpenGL &&
+           (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyGpuDecoding) == 0;
 #else
     return false;
 #endif
