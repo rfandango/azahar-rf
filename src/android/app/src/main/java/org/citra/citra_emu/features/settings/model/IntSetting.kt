@@ -23,6 +23,7 @@ enum class IntSetting(
     CAMERA_OUTER_LEFT_FLIP(SettingKeys.camera_outer_left_flip(), CitraSettings.SECTION_CAMERA, 0),
     CAMERA_OUTER_RIGHT_FLIP(SettingKeys.camera_outer_right_flip(), CitraSettings.SECTION_CAMERA, 0),
     GRAPHICS_API(SettingKeys.graphics_api(), CitraSettings.SECTION_RENDERER, 2),
+
     // In quarters: 4 for the console's own resolution, 0 for one that goes by the screen
     RESOLUTION_FACTOR(SettingKeys.resolution_factor(), CitraSettings.SECTION_RENDERER, 4, 4),
     STEREOSCOPIC_3D_MODE(SettingKeys.render_3d(), CitraSettings.SECTION_RENDERER, 2),
