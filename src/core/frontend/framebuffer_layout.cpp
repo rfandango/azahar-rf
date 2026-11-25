@@ -135,7 +135,8 @@ FramebufferLayout PortraitOriginalLayout(u32 width, u32 height, bool swapped, bo
     return res;
 }
 
-FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool swapped, bool upright) {
+FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool swapped, bool upright,
+                                    bool is_second_display) {
     ASSERT(width > 0);
     ASSERT(height > 0);
     // The drawing code needs at least somewhat valid values for both screens
@@ -179,8 +180,9 @@ FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool swapped, bool up
         top_screen = MaxRectangle(screen_window_area, emulation_aspect_ratio);
         bot_screen = MaxRectangle(screen_window_area, emulation_aspect_ratio);
     }
-    if (wide) {
-        // The shape is the top screen's: the bottom screen, on a second display say, keeps its own
+    if (wide || (is_second_display && aspect_ratio_setting != Settings::AspectRatio::Stretch)) {
+        // The shape is the top screen's: the bottom screen, on a second display say, keeps its own.
+        // (16:9 for the main display left bars on a second one of 4:3, its very shape)
         bot_screen = bot_screen_as_it_is;
     }
 
@@ -376,10 +378,12 @@ FramebufferLayout AndroidSecondaryLayout(u32 width, u32 height) {
         Settings::values.secondary_display_layout.GetValue();
     switch (layout) {
     case Settings::SecondaryDisplayLayout::TopScreenOnly:
-        return SingleFrameLayout(width, height, false, Settings::values.upright_screen.GetValue());
+        return SingleFrameLayout(width, height, false, Settings::values.upright_screen.GetValue(),
+                                 true);
 
     case Settings::SecondaryDisplayLayout::BottomScreenOnly:
-        return SingleFrameLayout(width, height, true, Settings::values.upright_screen.GetValue());
+        return SingleFrameLayout(width, height, true, Settings::values.upright_screen.GetValue(),
+                                 true);
     case Settings::SecondaryDisplayLayout::SideBySide:
         return LargeFrameLayout(width, height, false, Settings::values.upright_screen.GetValue(),
                                 1.0f, Settings::SmallScreenPosition::MiddleRight);
@@ -398,7 +402,7 @@ FramebufferLayout AndroidSecondaryLayout(u32 width, u32 height) {
     case Settings::SecondaryDisplayLayout::OppositeScreenOnly:
     default:
         return SingleFrameLayout(width, height, !Settings::values.swap_screen.GetValue(),
-                                 Settings::values.upright_screen.GetValue());
+                                 Settings::values.upright_screen.GetValue(), true);
     }
 }
 

@@ -111,9 +111,12 @@ FramebufferLayout PortraitOriginalLayout(u32 width, u32 height, bool is_swapped,
  * @param height Window framebuffer height in pixels
  * @param is_swapped if true, the bottom screen will be displayed (and the top won't be displayed)
  * @param upright if true, the screens will be rotated 90 degrees anti-clockwise
+ * @param is_second_display if true, this is for a second display, on which a fixed aspect ratio
+ * that is set is the top screen's alone: it is chosen for the shape of the main display
  * @return Newly created FramebufferLayout object with default screen regions initialized
  */
-FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool is_swapped, bool upright);
+FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool is_swapped, bool upright,
+                                    bool is_second_display = false);
 
 /**
  * Factory method for constructing a Frame with differently sized top and bottom windows
