@@ -56,6 +56,9 @@ public:
     bool StillNeeded(Surface&) {
         return false;
     }
+    bool MayTakeOverNow(const Surface&) const {
+        return false;
+    }
 
     /// Submits and waits for current GPU work.
     void Finish();

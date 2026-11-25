@@ -4,6 +4,10 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
+#include <optional>
+#include <vector>
 #include "common/common_types.h"
 #include "common/math_util.h"
 #include "video_core/renderer_base.h"
@@ -61,22 +65,26 @@ struct PresentUniformData {
     std::array<f32, 4 * 4> modelview;
     /// The part of the image that is the screen: its lowest and highest coordinates
     Common::Vec4f screen_area;
-    Common::Vec4f o_resolution;
+    /// Its size in pixels, and that of a pixel
+    Common::Vec4f image_size;
     int screen_id_l = 0;
     int screen_id_r = 0;
-    int layer = 0;
+    float output_rows = 0.0f;
     int reverse_interlaced = 0;
-    /// Of Snapdragon Game Super Resolution, from 0 to 2
+    /// Of the upscalers, from 0 to 2
     float edge_sharpness = 0.0f;
 };
 static_assert(sizeof(PresentUniformData) == 116,
               "PresentUniformData does not structure in shader!");
 
 class RendererVulkan : public VideoCore::RendererBase {
-    static constexpr std::size_t PRESENT_PIPELINES = 5;
+    static constexpr std::size_t PRESENT_PIPELINES = 7;
     /// Of those, the ones that enlarge a screen with Snapdragon Game Super Resolution
     static constexpr u32 SGSR_PIPELINE = 3;
     static constexpr u32 SGSR_EDGE_PIPELINE = 4;
+    /// and the lighter ones
+    static constexpr u32 LIGHT_PIPELINE = 5;
+    static constexpr u32 CUBIC_PIPELINE = 6;
 
 public:
     explicit RendererVulkan(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window,
@@ -119,7 +127,9 @@ private:
     void RenderScreenshot();
     void RenderScreenshotWithStagingCopy();
     bool TryRenderScreenshotWithHostMemory();
-    void PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout);
+    /// Begins the drawing of the frame. Without `clear` only the given parts of it are cleared.
+    void PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout, bool clear,
+                     std::vector<vk::ClearRect> parts_to_clear);
     void RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
                         bool flipped);
 
@@ -131,13 +141,21 @@ private:
                        const Common::Rectangle<u32>& top_screen);
     /// The pipeline a screen is drawn with that is shown `width` pixels along its 240 and `height`
     /// along its length, with what that one wants to know
-    u32 ChoosePresentPipeline(const ScreenInfo& screen_info, float width, float height);
+    u32 ChoosePresentPipeline(u32 screen_id, float width, float height);
     void DrawSingleScreen(u32 screen_id, float x, float y, float w, float h,
                           Layout::DisplayOrientation orientation);
     void DrawSingleScreenStereo(u32 screen_id_l, u32 screen_id_r, float x, float y, float w,
                                 float h, Layout::DisplayOrientation orientation);
 
     void ApplySecondLayerOpacity(float alpha);
+
+    /// What of the frame the screens of the layout leave free, as rectangles. Nothing if that is to be
+    /// taken as not known.
+    std::optional<std::vector<vk::ClearRect>> UncoveredParts(
+        const Frame& frame, const Layout::FramebufferLayout& layout) const;
+
+    /// Every so many VBlanks: what the GPU does, and what of it is showing frames, in the log
+    void ReportGpuTime();
 
     void DrawCursor(const Layout::FramebufferLayout& layout);
 
@@ -163,7 +181,19 @@ private:
     std::unique_ptr<PresentWindow> secondary_present_window_ptr;
     DescriptorHeap present_heap;
     vk::UniquePipelineLayout present_pipeline_layout;
+    /// With blending, and without it
     std::array<vk::Pipeline, PRESENT_PIPELINES> present_pipelines;
+    std::array<vk::Pipeline, PRESENT_PIPELINES> opaque_present_pipelines;
+    /// Whether what is drawn now lets through what is below it
+    bool layer_blends{};
+    /// Pixels of the frame being drawn for one of the layout
+    float output_scale = 1.0f;
+    GpuSpanMeter draw_meter;
+    std::chrono::nanoseconds reported_busy{};
+    std::array<GpuSpanMeter::Sum, GpuSpanMeter::KINDS> reported_draws{};
+    std::array<GpuSpanMeter::Sum, 2> reported_copies{};
+    u32 report_vblanks{};
+    std::chrono::steady_clock::time_point report_start{};
     std::array<vk::ShaderModule, PRESENT_PIPELINES> present_shaders;
     std::array<vk::Sampler, 2> present_samplers;
     vk::ShaderModule present_vertex_shader;

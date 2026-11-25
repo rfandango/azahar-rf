@@ -94,6 +94,8 @@ object SettingKeys {
     external fun filter_mode(): String
     external fun screen_upscaling(): String
     external fun screen_upscaling_sharpness(): String
+    external fun screen_upscaling_bottom(): String
+    external fun output_resolution(): String
     external fun pp_shader_name(): String
     external fun anaglyph_shader_name(): String
     external fun dump_textures(): String

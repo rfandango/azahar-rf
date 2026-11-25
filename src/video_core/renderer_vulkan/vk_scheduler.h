@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -85,6 +86,54 @@ private:
     u64 last_end{};
 };
 
+/// Measures how long the GPU takes for stretches of command buffers, of up to four kinds. Unlike
+/// GpuTimeMeter it needs to know of no submissions: a stretch is taken in once its timestamps
+/// are there.
+class GpuSpanMeter {
+public:
+    static constexpr std::size_t KINDS = 4;
+
+    struct Sum {
+        std::chrono::nanoseconds time{};
+        u32 spans{};
+    };
+
+    explicit GpuSpanMeter(const Instance& instance);
+    ~GpuSpanMeter();
+
+    /// Outside of a render pass, on the thread that records. One stretch at a time.
+    void Begin(vk::CommandBuffer cmdbuf);
+
+    /// The end of the stretch, of the given kind.
+    void End(vk::CommandBuffer cmdbuf, std::size_t kind);
+
+    /// The stretches that were finished since this was last called. One thread at a time.
+    [[nodiscard]] std::array<Sum, KINDS> Take();
+
+private:
+    static constexpr u32 SLOTS = 64;
+
+    struct Pending {
+        u32 slot;
+        std::size_t kind;
+    };
+
+    const Instance& instance;
+    vk::UniqueQueryPool pool;
+    double tick_ns{};
+    u64 valid_mask{};
+    // Of the recording thread
+    u32 next_slot{};
+    u32 open_slot{};
+    bool is_open{};
+    // Recorded and not taken in yet, oldest first
+    std::mutex mutex;
+    std::deque<Pending> pending;
+    // Of the thread that takes them in: where the stretch that last had a slot began, to tell
+    // the old figures of a slot, which the GPU has not got to clearing yet, from new ones
+    std::array<u64, SLOTS> last_begin{};
+};
+
 /// The scheduler abstracts command buffer and fence management with an interface that's able to do
 /// OpenGL-like operations on Vulkan command buffers.
 class Scheduler {
@@ -119,9 +168,22 @@ public:
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
 
+    /// Whether there is anything the GPU was not sent yet
+    [[nodiscard]] bool HasUnsentWork() const noexcept {
+        return recorded_since_submit;
+    }
+
+    /// Whether the GPU is at the last of what it was sent, or done with that too
+    [[nodiscard]] bool IsGpuRunningOut() {
+        master_semaphore->Refresh();
+        const u64 last = master_semaphore->CurrentTick() - 1;
+        return last <= 1 || master_semaphore->IsFree(last - 1);
+    }
+
     /// Records the command to the current chunk.
     template <typename T>
     void Record(T&& command) {
+        recorded_since_submit = true;
         if (chunk->Record(command)) {
             return;
         }
@@ -270,6 +332,7 @@ private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     CommandPool command_pool;
     GpuTimeMeter gpu_time;
+    bool recorded_since_submit{};
     std::unique_ptr<CommandChunk> chunk;
     std::queue<std::unique_ptr<CommandChunk>> work_queue;
     std::vector<std::unique_ptr<CommandChunk>> chunk_reserve;

@@ -16,10 +16,11 @@ layout (push_constant, std140) uniform DrawInfo {
     mat4 modelview_matrix;
     // The part of the image that is the screen: its lowest and highest coordinates
     vec4 screen_area;
-    vec4 o_resolution;
+    // Its size in pixels, and that of a pixel
+    vec4 image_size;
     int screen_id_l;
     int screen_id_r;
-    int layer;
+    float output_rows;
     int reverse_interlaced;
     // 0 to 2
     float edge_sharpness;
@@ -61,21 +62,6 @@ vec4 GatherScreen(highp vec2 coord) {
 #endif
 }
 
-highp vec2 ScreenSize() {
-#ifdef ARRAY_DYNAMIC_INDEX
-    return vec2(textureSize(screen_textures[screen_id_l], 0));
-#else
-    switch (screen_id_l) {
-    case 0:
-        return vec2(textureSize(screen_textures[0], 0));
-    case 1:
-        return vec2(textureSize(screen_textures[1], 0));
-    default:
-        return vec2(textureSize(screen_textures[2], 0));
-    }
-#endif
-}
-
 mediump float FastLanczos2(mediump float x) {
     mediump float wA = x - 4.0;
     mediump float wB = x * wA - wA;
@@ -112,8 +98,8 @@ mediump vec2 EdgeDirection(mediump vec4 left, mediump vec4 right) {
 void main() {
     mediump vec4 color = vec4(SampleScreen(frag_tex_coord).rgb, 1.0);
 
-    highp vec2 size = ScreenSize();
-    highp vec2 texel = 1.0 / size;
+    highp vec2 size = image_size.xy;
+    highp vec2 texel = image_size.zw;
     highp vec2 img_coord = (frag_tex_coord * size) + vec2(-0.5, 0.5);
     highp vec2 img_coord_pixel = floor(img_coord);
     highp vec2 coord = img_coord_pixel * texel;

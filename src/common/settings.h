@@ -162,6 +162,8 @@ enum class ScreenUpscaling : u32 {
     Filter = 0,
     SGSR1 = 1,
     SGSR1Edge = 2,
+    Light = 3,
+    Cubic = 4,
 };
 
 enum class AspectRatio : u32 {
@@ -668,9 +670,14 @@ struct Values {
     SwitchableSetting<bool> filter_mode{true, Keys::filter_mode};
     SwitchableSetting<ScreenUpscaling> screen_upscaling{ScreenUpscaling::Filter,
                                                         Keys::screen_upscaling};
-    /// Percent of the edge sharpness of Snapdragon Game Super Resolution, whose default is 2
-    SwitchableSetting<u32, true> screen_upscaling_sharpness{200, 0, 200,
+    /// How much the upscalers sharpen, in percent. (Of Snapdragon Game Super Resolution 100 is half
+    /// of its own default, and closer to a picture drawn at that size than that.)
+    SwitchableSetting<u32, true> screen_upscaling_sharpness{100, 0, 200,
                                                             Keys::screen_upscaling_sharpness};
+    /// Whether the bottom screen is upscaled as well
+    SwitchableSetting<bool> screen_upscaling_bottom{false, Keys::screen_upscaling_bottom};
+    /// Percent of the display's lines and columns that are drawn, the display makes up the rest
+    SwitchableSetting<u32, true> output_resolution{100, 30, 100, Keys::output_resolution};
     SwitchableSetting<std::string> pp_shader_name{"None (builtin)", Keys::pp_shader_name};
     SwitchableSetting<std::string> anaglyph_shader_name{"Dubois (builtin)",
                                                         Keys::anaglyph_shader_name};

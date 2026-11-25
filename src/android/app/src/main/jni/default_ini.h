@@ -260,12 +260,21 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 
 # How the screens are brought to the size they are shown in, where that is larger than they are drawn
 # 0 (default): Filtered as said above, 1: Snapdragon Game Super Resolution 1 (Vulkan only),
-# 2: The same with edge direction
+# 2: The same with edge direction, 3: Linear filtering, sharpened, 4: Cubic filtering
 )") DECLARE_KEY(screen_upscaling) BOOST_HANA_STRING(R"(
 
-# How much Snapdragon Game Super Resolution sharpens, in percent
-# 0 - 200 (default: 200)
+# How much that sharpens, in percent
+# 0 - 200 (default: 100)
 )") DECLARE_KEY(screen_upscaling_sharpness) BOOST_HANA_STRING(R"(
+
+# Whether the bottom screen is upscaled as well
+# 0 (default): No, 1: Yes
+)") DECLARE_KEY(screen_upscaling_bottom) BOOST_HANA_STRING(R"(
+
+# The share of the display's resolution that is drawn, in percent. The display scales it up.
+# (Vulkan only)
+# 30 - 100 (default: 100)
+)") DECLARE_KEY(output_resolution) BOOST_HANA_STRING(R"(
 
 # Delays the game render thread by the specified amount of microseconds
 # Set to 0 for no delay, only useful in dynamic-fps games to simulate GPU delay.
@@ -310,6 +319,7 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 )") DECLARE_KEY(upright_screen) BOOST_HANA_STRING(R"(
 
 # Which aspect ratio should be used by the emulated 3DS screens
+# (the bottom screen on a second display keeps its own, unless it is stretched)
 # 0: (default): Default
 # 1: 16:9
 # 2: 4:3

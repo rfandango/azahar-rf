@@ -590,6 +590,8 @@ void PresentWindow::CreateFrameResources() {
             .layers = 1,
         };
         frame.framebuffer = device.createFramebuffer(fb_info);
+        frame.renderpass = present_renderpass;
+        frame.renderpass_uncleared = present_renderpass;
     }
 
     LOG_DEBUG(Render_Vulkan, "Created {} frame resources for LibRetro", frame_count);

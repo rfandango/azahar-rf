@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include "common/assert.h"
+#include "common/diagnostics.h"
+#include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/memory_detect.h"
 #include "common/microprofile.h"
@@ -19,8 +21,10 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include "video_core/host_shaders/vulkan_present_anaglyph_frag.h"
+#include "video_core/host_shaders/vulkan_present_cubic_frag.h"
 #include "video_core/host_shaders/vulkan_present_frag.h"
 #include "video_core/host_shaders/vulkan_present_interlaced_frag.h"
+#include "video_core/host_shaders/vulkan_present_light_frag.h"
 #include "video_core/host_shaders/vulkan_present_sgsr1_frag.h"
 #include "video_core/host_shaders/vulkan_present_vert.h"
 
@@ -157,7 +161,8 @@ RendererVulkan::RendererVulkan(Core::System& system, Pica::PicaCore& pica_,
                                          renderpass_cache,
                                          update_queue,
                                          main_present_window.ImageCount()},
-      present_heap{instance, scheduler.GetMasterSemaphore(), PRESENT_BINDINGS, 32} {
+      present_heap{instance, scheduler.GetMasterSemaphore(), PRESENT_BINDINGS, 32},
+      draw_meter{instance} {
     CompileShaders();
     BuildLayouts();
     BuildPipelines();
@@ -178,6 +183,7 @@ RendererVulkan::~RendererVulkan() {
     device.destroyShaderModule(present_vertex_shader);
     for (u32 i = 0; i < PRESENT_PIPELINES; i++) {
         device.destroyPipeline(present_pipelines[i]);
+        device.destroyPipeline(opaque_present_pipelines[i]);
         device.destroyShaderModule(present_shaders[i]);
     }
 
@@ -219,7 +225,89 @@ void RendererVulkan::PrepareRendertarget() {
     }
 }
 
-void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout) {
+std::optional<std::vector<vk::ClearRect>> RendererVulkan::UncoveredParts(
+    const Frame& frame, const Layout::FramebufferLayout& layout) const {
+    if (layout.render_3d_mode != Settings::StereoRenderOption::Off || layout.width == 0 ||
+        layout.height == 0 ||
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyScreenBlending)) {
+        return std::nullopt;
+    }
+    struct Part {
+        s32 left, top, right, bottom;
+    };
+    std::vector<Part> parts{
+        Part{0, 0, static_cast<s32>(frame.width), static_cast<s32>(frame.height)}};
+    const auto take_out = [&](const Common::Rectangle<u32>& screen) {
+        // Where the screen comes to lie in the frame, see MakeOrthographicMatrix, only with pixels
+        // that are covered in full
+        const float left = static_cast<float>(screen.left) / static_cast<float>(layout.width);
+        const float right = static_cast<float>(screen.right) / static_cast<float>(layout.width);
+        const float top = static_cast<float>(screen.top) / static_cast<float>(layout.height);
+        const float bottom = static_cast<float>(screen.bottom) / static_cast<float>(layout.height);
+        std::array<float, 4> box{left, top, right, bottom};
+        switch (frame_rotation) {
+        case 90:
+            box = {1.f - bottom, left, 1.f - top, right};
+            break;
+        case 180:
+            box = {1.f - right, 1.f - bottom, 1.f - left, 1.f - top};
+            break;
+        case 270:
+            box = {top, 1.f - right, bottom, 1.f - left};
+            break;
+        default:
+            break;
+        }
+        const float width = static_cast<float>(frame.width);
+        const float height = static_cast<float>(frame.height);
+        const Part covered{static_cast<s32>(std::ceil(box[0] * width - 0.01f)),
+                           static_cast<s32>(std::ceil(box[1] * height - 0.01f)),
+                           static_cast<s32>(std::floor(box[2] * width + 0.01f)),
+                           static_cast<s32>(std::floor(box[3] * height + 0.01f))};
+        std::vector<Part> rest;
+        for (const Part& part : parts) {
+            const Part both{std::max(part.left, covered.left), std::max(part.top, covered.top),
+                            std::min(part.right, covered.right),
+                            std::min(part.bottom, covered.bottom)};
+            if (both.left >= both.right || both.top >= both.bottom) {
+                rest.push_back(part);
+                continue;
+            }
+            const std::array pieces{Part{part.left, part.top, part.right, both.top},
+                                    Part{part.left, both.bottom, part.right, part.bottom},
+                                    Part{part.left, both.top, both.left, both.bottom},
+                                    Part{both.right, both.top, part.right, both.bottom}};
+            for (const Part& piece : pieces) {
+                if (piece.left < piece.right && piece.top < piece.bottom) {
+                    rest.push_back(piece);
+                }
+            }
+        }
+        parts = std::move(rest);
+    };
+    // (The one below may be seen through the one above)
+    const bool swapped = Settings::values.swap_screen.GetValue();
+    if (layout.top_screen_enabled && (!swapped || layout.top_opacity >= 1)) {
+        take_out(layout.top_screen);
+    }
+    if (layout.bottom_screen_enabled && (swapped || layout.bottom_opacity >= 1)) {
+        take_out(layout.bottom_screen);
+    }
+    std::vector<vk::ClearRect> rects;
+    for (const Part& part : parts) {
+        rects.push_back(vk::ClearRect{
+            .rect = vk::Rect2D{.offset = {part.left, part.top},
+                               .extent = {static_cast<u32>(part.right - part.left),
+                                          static_cast<u32>(part.bottom - part.top)}},
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        });
+    }
+    return rects;
+}
+
+void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout, bool clear,
+                                 std::vector<vk::ClearRect> parts_to_clear) {
     // (Snapdragon Game Super Resolution starts from the filtered picture)
     const bool linear =
         Settings::values.filter_mode.GetValue() ||
@@ -233,8 +321,10 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
 
     renderpass_cache.EndRendering();
     scheduler.Record([this, layout, frame, present_set,
-                      renderpass = main_present_window.Renderpass(),
+                      renderpass = clear ? frame->renderpass : frame->renderpass_uncleared,
+                      parts = std::move(parts_to_clear),
                       index = current_pipeline](vk::CommandBuffer cmdbuf) {
+        draw_meter.Begin(cmdbuf);
         // (the frame is as large as the layout, or the layout lying on its side)
         const vk::Viewport viewport = {
             .x = 0.0f,
@@ -268,6 +358,14 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
         };
 
         cmdbuf.beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
+        if (!parts.empty()) {
+            const vk::ClearAttachment attachment = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .colorAttachment = 0,
+                .clearValue = clear,
+            };
+            cmdbuf.clearAttachments(attachment, parts);
+        }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, present_pipelines[index]);
         cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 0, present_set, {});
     });
@@ -277,17 +375,32 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
                                     bool flipped) {
     if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
         Core::PerfStats::game_frames_updated) {
+        const bool direct = window.DrawsIntoSwapchain();
         Frame* frame = window.GetRenderFrame();
 
         // Where the display's panel lies turned the frame is drawn the way it lies
-        frame_rotation = window.PreRotation();
-        const bool sideways = frame_rotation == 90 || frame_rotation == 270;
-        const u32 frame_width = sideways ? layout.height : layout.width;
-        const u32 frame_height = sideways ? layout.width : layout.height;
-        if (frame_width != frame->width || frame_height != frame->height) {
-            window.WaitPresent();
-            scheduler.Finish();
-            window.RecreateFrame(frame, frame_width, frame_height);
+        if (direct) {
+            if (!frame) {
+                // There is nothing to show it on
+                return;
+            }
+            frame_rotation = frame->rotation;
+        } else {
+            frame_rotation = window.PreRotation();
+            const bool sideways = frame_rotation == 90 || frame_rotation == 270;
+            u32 frame_width = sideways ? layout.height : layout.width;
+            u32 frame_height = sideways ? layout.width : layout.height;
+#ifdef ANDROID
+            if (Settings::values.output_resolution.GetValue() != 100) {
+                frame_width = window.Extent().width;
+                frame_height = window.Extent().height;
+            }
+#endif
+            if (frame_width != frame->width || frame_height != frame->height) {
+                window.WaitPresent();
+                scheduler.Finish();
+                window.RecreateFrame(frame, frame_width, frame_height);
+            }
         }
 
         clear_color.float32[0] = Settings::values.bg_red.GetValue();
@@ -297,7 +410,7 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
 
         DrawScreens(frame, layout, flipped);
         frame_rotation = 0;
-        scheduler.Flush(frame->render_ready);
+        scheduler.Flush(frame->render_ready, direct ? frame->image_acquired : vk::Semaphore{});
         window.Present(frame, composing_vblank);
         if ((secondaryWindowEnabled && isSecondaryWindow) || (!secondaryWindowEnabled)) {
             Core::PerfStats::game_frames_updated = false;
@@ -358,6 +471,10 @@ void RendererVulkan::CompileShaders() {
     present_shaders[SGSR_EDGE_PIPELINE] =
         Compile(HostShaders::VULKAN_PRESENT_SGSR1_FRAG, vk::ShaderStageFlagBits::eFragment, device,
                 edge_preamble);
+    present_shaders[LIGHT_PIPELINE] = Compile(HostShaders::VULKAN_PRESENT_LIGHT_FRAG,
+                                              vk::ShaderStageFlagBits::eFragment, device, preamble);
+    present_shaders[CUBIC_PIPELINE] = Compile(HostShaders::VULKAN_PRESENT_CUBIC_FRAG,
+                                              vk::ShaderStageFlagBits::eFragment, device, preamble);
 
     cursor_vertex_shader =
         Compile(HostShaders::VULKAN_CURSOR_VERT, vk::ShaderStageFlagBits::eVertex, device);
@@ -457,7 +574,7 @@ void RendererVulkan::BuildPipelines() {
         .sampleShadingEnable = false,
     };
 
-    const vk::PipelineColorBlendAttachmentState colorblend_attachment = {
+    vk::PipelineColorBlendAttachmentState colorblend_attachment = {
         .blendEnable = true,
         .srcColorBlendFactor = vk::BlendFactor::eConstantAlpha,
         .dstColorBlendFactor = vk::BlendFactor::eOneMinusConstantAlpha,
@@ -532,10 +649,13 @@ void RendererVulkan::BuildPipelines() {
             .renderPass = main_present_window.Renderpass(),
         };
 
-        const auto [result, pipeline] =
-            instance.GetDevice().createGraphicsPipeline({}, pipeline_info);
-        ASSERT_MSG(result == vk::Result::eSuccess, "Unable to build present pipelines");
-        present_pipelines[i] = pipeline;
+        for (const bool blends : {true, false}) {
+            colorblend_attachment.blendEnable = blends;
+            const auto [result, pipeline] =
+                instance.GetDevice().createGraphicsPipeline({}, pipeline_info);
+            ASSERT_MSG(result == vk::Result::eSuccess, "Unable to build present pipelines");
+            (blends ? present_pipelines : opaque_present_pipelines)[i] = pipeline;
+        }
     }
 
     // Build cursor pipeline (simple position-only, inverted color blending)
@@ -797,8 +917,8 @@ void RendererVulkan::ReloadPipeline(Settings::StereoRenderOption render_3d) {
     }
 }
 
-u32 RendererVulkan::ChoosePresentPipeline(const ScreenInfo& screen_info, float width,
-                                          float height) {
+u32 RendererVulkan::ChoosePresentPipeline(u32 screen_id, float width, float height) {
+    const ScreenInfo& screen_info = screen_infos[screen_id];
     // (The screens lie on their side in memory: left and right are along the image's height)
     const auto& texcoords = screen_info.texcoords;
     const Common::Vec4f area =
@@ -807,20 +927,39 @@ u32 RendererVulkan::ChoosePresentPipeline(const ScreenInfo& screen_info, float w
                         std::max(texcoords.top, texcoords.bottom),
                         std::max(texcoords.left, texcoords.right));
     draw_info.screen_area = area;
+    const float image_width = static_cast<float>(std::max(screen_info.image_width, 1u));
+    const float image_height = static_cast<float>(std::max(screen_info.image_height, 1u));
+    draw_info.image_size =
+        Common::MakeVec(image_width, image_height, 1.0f / image_width, 1.0f / image_height);
     draw_info.edge_sharpness =
         static_cast<float>(Settings::values.screen_upscaling_sharpness.GetValue()) / 100.0f;
-    const auto upscaling = Settings::values.screen_upscaling.GetValue();
-    if (current_pipeline != 0 || upscaling == Settings::ScreenUpscaling::Filter) {
+    const auto upscaling = Common::Diagnostics::ComparesWithoutUpscaling()
+                               ? Settings::ScreenUpscaling::Filter
+                               : Settings::values.screen_upscaling.GetValue();
+    if (current_pipeline != 0 || upscaling == Settings::ScreenUpscaling::Filter ||
+        (screen_id == 2 && !Settings::values.screen_upscaling_bottom.GetValue())) {
         return current_pipeline;
     }
     // Only for a picture that is made larger: at its size, or smaller, there is nothing to add
-    const float pixels_across = (area.z - area.x) * static_cast<float>(screen_info.image_width);
-    const float pixels_along = (area.w - area.y) * static_cast<float>(screen_info.image_height);
-    const bool enlarged = width > pixels_across * 1.02f || height > pixels_along * 1.02f;
+    const float pixels_across = (area.z - area.x) * image_width;
+    const float pixels_along = (area.w - area.y) * image_height;
+    const bool enlarged = width * output_scale > pixels_across * 1.02f ||
+                          height * output_scale > pixels_along * 1.02f;
     if (!enlarged) {
         return current_pipeline;
     }
-    return upscaling == Settings::ScreenUpscaling::SGSR1Edge ? SGSR_EDGE_PIPELINE : SGSR_PIPELINE;
+    switch (upscaling) {
+    case Settings::ScreenUpscaling::SGSR1:
+        return SGSR_PIPELINE;
+    case Settings::ScreenUpscaling::SGSR1Edge:
+        return SGSR_EDGE_PIPELINE;
+    case Settings::ScreenUpscaling::Light:
+        return LIGHT_PIPELINE;
+    case Settings::ScreenUpscaling::Cubic:
+        return CUBIC_PIPELINE;
+    default:
+        return current_pipeline;
+    }
 }
 
 void RendererVulkan::DrawSingleScreen(u32 screen_id, float x, float y, float w, float h,
@@ -829,7 +968,7 @@ void RendererVulkan::DrawSingleScreen(u32 screen_id, float x, float y, float w, 
     const auto& texcoords = screen_info.texcoords;
     const bool upright = orientation == Layout::DisplayOrientation::Portrait ||
                          orientation == Layout::DisplayOrientation::PortraitFlipped;
-    const u32 pipeline = ChoosePresentPipeline(screen_info, upright ? w : h, upright ? h : w);
+    const u32 pipeline = ChoosePresentPipeline(screen_id, upright ? w : h, upright ? h : w);
 
     std::array<ScreenRectVertex, 4> vertices;
     switch (orientation) {
@@ -877,12 +1016,15 @@ void RendererVulkan::DrawSingleScreen(u32 screen_id, float x, float y, float w, 
     std::memcpy(data, vertices.data(), size);
     vertex_buffer.Commit(size);
 
-    draw_info.o_resolution = Common::MakeVec(h, w, 1.0f / h, 1.0f / w);
+    draw_info.output_rows = h * output_scale;
     draw_info.screen_id_l = screen_id;
 
-    scheduler.Record([this, offset = offset, info = draw_info, pipeline](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, offset = offset, info = draw_info,
+                      pipeline = (layer_blends ? present_pipelines
+                                               : opaque_present_pipelines)[pipeline]](
+                         vk::CommandBuffer cmdbuf) {
         const u32 first_vertex = static_cast<u32>(offset) / sizeof(ScreenRectVertex);
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, present_pipelines[pipeline]);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
         cmdbuf.pushConstants(*present_pipeline_layout,
                              vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex,
                              0, sizeof(info), &info);
@@ -944,12 +1086,16 @@ void RendererVulkan::DrawSingleScreenStereo(u32 screen_id_l, u32 screen_id_r, fl
     std::memcpy(data, vertices.data(), size);
     vertex_buffer.Commit(size);
 
-    draw_info.o_resolution = Common::MakeVec(h, w, 1.0f / h, 1.0f / w);
+    draw_info.output_rows = h * output_scale;
     draw_info.screen_id_l = screen_id_l;
     draw_info.screen_id_r = screen_id_r;
 
-    scheduler.Record([this, offset = offset, info = draw_info](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, offset = offset, info = draw_info,
+                      pipeline = (layer_blends ? present_pipelines
+                                               : opaque_present_pipelines)[current_pipeline]](
+                         vk::CommandBuffer cmdbuf) {
         const u32 first_vertex = static_cast<u32>(offset) / sizeof(ScreenRectVertex);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
         cmdbuf.pushConstants(*present_pipeline_layout,
                              vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex,
                              0, sizeof(info), &info);
@@ -960,6 +1106,9 @@ void RendererVulkan::DrawSingleScreenStereo(u32 screen_id_l, u32 screen_id_r, fl
 }
 
 void RendererVulkan::ApplySecondLayerOpacity(float alpha) {
+    layer_blends =
+        alpha < 1.0f ||
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyScreenBlending) != 0;
     scheduler.Record([alpha](vk::CommandBuffer cmdbuf) {
         const std::array<float, 4> blend_constants = {0.0f, 0.0f, 0.0f, alpha};
         cmdbuf.setBlendConstants(blend_constants.data());
@@ -991,7 +1140,6 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::SideBySide: {
         DrawSingleScreen(leftside, top_screen_left / 2, top_screen_top, top_screen_width / 2,
                          top_screen_height, orientation);
-        draw_info.layer = 1;
         DrawSingleScreen(rightside, static_cast<float>((top_screen_left / 2) + (layout.width / 2)),
                          top_screen_top, top_screen_width / 2, top_screen_height, orientation);
         break;
@@ -999,7 +1147,6 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::SideBySideFull: {
         DrawSingleScreen(leftside, top_screen_left, top_screen_top, top_screen_width,
                          top_screen_height, orientation);
-        draw_info.layer = 1;
         DrawSingleScreen(rightside, top_screen_left + layout.width / 2, top_screen_top,
                          top_screen_width, top_screen_height, orientation);
         break;
@@ -1007,7 +1154,6 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::CardboardVR: {
         DrawSingleScreen(leftside, top_screen_left, top_screen_top, top_screen_width,
                          top_screen_height, orientation);
-        draw_info.layer = 1;
         DrawSingleScreen(
             rightside,
             static_cast<float>(layout.cardboard.top_screen_right_eye + (layout.width / 2)),
@@ -1049,7 +1195,6 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
     {
         DrawSingleScreen(2, bottom_screen_left / 2, bottom_screen_top, bottom_screen_width / 2,
                          bottom_screen_height, orientation);
-        draw_info.layer = 1;
         DrawSingleScreen(2, static_cast<float>((bottom_screen_left / 2) + (layout.width / 2)),
                          bottom_screen_top, bottom_screen_width / 2, bottom_screen_height,
                          orientation);
@@ -1058,7 +1203,6 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::SideBySideFull: {
         DrawSingleScreen(2, bottom_screen_left, bottom_screen_top, bottom_screen_width,
                          bottom_screen_height, orientation);
-        draw_info.layer = 1;
         DrawSingleScreen(2, bottom_screen_left + layout.width / 2, bottom_screen_top,
                          bottom_screen_width, bottom_screen_height, orientation);
         break;
@@ -1066,7 +1210,6 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::CardboardVR: {
         DrawSingleScreen(2, bottom_screen_left, bottom_screen_top, bottom_screen_width,
                          bottom_screen_height, orientation);
-        draw_info.layer = 1;
         DrawSingleScreen(
             2, static_cast<float>(layout.cardboard.bottom_screen_right_eye + (layout.width / 2)),
             bottom_screen_top, bottom_screen_width, bottom_screen_height, orientation);
@@ -1093,27 +1236,30 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
         ReloadPipeline(layout.render_3d_mode);
     }
 
-    PrepareDraw(frame, layout);
+    auto uncovered = UncoveredParts(*frame, layout);
+    const bool clear = !uncovered.has_value();
+    PrepareDraw(frame, layout, clear,
+                std::move(uncovered).value_or(std::vector<vk::ClearRect>{}));
 
     const auto& top_screen = layout.top_screen;
     const auto& bottom_screen = layout.bottom_screen;
     draw_info.modelview = MakeOrthographicMatrix(layout.width, layout.height, frame_rotation);
-
-    draw_info.layer = 0;
+    output_scale = std::sqrt(static_cast<float>(frame->width) * static_cast<float>(frame->height) /
+                             std::max(static_cast<float>(layout.width) *
+                                          static_cast<float>(layout.height),
+                                      1.0f));
 
     // Apply the initial default opacity value; Needed to avoid flickering
     ApplySecondLayerOpacity(1.0f);
 
     if (!Settings::values.swap_screen.GetValue()) {
         DrawTopScreen(layout, top_screen);
-        draw_info.layer = 0;
         if (layout.bottom_opacity < 1) {
             ApplySecondLayerOpacity(layout.bottom_opacity);
         }
         DrawBottomScreen(layout, bottom_screen);
     } else {
         DrawBottomScreen(layout, bottom_screen);
-        draw_info.layer = 0;
         if (layout.top_opacity < 1) {
             ApplySecondLayerOpacity(layout.top_opacity);
         }
@@ -1131,7 +1277,10 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
 
     DrawCursor(layout);
 
-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRenderPass(); });
+    scheduler.Record([this, kind = isSecondaryWindow ? 1 : 0](vk::CommandBuffer cmdbuf) {
+        cmdbuf.endRenderPass();
+        draw_meter.End(cmdbuf, kind);
+    });
 }
 
 void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
@@ -1291,6 +1440,11 @@ void RendererVulkan::Compose() {
     if (present_image) {
         PrepareRendertarget();
         RenderScreenshot();
+        if (main_present_window.DrawsIntoSwapchain()) {
+            // What was drawn for the game is not to wait for an image of the display's
+            renderpass_cache.EndRendering();
+            scheduler.Flush();
+        }
         isSecondaryWindow = false;
         RenderToWindow(main_present_window, layout, false);
     }
@@ -1337,6 +1491,66 @@ void RendererVulkan::Compose() {
 
     system.perf_stats->EndSwap();
     rasterizer.TickFrame();
+    ReportGpuTime();
+}
+
+void RendererVulkan::ReportGpuTime() {
+    const auto add = [](GpuSpanMeter::Sum& to, const GpuSpanMeter::Sum& sum) {
+        to.time += sum.time;
+        to.spans += sum.spans;
+    };
+    const auto draws = draw_meter.Take();
+    add(reported_draws[0], draws[0]);
+    add(reported_draws[1], draws[1]);
+    add(reported_copies[0], main_present_window.TakeCopyTime());
+    if (secondary_present_window_ptr) {
+        add(reported_copies[1], secondary_present_window_ptr->TakeCopyTime());
+    }
+
+    static constexpr u32 REPORT_VBLANKS = 300;
+    const auto now = std::chrono::steady_clock::now();
+    if (report_start == std::chrono::steady_clock::time_point{}) {
+        report_start = now;
+    }
+    if (++report_vblanks < REPORT_VBLANKS) {
+        return;
+    }
+    const auto ms = [](std::chrono::nanoseconds time) {
+        return std::chrono::duration<double, std::milli>(time).count();
+    };
+    const auto per_span = [&](const GpuSpanMeter::Sum& sum) {
+        return sum.spans == 0 ? 0.0 : ms(sum.time) / sum.spans;
+    };
+    const double wall = ms(now - report_start);
+    const auto window_text = [&](const PresentWindow& window, const GpuSpanMeter::Sum& draw,
+                                 const GpuSpanMeter::Sum& copy) {
+        const vk::Extent2D extent = window.Extent();
+        std::string text = fmt::format("{} frames of {}x{} drawn in {:.2f} ms each", draw.spans,
+                                       extent.width, extent.height, per_span(draw));
+        if (copy.spans != 0) {
+            text += fmt::format(" and copied in {:.2f} ms", per_span(copy));
+        }
+        return text;
+    };
+    std::string second;
+    if (secondary_present_window_ptr && secondaryWindowEnabled) {
+        second = "; second window: " + window_text(*secondary_present_window_ptr,
+                                                   reported_draws[1], reported_copies[1]);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Host GPU, the last {} VBlanks in {:.1f} s: at work {:.0f}% of the time, {:.2f} ms a "
+             "VBlank, without the copies; main window: {}{}; scale {}x, upscaling {} at {}%",
+             REPORT_VBLANKS, wall / 1000.0, 100.0 * ms(reported_busy) / wall,
+             ms(reported_busy) / REPORT_VBLANKS,
+             window_text(main_present_window, reported_draws[0], reported_copies[0]), second,
+             GetResolutionScaleFactor().Factor(),
+             static_cast<u32>(Settings::values.screen_upscaling.GetValue()),
+             Settings::values.screen_upscaling_sharpness.GetValue());
+    report_vblanks = 0;
+    report_start = now;
+    reported_busy = {};
+    reported_draws = {};
+    reported_copies = {};
 }
 
 bool RendererVulkan::AlwaysLimitsFramesAheadOfGpu() const {
@@ -1352,7 +1566,10 @@ bool RendererVulkan::AlwaysLimitsFramesAheadOfGpu() const {
 }
 
 std::optional<std::chrono::nanoseconds> RendererVulkan::TakeGpuTime(bool wanted) {
-    return scheduler.TakeGpuTime(wanted);
+    // (Always measured, for the log)
+    const auto busy = scheduler.TakeGpuTime(true);
+    reported_busy += busy.value_or(std::chrono::nanoseconds{});
+    return wanted ? busy : std::nullopt;
 }
 
 void RendererVulkan::LimitFramesAheadOfGpu() {

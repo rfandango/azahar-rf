@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include "libretro_vulkan.h"
 
@@ -94,6 +95,10 @@ struct Frame {
     vk::Semaphore render_ready;
     vk::Fence present_done;
     vk::CommandBuffer cmdbuf;
+    vk::RenderPass renderpass{};
+    vk::RenderPass renderpass_uncleared{};
+    vk::Semaphore image_acquired{};
+    u32 rotation{};
 };
 
 /// LibRetro-specific PresentWindow implementation (same interface as desktop version)
@@ -134,6 +139,23 @@ public:
 
     u32 ImageCount() const noexcept {
         return static_cast<u32>(frame_pool.size());
+    }
+
+    // There is no swapchain here
+    u32 PreRotation() const noexcept {
+        return 0;
+    }
+    bool DrawsIntoSwapchain() const noexcept {
+        return false;
+    }
+    u32 Generation() const noexcept {
+        return 0;
+    }
+    vk::Extent2D Extent() const noexcept {
+        return {};
+    }
+    GpuSpanMeter::Sum TakeCopyTime() noexcept {
+        return {};
     }
 
     vk::Format GetSurfaceFormat() const noexcept {

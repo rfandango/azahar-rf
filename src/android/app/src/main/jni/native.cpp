@@ -661,9 +661,14 @@ void Java_org_citra_citra_1emu_NativeLibrary_swapScreens([[maybe_unused]] JNIEnv
 
 void Java_org_citra_citra_1emu_NativeLibrary_setScreenUpscaling([[maybe_unused]] JNIEnv* env,
                                                                 [[maybe_unused]] jobject obj,
-                                                                jint upscaling, jint sharpness) {
+                                                                jint upscaling, jint sharpness,
+                                                                jboolean bottom, jint output) {
     Settings::values.screen_upscaling = static_cast<Settings::ScreenUpscaling>(upscaling);
     Settings::values.screen_upscaling_sharpness = static_cast<u32>(sharpness);
+    Settings::values.screen_upscaling_bottom = bottom != JNI_FALSE;
+    Settings::values.output_resolution = static_cast<u32>(output);
+    LOG_INFO(Frontend, "Screen upscaling set to {} at {}%{}, output resolution to {}%", upscaling,
+             sharpness, bottom != JNI_FALSE ? ", the bottom screen too" : "", output);
 }
 
 jboolean Java_org_citra_citra_1emu_NativeLibrary_areKeysAvailable([[maybe_unused]] JNIEnv* env,

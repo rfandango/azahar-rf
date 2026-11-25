@@ -396,6 +396,11 @@ private:
     };
     std::vector<LateReadback> late_readbacks;
     u64 late_frame{};
+    /// For the log, see CreateSurface
+    u32 taken_over{};
+    u32 taken_over_early{};
+    u32 made_new{};
+    u32 made_new_waiting{};
     Common::ResolutionScale resolution_scale_factor;
     u8 sample_count;
     FramebufferParams fb_params;

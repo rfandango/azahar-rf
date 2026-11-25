@@ -26,7 +26,9 @@ set(SHADER_FILES
     vulkan_present.frag
     vulkan_present.vert
     vulkan_present_anaglyph.frag
+    vulkan_present_cubic.frag
     vulkan_present_interlaced.frag
+    vulkan_present_light.frag
     vulkan_present_sgsr1.frag
     vulkan_blit_depth_stencil.frag
     vulkan_cursor.frag

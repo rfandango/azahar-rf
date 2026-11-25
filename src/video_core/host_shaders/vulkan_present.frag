@@ -11,10 +11,10 @@ layout (location = 0) out vec4 color;
 layout (push_constant, std140) uniform DrawInfo {
     mat4 modelview_matrix;
     vec4 screen_area;
-    vec4 o_resolution;
+    vec4 image_size;
     int screen_id_l;
     int screen_id_r;
-    int layer;
+    float output_rows;
     int reverse_interlaced;
 };
 

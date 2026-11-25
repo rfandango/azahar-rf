@@ -140,6 +140,93 @@ std::chrono::nanoseconds GpuTimeMeter::Collect(u64 finished_tick) {
     return std::chrono::nanoseconds{static_cast<s64>(static_cast<double>(busy) * tick_ns)};
 }
 
+GpuSpanMeter::GpuSpanMeter(const Instance& instance_) : instance{instance_} {
+    const vk::PhysicalDevice physical_device = instance.GetPhysicalDevice();
+    const auto families = physical_device.getQueueFamilyProperties();
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const u32 valid_bits = family < families.size() ? families[family].timestampValidBits : 0;
+    if (valid_bits == 0) {
+        return;
+    }
+    valid_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
+    tick_ns = physical_device.getProperties().limits.timestampPeriod;
+    const vk::QueryPoolCreateInfo pool_info = {
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = SLOTS * 2,
+    };
+    try {
+        pool = instance.GetDevice().createQueryPoolUnique(pool_info);
+    } catch (const vk::SystemError&) {
+        // Nothing is measured then
+    }
+}
+
+GpuSpanMeter::~GpuSpanMeter() = default;
+
+void GpuSpanMeter::Begin(vk::CommandBuffer cmdbuf) {
+    is_open = false;
+    if (!pool) {
+        return;
+    }
+    {
+        std::scoped_lock lock{mutex};
+        if (pending.size() >= SLOTS - 1) {
+            return;
+        }
+    }
+    open_slot = next_slot;
+    next_slot = (next_slot + 1) % SLOTS;
+    is_open = true;
+    cmdbuf.resetQueryPool(*pool, open_slot * 2, 2);
+    // (At the bottom of the pipe: what came before is done then)
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *pool, open_slot * 2);
+}
+
+void GpuSpanMeter::End(vk::CommandBuffer cmdbuf, std::size_t kind) {
+    if (!is_open) {
+        return;
+    }
+    is_open = false;
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *pool, open_slot * 2 + 1);
+    std::scoped_lock lock{mutex};
+    pending.push_back(Pending{.slot = open_slot, .kind = kind});
+}
+
+std::array<GpuSpanMeter::Sum, GpuSpanMeter::KINDS> GpuSpanMeter::Take() {
+    std::array<Sum, KINDS> sums{};
+    while (pool) {
+        Pending entry;
+        {
+            std::scoped_lock lock{mutex};
+            if (pending.empty()) {
+                break;
+            }
+            entry = pending.front();
+        }
+        std::array<u64, 4> data{}; // two times, each with whether it is there
+        const vk::Result result = instance.GetDevice().getQueryPoolResults(
+            *pool, entry.slot * 2, 2, sizeof(data), data.data(), sizeof(u64) * 2,
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        if (result != vk::Result::eSuccess || data[1] == 0 || data[3] == 0 ||
+            data[0] == last_begin[entry.slot]) {
+            break;
+        }
+        last_begin[entry.slot] = data[0];
+        {
+            std::scoped_lock lock{mutex};
+            pending.pop_front();
+        }
+        const u64 begin = data[0] & valid_mask;
+        const u64 end = data[2] & valid_mask;
+        if (end > begin) {
+            sums[entry.kind].time += std::chrono::nanoseconds{
+                static_cast<s64>(static_cast<double>(end - begin) * tick_ns)};
+        }
+        sums[entry.kind].spans++;
+    }
+    return sums;
+}
+
 void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf) {
     auto command = first;
     while (command != nullptr) {
@@ -341,6 +428,7 @@ void Scheduler::SubmitExecution(vk::Semaphore signal_semaphore, vk::Semaphore wa
         chunk->MarkSubmit();
         DispatchWork();
     }
+    recorded_since_submit = false;
 }
 
 void Scheduler::AcquireNewChunk() {

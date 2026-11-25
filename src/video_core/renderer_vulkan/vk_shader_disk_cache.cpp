@@ -789,6 +789,24 @@ std::string ShaderDiskCache::GetPLFile(u64 title_id, bool is_temp) const {
            (is_temp ? "_temp" : "") + ".vkch";
 }
 
+void ShaderDiskCache::ReplaceCache(CacheFile& old_file, std::unique_ptr<CacheFile>& new_file,
+                                   const std::string& new_path, const std::string& path) {
+    // What is written to the new file is on its way to it on a thread of its own, entry by entry,
+    // which can take seconds. The old file only goes once all of it is there: an app that is
+    // closed meanwhile would otherwise be left with neither.
+    new_file->SwitchMode(CacheFile::CacheOpMode::READ);
+    new_file.reset();
+    old_file.SwitchMode(CacheFile::CacheOpMode::DELETE);
+    FileUtil::Rename(new_path, path);
+}
+
+void ShaderDiskCache::RecoverCache(const std::string& new_path, const std::string& path) {
+    if (!FileUtil::Exists(path) && FileUtil::Exists(new_path)) {
+        LOG_WARNING(Render_Vulkan, "Shader cache {} is gone, taking {}", path, new_path);
+        FileUtil::Rename(new_path, path);
+    }
+}
+
 bool ShaderDiskCache::RecreateCache(CacheFile& file, CacheFileType type) {
     file.SwitchMode(CacheFile::CacheOpMode::RECREATE);
 
@@ -844,6 +862,7 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
 
     LOG_INFO(Render_Vulkan, "Loading VS disk shader cache for title {:016X}", title_id);
 
+    RecoverCache(GetVSFile(title_id, true), GetVSFile(title_id, false));
     vs_cache.SetFilePath(GetVSFile(title_id, false));
 
     if (!vs_cache.SwitchMode(CacheFile::CacheOpMode::READ)) {
@@ -1132,9 +1151,8 @@ bool ShaderDiskCache::InitVSCache(const std::atomic_bool& stop_loading,
 
     if (regenerate_file) {
         // If we are regenerating, replace the old file with the new one.
-        vs_cache.SwitchMode(CacheFile::CacheOpMode::DELETE);
-        regenerate_file.reset();
-        FileUtil::Rename(GetVSFile(title_id, true), GetVSFile(title_id, false));
+        ReplaceCache(vs_cache, regenerate_file, GetVSFile(title_id, true),
+                     GetVSFile(title_id, false));
     }
 
     // Switch to append mode to receive new entries.
@@ -1155,6 +1173,7 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
 
     LOG_INFO(Render_Vulkan, "Loading FS disk shader cache for title {:016X}", title_id);
 
+    RecoverCache(GetFSFile(title_id, true), GetFSFile(title_id, false));
     fs_cache.SetFilePath(GetFSFile(title_id, false));
 
     if (!fs_cache.SwitchMode(CacheFile::CacheOpMode::READ)) {
@@ -1349,9 +1368,8 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
 
     if (regenerate_file) {
         // If we are regenerating, replace the old file with the new one.
-        fs_cache.SwitchMode(CacheFile::CacheOpMode::DELETE);
-        regenerate_file.reset();
-        FileUtil::Rename(GetFSFile(title_id, true), GetFSFile(title_id, false));
+        ReplaceCache(fs_cache, regenerate_file, GetFSFile(title_id, true),
+                     GetFSFile(title_id, false));
     }
 
     // Switch to append mode to receive new entries.
@@ -1372,6 +1390,7 @@ bool ShaderDiskCache::InitGSCache(const std::atomic_bool& stop_loading,
 
     LOG_INFO(Render_Vulkan, "Loading GS disk shader cache for title {:016X}", title_id);
 
+    RecoverCache(GetGSFile(title_id, true), GetGSFile(title_id, false));
     gs_cache.SetFilePath(GetGSFile(title_id, false));
 
     if (!gs_cache.SwitchMode(CacheFile::CacheOpMode::READ)) {
@@ -1575,9 +1594,8 @@ bool ShaderDiskCache::InitGSCache(const std::atomic_bool& stop_loading,
 
     if (regenerate_file) {
         // If we are regenerating, replace the old file with the new one.
-        gs_cache.SwitchMode(CacheFile::CacheOpMode::DELETE);
-        regenerate_file.reset();
-        FileUtil::Rename(GetGSFile(title_id, true), GetGSFile(title_id, false));
+        ReplaceCache(gs_cache, regenerate_file, GetGSFile(title_id, true),
+                     GetGSFile(title_id, false));
     }
 
     // Switch to append mode to receive new entries.

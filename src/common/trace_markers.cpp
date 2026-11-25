@@ -22,6 +22,7 @@ constexpr const char* EXPERIMENT_PROPERTY = "debug.azahar.experiment";
 
 constexpr const char* EXPERIMENT2_PROPERTY = "debug.azahar.experiment2";
 constexpr const char* EXPERIMENT3_PROPERTY = "debug.azahar.experiment3";
+constexpr const char* EXPERIMENT4_PROPERTY = "debug.azahar.experiment4";
 
 std::uint32_t ReadExperiments(const char* property = EXPERIMENT_PROPERTY) {
     const auto value = Common::Diagnostics::Property(property);
@@ -33,6 +34,7 @@ std::uint32_t ReadExperiments(const char* property = EXPERIMENT_PROPERTY) {
 std::atomic<std::uint32_t> experiments{ReadExperiments()};
 std::atomic<std::uint32_t> experiments2{ReadExperiments(EXPERIMENT2_PROPERTY)};
 std::atomic<std::uint32_t> experiments3{ReadExperiments(EXPERIMENT3_PROPERTY)};
+std::atomic<std::uint32_t> experiments4{ReadExperiments(EXPERIMENT4_PROPERTY)};
 
 constexpr const char* STALL_PROPERTY = "debug.azahar.stall";
 
@@ -131,6 +133,10 @@ std::uint32_t Experiments3() {
     return experiments3.load(std::memory_order_relaxed);
 }
 
+std::uint32_t Experiments4() {
+    return experiments4.load(std::memory_order_relaxed);
+}
+
 InjectedStall Stall() {
     const std::uint64_t value = stall.load(std::memory_order_relaxed);
     return {static_cast<std::uint32_t>(value >> 32), static_cast<std::uint32_t>(value)};
@@ -154,6 +160,9 @@ void RefreshSettings() {
     // With what the build's own comparison has turned on for now
     experiments3.store(ReadExperiments(EXPERIMENT3_PROPERTY) |
                            Common::Diagnostics::ComparisonBits(),
+                       std::memory_order_relaxed);
+    experiments4.store(ReadExperiments(EXPERIMENT4_PROPERTY) |
+                           Common::Diagnostics::ComparisonBits4(),
                        std::memory_order_relaxed);
     stall.store(ReadStall(), std::memory_order_relaxed);
 }

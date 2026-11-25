@@ -34,7 +34,7 @@ namespace {
 
 constexpr const char* TRIGGER_PROPERTY = "debug.azahar.dump_frame";
 constexpr const char* LOG_TAG = "AzaharFrameDump";
-constexpr u32 VBLANKS_PER_DUMP = 2;
+constexpr u32 VBLANKS_PER_DUMP = 5;
 /// With GPU times a game frame is wanted that starts with the GPU idle, which the first is not
 constexpr u32 VBLANKS_PER_TIMED_DUMP = 4;
 constexpr std::string_view TIMED_PREFIX = "gpu";

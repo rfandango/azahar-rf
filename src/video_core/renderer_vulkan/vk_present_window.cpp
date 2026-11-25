@@ -106,7 +106,15 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
       surface{CreateSurface(instance.GetInstance(), emu_window)}, next_surface{surface},
       swapchain{instance, emu_window.GetFramebufferLayout().width,
                 emu_window.GetFramebufferLayout().height, surface, low_refresh_rate_},
-      graphics_queue{instance.GetGraphicsQueue()}, present_renderpass{CreateRenderpass()},
+      graphics_queue{instance.GetGraphicsQueue()},
+      present_renderpass{CreateRenderpass(vk::AttachmentLoadOp::eClear,
+                                          vk::ImageLayout::eTransferSrcOptimal)},
+      present_renderpass_uncleared{CreateRenderpass(vk::AttachmentLoadOp::eDontCare,
+                                                    vk::ImageLayout::eTransferSrcOptimal)},
+      direct_renderpass{
+          CreateRenderpass(vk::AttachmentLoadOp::eClear, vk::ImageLayout::ePresentSrcKHR)},
+      direct_renderpass_uncleared{
+          CreateRenderpass(vk::AttachmentLoadOp::eDontCare, vk::ImageLayout::ePresentSrcKHR)},
       vsync_enabled{Settings::values.use_vsync.GetValue()},
       blit_supported{
           CanBlitToSwapchain(instance.GetPhysicalDevice(), swapchain.GetSurfaceFormat().format)},
@@ -114,8 +122,19 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
       is_main_window{!emu_window.isSecondary()},
       legacy_present_mode{
           (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyPresentMode) != 0},
-      last_render_surface{emu_window.GetWindowInfo().render_surface} {
+      last_render_surface{emu_window.GetWindowInfo().render_surface}, copy_meter{instance} {
+#ifdef ANDROID
+    draws_into_swapchain =
+        use_present_thread &&
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyPresentCopy) == 0;
+#endif
     UpdateDisplay();
+    if (draws_into_swapchain) {
+        MakeImageFrames();
+        present_thread =
+            std::jthread([this](std::stop_token token) { DirectPresentThread(token); });
+        return;
+    }
 
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
@@ -161,6 +180,16 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
 PresentWindow::~PresentWindow() {
     scheduler.Finish();
     const vk::Device device = instance.GetDevice();
+    if (draws_into_swapchain) {
+        // It may be after an image, or wait for a surface that does not come any more
+        present_thread.request_stop();
+        present_thread.join();
+        {
+            std::scoped_lock lock{scheduler.submit_mutex, scheduler.present_mutex};
+            device.waitIdle();
+        }
+        DestroyImageFrames();
+    }
     // If the window is destroyed before the next_surface is
     // consumed, make sure to destroy it here to prevent a
     // resource leak.
@@ -168,8 +197,14 @@ PresentWindow::~PresentWindow() {
         instance.GetInstance().destroySurfaceKHR(next_surface);
         next_surface = vk::SurfaceKHR{};
     }
-    device.destroyCommandPool(command_pool);
     device.destroyRenderPass(present_renderpass);
+    device.destroyRenderPass(present_renderpass_uncleared);
+    device.destroyRenderPass(direct_renderpass);
+    device.destroyRenderPass(direct_renderpass_uncleared);
+    if (draws_into_swapchain) {
+        return;
+    }
+    device.destroyCommandPool(command_pool);
     for (auto& frame : swap_chain) {
         device.destroyImageView(frame.image_view);
         device.destroyFramebuffer(frame.framebuffer);
@@ -245,9 +280,73 @@ void PresentWindow::RecreateFrame(Frame* frame, u32 width, u32 height) {
         .layers = 1,
     };
     frame->framebuffer = instance.GetDevice().createFramebuffer(framebuffer_info);
+    frame->renderpass = present_renderpass;
+    frame->renderpass_uncleared = present_renderpass_uncleared;
 
     frame->width = width;
     frame->height = height;
+}
+
+void PresentWindow::MakeImageFrames() {
+    const vk::Device device = instance.GetDevice();
+    const vk::Format format = swapchain.GetSurfaceFormat().format;
+    const vk::Extent2D extent = swapchain.GetExtent();
+    const auto images = swapchain.Images();
+    swap_chain.assign(images.size(), Frame{});
+    for (u32 i = 0; i < images.size(); i++) {
+        Frame& frame = swap_chain[i];
+        frame.width = extent.width;
+        frame.height = extent.height;
+        frame.image = images[i];
+        frame.image_index = i;
+        frame.rotation = swapchain.GetPreRotation();
+        frame.renderpass = direct_renderpass;
+        frame.renderpass_uncleared = direct_renderpass_uncleared;
+        frame.render_ready = device.createSemaphore({});
+        const vk::ImageViewCreateInfo view_info = {
+            .image = frame.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        };
+        frame.image_view = device.createImageView(view_info);
+        const vk::FramebufferCreateInfo framebuffer_info = {
+            .renderPass = direct_renderpass,
+            .attachmentCount = 1,
+            .pAttachments = &frame.image_view,
+            .width = extent.width,
+            .height = extent.height,
+            .layers = 1,
+        };
+        frame.framebuffer = device.createFramebuffer(framebuffer_info);
+    }
+    // One more than images: the one whose turn it is was then waited for long ago
+    acquire_semaphores.resize(images.size() + 1);
+    for (vk::Semaphore& semaphore : acquire_semaphores) {
+        semaphore = device.createSemaphore({});
+    }
+    acquire_ticks.assign(acquire_semaphores.size(), 0);
+    next_acquire_slot = 0;
+}
+
+void PresentWindow::DestroyImageFrames() {
+    const vk::Device device = instance.GetDevice();
+    for (Frame& frame : swap_chain) {
+        device.destroyFramebuffer(frame.framebuffer);
+        device.destroyImageView(frame.image_view);
+        device.destroySemaphore(frame.render_ready);
+    }
+    swap_chain.clear();
+    for (const vk::Semaphore semaphore : acquire_semaphores) {
+        device.destroySemaphore(semaphore);
+    }
+    acquire_semaphores.clear();
 }
 
 Frame* PresentWindow::GetRenderFrame() {
@@ -255,6 +354,24 @@ Frame* PresentWindow::GetRenderFrame() {
     // Blocks when all presentation frames are queued or still being presented.
     CITRA_TRACE_SCOPE("Vulkan::WaitPresentFrame");
     CITRA_HITCH_SCOPE(PresentQueue);
+
+    if (draws_into_swapchain) {
+        std::unique_lock lock{queue_mutex};
+        if (!wants_images || free_queue.empty()) {
+            wants_images = true;
+            waits_for_image = free_queue.empty();
+            frame_cv.notify_all();
+        }
+        free_cv.wait(lock, [this] { return !free_queue.empty() || surface_lost; });
+        waits_for_image = false;
+        if (free_queue.empty()) {
+            return nullptr;
+        }
+        Frame* frame = free_queue.front();
+        free_queue.pop();
+        images_drawn_into++;
+        return frame;
+    }
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
@@ -340,6 +457,9 @@ void PresentWindow::Present(Frame* frame, u64 vblank) {
         }
     }
 
+    if (draws_into_swapchain) {
+        frame->tick = scheduler.CurrentTick() - 1;
+    }
     if (!use_present_thread) {
         scheduler.WaitWorker();
         CopyToSwapchain(frame);
@@ -350,7 +470,12 @@ void PresentWindow::Present(Frame* frame, u64 vblank) {
     scheduler.Record([this, frame](vk::CommandBuffer) {
         std::unique_lock lock{queue_mutex};
         present_queue.push(frame);
-        frame_cv.notify_one();
+        if (draws_into_swapchain) {
+            images_drawn_into--;
+            frame_cv.notify_all();
+        } else {
+            frame_cv.notify_one();
+        }
     });
     // On to the render thread now. Left in the batch that is being recorded, the frame would
     // be passed on only when the next frame's drawing sends that batch: 5 to 15 ms of delay
@@ -360,6 +485,11 @@ void PresentWindow::Present(Frame* frame, u64 vblank) {
 
 void PresentWindow::WaitPresent() {
     if (!use_present_thread) {
+        return;
+    }
+    if (draws_into_swapchain) {
+        std::unique_lock lock{queue_mutex};
+        frame_cv.wait(lock, [this] { return present_queue.empty() && !is_showing; });
         return;
     }
 
@@ -402,6 +532,194 @@ void PresentWindow::PresentThread(std::stop_token token) {
         std::scoped_lock fl{free_mutex};
         free_queue.push(frame);
         free_cv.notify_one();
+    }
+}
+
+void PresentWindow::DirectPresentThread(std::stop_token token) {
+    Common::SetCurrentThreadName("VulkanPresent");
+    // While the display has none to spare it is asked again a little later, and not waited for: a frame
+    // that gets ready meanwhile is to be shown at once. Held up here it would come to the display
+    // together with the one after it, which then takes its place.
+    static constexpr std::chrono::milliseconds SHORTEST_PAUSE{2};
+    static constexpr std::chrono::milliseconds LONGEST_PAUSE{64};
+    static constexpr std::chrono::milliseconds PATIENCE{20};
+    std::chrono::milliseconds pause{0};
+    while (!token.stop_requested()) {
+        Frame* frame = nullptr;
+        bool nothing_else_to_do = false;
+        {
+            std::unique_lock lock{queue_mutex};
+            const auto has_frame = [this] { return !present_queue.empty(); };
+            const auto wants_image = [this] {
+                return wants_images && images_held < IMAGES_AHEAD;
+            };
+            if (pause.count() != 0 && !has_frame()) {
+                frame_cv.wait_for(lock, pause, [&] {
+                    return has_frame() || token.stop_requested() ||
+                           (waits_for_image && images_drawn_into == 0);
+                });
+            } else {
+                Common::CondvarWait(frame_cv, lock, token,
+                                    [&] { return has_frame() || wants_image(); });
+            }
+            if (token.stop_requested()) {
+                return;
+            }
+            if (has_frame()) {
+                frame = present_queue.front();
+                present_queue.pop();
+                is_showing = true;
+            } else if (!wants_image()) {
+                pause = std::chrono::milliseconds{0};
+                continue;
+            }
+            // (Whoever draws waits for an image, and there is no frame on its way here)
+            nothing_else_to_do = waits_for_image && images_drawn_into == 0;
+        }
+        if (!frame) {
+            const bool got_one =
+                AcquireAhead(nothing_else_to_do ? PATIENCE : std::chrono::milliseconds{0}, token);
+            pause = got_one ? std::chrono::milliseconds{0}
+                            : std::clamp(pause * 2, SHORTEST_PAUSE, LONGEST_PAUSE);
+            if (nothing_else_to_do) {
+                pause = std::chrono::milliseconds{0};
+            }
+            continue;
+        }
+        pause = std::chrono::milliseconds{0};
+
+        acquire_ticks[frame->acquire_slot] = frame->tick;
+        if (!swapchain.NeedsRecreation()) {
+            Show(frame);
+        }
+        {
+            std::scoped_lock lock{queue_mutex};
+            is_showing = false;
+            images_held--;
+        }
+        frame_cv.notify_all();
+        if (IsOutdated()) {
+            RemakeImages(false, token);
+        }
+    }
+}
+
+bool PresentWindow::IsOutdated() {
+    const bool legacy_mode =
+        (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyPresentMode) != 0;
+    return std::exchange(legacy_present_mode, legacy_mode) != legacy_mode ||
+           swapchain.IsOutputOutdated();
+}
+
+bool PresentWindow::AcquireAhead(std::chrono::nanoseconds patience, std::stop_token token) {
+    MasterSemaphore* const gpu = scheduler.GetMasterSemaphore();
+    if (!gpu->IsFree(acquire_ticks[next_acquire_slot])) {
+        if (patience.count() == 0) {
+            return false;
+        }
+        gpu->Wait(acquire_ticks[next_acquire_slot]);
+    }
+    const vk::Semaphore semaphore = acquire_semaphores[next_acquire_slot];
+    const std::optional<u32> image = swapchain.Acquire(semaphore, patience);
+    if (!image) {
+        if (swapchain.NeedsRecreation()) {
+            RemakeImages(true, token);
+        }
+        return false;
+    }
+    Frame& frame = swap_chain[*image];
+    frame.image_acquired = semaphore;
+    frame.acquire_slot = next_acquire_slot;
+    next_acquire_slot = (next_acquire_slot + 1) % static_cast<u32>(acquire_semaphores.size());
+    {
+        std::scoped_lock lock{queue_mutex};
+        free_queue.push(&frame);
+        images_held++;
+    }
+    free_cv.notify_one();
+    return true;
+}
+
+bool PresentWindow::RemakeImages(bool new_surface, std::stop_token token) {
+    do {
+        if (new_surface) {
+            {
+                std::scoped_lock lock{queue_mutex};
+                surface_lost = true;
+            }
+            free_cv.notify_all();
+#ifdef ANDROID
+            std::unique_lock lock{recreate_surface_mutex};
+            Common::CondvarWait(recreate_surface_cv, lock, token,
+                                [this] { return surface != next_surface; });
+            if (token.stop_requested()) {
+                return false;
+            }
+            surface = next_surface;
+#endif
+        }
+        {
+            // What was drawn into the images there were is not shown any more. Whoever draws into
+            // one gets to its end first.
+            std::unique_lock lock{queue_mutex};
+            Common::CondvarWait(frame_cv, lock, token,
+                                [this] { return images_drawn_into == 0; });
+            if (token.stop_requested()) {
+                return false;
+            }
+            free_queue = {};
+            present_queue = {};
+            images_held = 0;
+        }
+        frame_cv.notify_all();
+        {
+            std::scoped_lock lock{scheduler.submit_mutex, scheduler.present_mutex};
+            graphics_queue.waitIdle();
+            if (instance.HasSeparatePresentQueue()) {
+                instance.GetPresentQueue().waitIdle();
+            }
+            DestroyImageFrames();
+            swapchain.Create(emu_window.GetFramebufferLayout().width,
+                             emu_window.GetFramebufferLayout().height, surface, low_refresh_rate);
+            if (!swapchain.NeedsRecreation()) {
+                MakeImageFrames();
+            }
+        }
+        // (The surface may have gone again meanwhile)
+        new_surface = true;
+    } while (swapchain.NeedsRecreation());
+    UpdateDisplay();
+    {
+        std::scoped_lock lock{queue_mutex};
+        surface_lost = false;
+    }
+    return true;
+}
+
+void PresentWindow::Show(Frame* frame) {
+    CITRA_TRACE_SCOPE("Vulkan::Show");
+    {
+        std::scoped_lock surface_lock{recreate_surface_mutex};
+        Common::Hitches::NotePresentQueued(frame->present_id, frame->game_frame, frame->submitted,
+                                           frame->desired_time);
+        if (is_main_window) {
+            pacer.NoteQueued(frame->present_id, std::chrono::steady_clock::now());
+        }
+        // Handing the image to the display blocks until the display has taken the one before it.
+        // On a queue of its own that holds up nobody (see CopyToSwapchain).
+        const bool own_queue = instance.HasSeparatePresentQueue();
+        std::scoped_lock queue_lock{own_queue ? scheduler.present_mutex : scheduler.submit_mutex};
+        swapchain.Present(frame->image_index, frame->render_ready, frame->present_id,
+                          frame->desired_time);
+    }
+    if (frame->present_id != 0) {
+        std::scoped_lock surface_lock{recreate_surface_mutex};
+        for (const vk::PastPresentationTimingGOOGLE& timing : swapchain.TakePresentTimings()) {
+            pacer.NoteDisplayed(timing.presentID, timing.actualPresentTime,
+                                static_cast<s64>(timing.presentMargin));
+            Common::Hitches::NotePresentShown(timing.presentID, timing.actualPresentTime,
+                                              timing.presentMargin);
+        }
     }
 }
 
@@ -453,6 +771,11 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         legacy_present_mode = legacy_mode;
         recreate_swapchain(false);
     }
+#ifdef ANDROID
+    if (swapchain.IsOutputOutdated()) [[unlikely]] {
+        recreate_swapchain(false);
+    }
+#endif
 
 #ifndef ANDROID
     const bool use_vsync = Settings::values.use_vsync.GetValue();
@@ -477,6 +800,7 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
     const vk::CommandBuffer cmdbuf = frame->cmdbuf;
     cmdbuf.begin(begin_info);
 
+    copy_meter.Begin(cmdbuf);
     const vk::Extent2D extent = swapchain.GetExtent();
     const std::array pre_barriers{
         vk::ImageMemoryBarrier{
@@ -548,6 +872,7 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
     cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                            vk::PipelineStageFlagBits::eAllCommands,
                            vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+    copy_meter.End(cmdbuf, 0);
 
     cmdbuf.end();
 
@@ -615,10 +940,13 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
     }
 }
 
-vk::RenderPass PresentWindow::CreateRenderpass() {
+vk::RenderPass PresentWindow::CreateRenderpass(vk::AttachmentLoadOp load_op,
+                                               vk::ImageLayout final_layout) {
     const vk::AttachmentReference color_ref = {
         .attachment = 0,
-        .layout = vk::ImageLayout::eGeneral,
+        .layout = final_layout == vk::ImageLayout::ePresentSrcKHR
+                      ? vk::ImageLayout::eColorAttachmentOptimal
+                      : vk::ImageLayout::eGeneral,
     };
 
     const vk::SubpassDescription subpass = {
@@ -633,21 +961,34 @@ vk::RenderPass PresentWindow::CreateRenderpass() {
 
     const vk::AttachmentDescription color_attachment = {
         .format = swapchain.GetSurfaceFormat().format,
-        .loadOp = vk::AttachmentLoadOp::eClear,
+        .loadOp = load_op,
         .storeOp = vk::AttachmentStoreOp::eStore,
         .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
         .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
         .initialLayout = vk::ImageLayout::eUndefined,
-        .finalLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .finalLayout = final_layout,
     };
+
+    // An image of the swapchain is the one to draw into from when its semaphore was waited for, which
+    // is at this stage
+    const vk::SubpassDependency from_acquire = {
+        .srcSubpass = VK_SUBPASS_EXTERNAL,
+        .dstSubpass = 0,
+        .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        .dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        .srcAccessMask = vk::AccessFlagBits::eNone,
+        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite |
+                         vk::AccessFlagBits::eColorAttachmentRead,
+    };
+    const bool direct = final_layout == vk::ImageLayout::ePresentSrcKHR;
 
     const vk::RenderPassCreateInfo renderpass_info = {
         .attachmentCount = 1,
         .pAttachments = &color_attachment,
         .subpassCount = 1,
         .pSubpasses = &subpass,
-        .dependencyCount = 0,
-        .pDependencies = nullptr,
+        .dependencyCount = direct ? 1u : 0u,
+        .pDependencies = direct ? &from_acquire : nullptr,
     };
 
     return instance.GetDevice().createRenderPass(renderpass_info);

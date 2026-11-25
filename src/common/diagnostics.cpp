@@ -53,18 +53,26 @@ bool frame_dumps_set = false;
 /// session and nothing set by hand, what each rule is worth on that device in that scene.
 enum class Phase : u32 {
     AsBuilt,
-    OldDepthPath,
-    ClockAtConsole,
     AllDirect,
+    AllTiled,
+    HalfOutput,
+    NoUpscaling,
+    ScreensBlended,
+    OldDepthPath,
     VertexDataCopied,
+    ClockAtConsole,
     Count,
 };
 constexpr std::array<const char*, static_cast<std::size_t>(Phase::Count)> PHASE_NAMES{
     "as built",
-    "the depth buffer loaded as before",
-    "the processor clock not below the console's",
     "the driver renders every pass directly",
+    "the driver renders every pass in tiles",
+    "half of the output resolution",
+    "the screens not upscaled but filtered",
+    "the screens drawn with blending and a full clear",
+    "the depth buffer loaded as before",
     "vertex data copied for every draw",
+    "the processor clock not below the console's",
 };
 constexpr std::chrono::seconds AS_BUILT_TIME{30};
 constexpr std::chrono::seconds OTHER_PHASE_TIME{15};
@@ -82,6 +90,9 @@ struct Comparison {
     u32 window_vblanks = 0;
     u32 slow_windows = 0;
     std::atomic<u32> bits{0};
+    std::atomic<u32> bits4{0};
+    std::atomic_bool half_output{false};
+    std::atomic_bool no_upscaling{false};
 };
 Comparison comparison;
 
@@ -400,8 +411,13 @@ void EnterPhase(Phase phase, std::chrono::steady_clock::time_point now) {
         bits = Common::TraceMarkers::CopiedVertexData;
     }
     comparison.bits.store(bits, std::memory_order_relaxed);
+    comparison.bits4.store(
+        phase == Phase::ScreensBlended ? Common::TraceMarkers::LegacyScreenBlending : 0,
+        std::memory_order_relaxed);
+    comparison.half_output.store(phase == Phase::HalfOutput, std::memory_order_relaxed);
+    comparison.no_upscaling.store(phase == Phase::NoUpscaling, std::memory_order_relaxed);
     if (control_page) {
-        control_page[0] = phase == Phase::AllDirect ? 1 : 0;
+        control_page[0] = phase == Phase::AllDirect ? 1 : phase == Phase::AllTiled ? 2 : 0;
     }
     if (phase == Phase::AsBuilt) {
         // A game has to be slow anew for the next round
@@ -433,7 +449,7 @@ void OnVBlank() {
         // The comparison is for a game that runs below its speed. One at its speed stays as
         // built: nothing is to be learnt from slowing it, and nobody is to be bothered.
         if (in_phase >= AS_BUILT_TIME && comparison.slow_windows >= SLOW_WINDOWS) {
-            EnterPhase(Phase::OldDepthPath, now);
+            EnterPhase(static_cast<Phase>(static_cast<u32>(Phase::AsBuilt) + 1), now);
         }
     } else if (in_phase >= OTHER_PHASE_TIME) {
         const u32 next = (static_cast<u32>(comparison.phase) + 1) % static_cast<u32>(Phase::Count);
@@ -452,6 +468,18 @@ void OnGameStart() {
 
 u32 ComparisonBits() {
     return comparison.bits.load(std::memory_order_relaxed);
+}
+
+u32 ComparisonBits4() {
+    return comparison.bits4.load(std::memory_order_relaxed);
+}
+
+bool ComparesHalfOutput() {
+    return comparison.half_output.load(std::memory_order_relaxed);
+}
+
+bool ComparesWithoutUpscaling() {
+    return comparison.no_upscaling.load(std::memory_order_relaxed);
 }
 
 void PrepareDriverEnvironment() {
@@ -614,6 +642,18 @@ void OnGameStart() {}
 
 u32 ComparisonBits() {
     return 0;
+}
+
+u32 ComparisonBits4() {
+    return 0;
+}
+
+bool ComparesHalfOutput() {
+    return false;
+}
+
+bool ComparesWithoutUpscaling() {
+    return false;
 }
 
 const std::vector<u32>& FrameDumpTimes() {

@@ -1053,6 +1053,33 @@ class SettingsFragmentPresenter(
             add(
                 SwitchSetting(
                     editingSettings,
+                    BooleanSetting.SCREEN_UPSCALING_BOTTOM,
+                    R.string.screen_upscaling_bottom,
+                    R.string.screen_upscaling_bottom_description,
+                    BooleanSetting.SCREEN_UPSCALING_BOTTOM.key,
+                    BooleanSetting.SCREEN_UPSCALING_BOTTOM.defaultValue,
+                    isEnabled =
+                        editingSettings.get(IntSetting.GRAPHICS_API) == GraphicsAPI.VULKAN.int
+                )
+            )
+            add(
+                SliderSetting(
+                    editingSettings,
+                    IntSetting.OUTPUT_RESOLUTION,
+                    R.string.output_resolution,
+                    R.string.output_resolution_description,
+                    30,
+                    100,
+                    "%",
+                    IntSetting.OUTPUT_RESOLUTION.key,
+                    IntSetting.OUTPUT_RESOLUTION.defaultValue.toFloat(),
+                    isEnabled =
+                        editingSettings.get(IntSetting.GRAPHICS_API) == GraphicsAPI.VULKAN.int
+                )
+            )
+            add(
+                SwitchSetting(
+                    editingSettings,
                     BooleanSetting.SHADERS_ACCURATE_MUL,
                     R.string.shaders_accurate_mul,
                     R.string.shaders_accurate_mul_description,

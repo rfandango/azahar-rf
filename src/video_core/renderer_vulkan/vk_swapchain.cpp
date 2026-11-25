@@ -6,6 +6,7 @@
 #include <array>
 #include <limits>
 #include <utility>
+#include "common/diagnostics.h"
 #include "common/hitch_tracker.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
@@ -18,6 +19,25 @@ MICROPROFILE_DEFINE(Vulkan_Acquire, "Vulkan", "Swapchain Acquire", MP_RGB(185, 6
 MICROPROFILE_DEFINE(Vulkan_Present, "Vulkan", "Swapchain Present", MP_RGB(66, 185, 245));
 
 namespace Vulkan {
+
+namespace {
+
+/// The share of the display's lines and columns to be drawn
+u32 WantedOutputPercent() {
+#ifdef ANDROID
+    return Common::Diagnostics::ComparesHalfOutput()
+               ? 50
+               : Settings::values.output_resolution.GetValue();
+#else
+    return 100;
+#endif
+}
+
+} // Anonymous namespace
+
+bool Swapchain::IsOutputOutdated() const {
+    return output_percent != WantedOutputPercent();
+}
 
 Swapchain::Swapchain(const Instance& instance_, u32 width, u32 height, vk::SurfaceKHR surface_,
                      bool low_refresh_rate)
@@ -134,7 +154,42 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
+std::optional<u32> Swapchain::Acquire(vk::Semaphore semaphore,
+                                      std::chrono::nanoseconds timeout) {
+    if (needs_recreation) {
+        return std::nullopt;
+    }
+
+    MICROPROFILE_SCOPE(Vulkan_Acquire);
+    CITRA_TRACE_SCOPE("vkAcquireNextImageKHR");
+    u32 image{};
+    const vk::Result result = instance.GetDevice().acquireNextImageKHR(
+        swapchain, static_cast<u64>(timeout.count()), semaphore, VK_NULL_HANDLE, &image);
+    switch (result) {
+    case vk::Result::eSuccess:
+    case vk::Result::eSuboptimalKHR:
+        // (An image that only suits the display less well is an image)
+        return image;
+    case vk::Result::eTimeout:
+    case vk::Result::eNotReady:
+        return std::nullopt;
+    case vk::Result::eErrorSurfaceLostKHR:
+    case vk::Result::eErrorOutOfDateKHR:
+        needs_recreation = true;
+        return std::nullopt;
+    default:
+        LOG_CRITICAL(Render_Vulkan, "Swapchain acquire returned unknown result {}", result);
+        needs_recreation = true;
+        return std::nullopt;
+    }
+}
+
 void Swapchain::Present(u32 present_id, u64 desired_time) {
+    Present(image_index, present_ready[image_index], present_id, desired_time);
+    frame_index = (frame_index + 1) % image_count;
+}
+
+void Swapchain::Present(u32 image, vk::Semaphore ready, u32 present_id, u64 desired_time) {
     // Have the display record when it shows the image, and show it at the time asked for
     const vk::PresentTimeGOOGLE present_time = {
         .presentID = present_id,
@@ -149,10 +204,10 @@ void Swapchain::Present(u32 present_id, u64 desired_time) {
     const vk::PresentInfoKHR present_info = {
         .pNext = timed ? &present_times : nullptr,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &present_ready[image_index],
+        .pWaitSemaphores = &ready,
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
-        .pImageIndices = &image_index,
+        .pImageIndices = &image,
     };
 
     MICROPROFILE_SCOPE(Vulkan_Present);
@@ -169,8 +224,6 @@ void Swapchain::Present(u32 present_id, u64 desired_time) {
         LOG_CRITICAL(Render_Vulkan, "Swapchain presentation failed {}", err.what());
         UNREACHABLE();
     }
-
-    frame_index = (frame_index + 1) % image_count;
 }
 
 std::span<const vk::PastPresentationTimingGOOGLE> Swapchain::TakePresentTimings() {
@@ -317,6 +370,19 @@ void Swapchain::SetSurfaceProperties() {
     } else if (!(capabilities.supportedTransforms & transform)) {
         transform = capabilities.currentTransform;
     }
+    // Android shows an image of another size than its surface's enlarged to that, where it can with the
+    // scaler of the display's hardware
+    output_percent = WantedOutputPercent();
+    if (output_percent < 100) {
+        const auto reduce = [&](u32 size, u32 lowest, u32 highest) {
+            const u32 reduced = std::max((size * output_percent / 100) & ~1u, 2u);
+            return std::clamp(reduced, lowest, highest);
+        };
+        extent.width = reduce(extent.width, capabilities.minImageExtent.width,
+                              capabilities.maxImageExtent.width);
+        extent.height = reduce(extent.height, capabilities.minImageExtent.height,
+                               capabilities.maxImageExtent.height);
+    }
     LOG_INFO(Render_Vulkan,
              "Swapchain: the surface is {}x{} and its transform {}; images of {}x{}, what is "
              "drawn into them turned by {} degrees",
@@ -337,12 +403,16 @@ void Swapchain::Destroy() {
         device.destroySwapchainKHR(swapchain);
         swapchain = VK_NULL_HANDLE;
     }
-    for (u32 i = 0; i < image_count; i++) {
-        device.destroySemaphore(image_acquired[i]);
-        device.destroySemaphore(present_ready[i]);
+    // (As many as there are: none, where the swapchain could not be made after the last time)
+    for (const vk::Semaphore semaphore : image_acquired) {
+        device.destroySemaphore(semaphore);
+    }
+    for (const vk::Semaphore semaphore : present_ready) {
+        device.destroySemaphore(semaphore);
     }
     image_acquired.clear();
     present_ready.clear();
+    images.clear();
 }
 
 void Swapchain::RefreshSemaphores() {

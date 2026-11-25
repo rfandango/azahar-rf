@@ -235,6 +235,8 @@ void Config::ReadValues() {
     ReadSetting("Renderer", Settings::values.filter_mode);
     ReadSetting("Renderer", Settings::values.screen_upscaling);
     ReadSetting("Renderer", Settings::values.screen_upscaling_sharpness);
+    ReadSetting("Renderer", Settings::values.screen_upscaling_bottom);
+    ReadSetting("Renderer", Settings::values.output_resolution);
     ReadSetting("Renderer", Settings::values.use_integer_scaling);
 
     ReadSetting("Renderer", Settings::values.bg_red);

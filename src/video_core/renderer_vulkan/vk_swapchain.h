@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
 #include "common/common_types.h"
@@ -28,6 +29,22 @@ public:
 
     /// Acquires the next image in the swapchain.
     bool AcquireNextImage();
+
+    /// Acquires an image, which is free to be drawn into once the semaphore is signalled, and says
+    /// which. Nothing if none came free in that time, or if the swapchain has to be made anew
+    /// (NeedsRecreation).
+    std::optional<u32> Acquire(vk::Semaphore semaphore, std::chrono::nanoseconds timeout);
+
+    /// Presents that image once `ready` is signalled, otherwise as the function below
+    void Present(u32 image, vk::Semaphore ready, u32 present_id, u64 desired_time);
+
+    /// Whether it was made for another output resolution than the settings ask for by now
+    bool IsOutputOutdated() const;
+
+    /// Whether the swapchain cannot be used any more and has to be made anew
+    bool NeedsRecreation() const {
+        return needs_recreation;
+    }
 
     /// Presents the current image and move to the next one. A present_id other than zero asks
     /// the display, where it can tell, when the image reached it: see TakePresentTimings. A
@@ -71,6 +88,10 @@ public:
 
     vk::Image Image() const {
         return images[image_index];
+    }
+
+    std::span<const vk::Image> Images() const {
+        return images;
     }
 
     vk::SurfaceFormatKHR GetSurfaceFormat() const {
@@ -142,6 +163,7 @@ private:
     vk::Extent2D extent;
     vk::SurfaceTransformFlagBitsKHR transform;
     u32 pre_rotation{};
+    u32 output_percent = 100;
     vk::CompositeAlphaFlagBitsKHR composite_alpha;
     std::vector<vk::Image> images;
     std::vector<vk::Semaphore> image_acquired;

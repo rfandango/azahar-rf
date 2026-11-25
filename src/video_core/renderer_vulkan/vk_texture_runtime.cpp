@@ -1073,6 +1073,18 @@ void TextureRuntime::NoteSurfaceRemoved(Surface& surface) {
     }
 }
 
+bool TextureRuntime::MayTakeOverNow(const Surface& surface) const {
+    if ((Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacySurfaceReuse) != 0 ||
+        surface.type == VideoCore::SurfaceType::Texture || surface.IsCustom()) {
+        return false;
+    }
+    const u64 serial = surface.SerialIfAny();
+    return serial == 0 ||
+           std::ranges::none_of(pending_blits, [serial](const PendingBlit& pending) {
+               return pending.src_serial == serial;
+           });
+}
+
 bool TextureRuntime::StillNeeded(Surface& surface) {
     const u64 serial = surface.SerialIfAny();
     if (serial == 0) {

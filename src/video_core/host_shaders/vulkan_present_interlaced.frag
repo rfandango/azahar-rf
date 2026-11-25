@@ -11,10 +11,10 @@ layout (location = 0) out vec4 color;
 layout (push_constant, std140) uniform DrawInfo {
     mat4 modelview_matrix;
     vec4 screen_area;
-    vec4 o_resolution;
+    vec4 image_size;
     int screen_id_l;
     int screen_id_r;
-    int layer;
+    float output_rows;
     int reverse_interlaced;
 };
 
@@ -36,7 +36,7 @@ vec4 GetScreen(int screen_id) {
 }
 
 void main() {
-    float screen_row = o_resolution.x * frag_tex_coord.x;
+    float screen_row = output_rows * frag_tex_coord.x;
     if (int(screen_row) % 2 == reverse_interlaced)
         color = GetScreen(screen_id_l);
     else

@@ -106,6 +106,8 @@ foreach(KEY IN ITEMS
     "filter_mode"
     "screen_upscaling"
     "screen_upscaling_sharpness"
+    "screen_upscaling_bottom"
+    "output_resolution"
     "pp_shader_name"
     "anaglyph_shader_name"
     "dump_textures"

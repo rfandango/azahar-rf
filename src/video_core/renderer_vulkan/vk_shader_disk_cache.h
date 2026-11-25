@@ -324,6 +324,14 @@ private:
 
     bool RecreateCache(CacheFile& file, CacheFileType type);
 
+    /// Puts the file that was made anew in the place of the old one, once it is written out in full
+    void ReplaceCache(CacheFile& old_file, std::unique_ptr<CacheFile>& new_file,
+                      const std::string& new_path, const std::string& path);
+
+    /// Takes up a file that was made anew where that was cut short between the old one being deleted
+    /// and the new one taking its name
+    void RecoverCache(const std::string& new_path, const std::string& path);
+
     bool InitVSCache(const std::atomic_bool& stop_loading,
                      const VideoCore::DiskResourceLoadCallback& callback);
 

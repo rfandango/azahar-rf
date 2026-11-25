@@ -58,11 +58,12 @@ const std::vector<u32>& FrameDumpTimes();
 bool AutomaticFrameDumps();
 
 /// Called at every emulated VBlank. Runs the build's own comparison: while a game is below
-/// its speed it runs in turns as built (30 s) and, 15 s each, with the depth buffer loaded as
-/// before, with the processor clock held at the console's, with the driver asked to render
-/// every pass directly, and with vertex data copied for every draw. Each turn is said in the
-/// log, so the summaries beside it show what
-/// each is worth in that scene on that device. A game at its speed is left as built.
+/// its speed it runs in turns as built (30 s) and, 15 s each, with the driver asked to render
+/// every pass directly or every pass in tiles, with half of the output resolution, with the
+/// screens not upscaled, with them drawn as before, with the depth buffer loaded as before, with
+/// vertex data copied for every draw, and with the processor clock held at the console's. Each
+/// turn is said in the log, so the summaries beside it show what each is worth in that scene on
+/// that device. A game at its speed is left as built.
 /// `comparison=off` in the control file turns it off.
 void OnVBlank();
 
@@ -71,6 +72,11 @@ void OnGameStart();
 
 /// The bits of `debug.azahar.experiment3` the comparison turns on for the turn it is in
 u32 ComparisonBits();
+/// The same of the Experiment4 flags
+u32 ComparisonBits4();
+/// Whether the comparison has half of the output resolution drawn, and the screens not upscaled, for now
+bool ComparesHalfOutput();
+bool ComparesWithoutUpscaling();
 
 /// Describes the device in the log: model, system on a chip, the processor's cores and their
 /// clocks, memory, what the kernel says of the GPU

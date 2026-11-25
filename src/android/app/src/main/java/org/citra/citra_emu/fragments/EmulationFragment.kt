@@ -1140,12 +1140,26 @@ class EmulationFragment :
                     getString(R.string.screen_upscaling_sharpness_value, sharpness)
                 textSharpness.isEnabled = upscaling != values.first()
                 sliderSharpness.isEnabled = upscaling != values.first()
+                checkBottom.isEnabled = upscaling != values.first()
+                textOutput.text =
+                    getString(R.string.output_resolution_value, sliderOutput.value.toInt())
             }
 
             fun applyChoice() {
                 changed = true
                 update()
-                screenAdjustmentUtil.changeScreenUpscaling(upscaling, sliderSharpness.value.toInt())
+                screenAdjustmentUtil.changeScreenUpscaling(
+                    upscaling,
+                    sliderSharpness.value.toInt(),
+                    checkBottom.isChecked,
+                    sliderOutput.value.toInt()
+                )
+            }
+
+            // (A slider only takes values that are on its steps)
+            fun Slider.setNearest(value: Int) {
+                val steps = ((value - valueFrom) / stepSize).roundToInt()
+                this.value = (valueFrom + steps * stepSize).coerceIn(valueFrom, valueTo)
             }
 
             names.forEachIndexed { index, name ->
@@ -1156,15 +1170,16 @@ class EmulationFragment :
                 }
                 upscalers.addView(
                     button,
-                    RadioGroup.LayoutParams(0, RadioGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    RadioGroup.LayoutParams(
+                        RadioGroup.LayoutParams.WRAP_CONTENT,
+                        RadioGroup.LayoutParams.WRAP_CONTENT,
+                        1f
+                    )
                 )
             }
-            // (The slider only takes values that are on its steps)
-            val sharpness = activeSettings.get(IntSetting.SCREEN_UPSCALING_SHARPNESS)
-                .toFloat()
-                .coerceIn(sliderSharpness.valueFrom, sliderSharpness.valueTo)
-            sliderSharpness.value =
-                (sharpness / sliderSharpness.stepSize).roundToInt() * sliderSharpness.stepSize
+            sliderSharpness.setNearest(activeSettings.get(IntSetting.SCREEN_UPSCALING_SHARPNESS))
+            sliderOutput.setNearest(activeSettings.get(IntSetting.OUTPUT_RESOLUTION))
+            checkBottom.isChecked = activeSettings.get(BooleanSetting.SCREEN_UPSCALING_BOTTOM)
             update()
 
             upscalers.setOnCheckedChangeListener { group, checkedId ->
@@ -1172,6 +1187,8 @@ class EmulationFragment :
                 applyChoice()
             }
             sliderSharpness.addOnChangeListener { _, _, _ -> applyChoice() }
+            sliderOutput.addOnChangeListener { _, _, _ -> applyChoice() }
+            checkBottom.setOnCheckedChangeListener { _, _ -> applyChoice() }
         }
 
         binding.drawerLayout.close()

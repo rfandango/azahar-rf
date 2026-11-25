@@ -114,6 +114,8 @@ void LogSettings() {
     log_setting("Renderer_FilterMode", values.filter_mode.GetValue());
     log_setting("Renderer_ScreenUpscaling", values.screen_upscaling.GetValue());
     log_setting("Renderer_ScreenUpscalingSharpness", values.screen_upscaling_sharpness.GetValue());
+    log_setting("Renderer_ScreenUpscalingBottom", values.screen_upscaling_bottom.GetValue());
+    log_setting("Renderer_OutputResolution", values.output_resolution.GetValue());
     log_setting("Renderer_TextureFilter", GetTextureFilterName(values.texture_filter.GetValue()));
     log_setting("Renderer_TextureSampling",
                 GetTextureSamplingName(values.texture_sampling.GetValue()));
@@ -132,6 +134,8 @@ void LogSettings() {
     log_setting("Layout_LayoutOption", values.layout_option.GetValue());
     log_setting("Layout_PortraitLayoutOption", values.portrait_layout_option.GetValue());
     log_setting("Layout_SecondaryDisplayLayout", values.secondary_display_layout.GetValue());
+    log_setting("Layout_AspectRatio", values.aspect_ratio.GetValue());
+    log_setting("Layout_WideTopScreen", values.wide_top_screen.GetValue());
     log_setting("Layout_SwapScreen", values.swap_screen.GetValue());
     log_setting("Layout_UprightScreen", values.upright_screen.GetValue());
     log_setting("Layout_ScreenGap", values.screen_gap.GetValue());
@@ -255,6 +259,8 @@ void RestoreGlobalState(bool is_powered_on) {
     values.filter_mode.SetGlobal(true);
     values.screen_upscaling.SetGlobal(true);
     values.screen_upscaling_sharpness.SetGlobal(true);
+    values.screen_upscaling_bottom.SetGlobal(true);
+    values.output_resolution.SetGlobal(true);
     values.pp_shader_name.SetGlobal(true);
     values.anaglyph_shader_name.SetGlobal(true);
     values.dump_textures.SetGlobal(true);

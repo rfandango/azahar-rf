@@ -85,8 +85,9 @@ enum class IntSetting(
     SCREEN_UPSCALING_SHARPNESS(
         SettingKeys.screen_upscaling_sharpness(),
         CitraSettings.SECTION_RENDERER,
-        200
+        100
     ),
+    OUTPUT_RESOLUTION(SettingKeys.output_resolution(), CitraSettings.SECTION_RENDERER, 100),
     DELAY_RENDER_THREAD_US(
         SettingKeys.delay_game_render_thread_us(),
         CitraSettings.SECTION_RENDERER,

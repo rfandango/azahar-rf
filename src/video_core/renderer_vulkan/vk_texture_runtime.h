@@ -231,6 +231,11 @@ public:
     /// Whether the images of a surface the cache is done with are still read: by a blit that
     /// waits, or by one the GPU may not have finished
     bool StillNeeded(Surface& surface);
+    /// Whether a surface the cache is done with may be used for another one although the GPU is
+    /// not through with what it was used for. What comes next is recorded behind that, into the
+    /// same queue and with the same barriers as for a target that is drawn to again without
+    /// having been given up. Not while a blit that waits has yet to read from it.
+    bool MayTakeOverNow(const Surface& surface) const;
     u64 NewSurfaceSerial() noexcept {
         return ++last_surface_serial;
     }

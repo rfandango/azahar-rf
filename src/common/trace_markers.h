@@ -378,6 +378,32 @@ enum Experiment3 : std::uint32_t {
     CpuVertexShading = 2147483648,
 };
 
+/// Yet more of them, read from the system property `debug.azahar.experiment4`: what is done to show
+/// the picture that was drawn.
+enum Experiment4 : std::uint32_t {
+    /// Vulkan: the screens are drawn into an image apart that is then copied into the one the
+    /// display shows, as before, and not straight into that one (Vulkan::PresentWindow). Read
+    /// when a window is made.
+    LegacyPresentCopy = 1,
+    /// Vulkan: every screen is drawn with blending, and over a frame that was cleared in all of
+    /// its area, as before, also one that covers what is below it
+    /// (Vulkan::RendererVulkan::DrawScreens).
+    LegacyScreenBlending = 2,
+    /// Vulkan: the GPU is sent what was recorded at the end of every command list, as before, and not
+    /// only where it is running out of work (Vulkan::RasterizerVulkan::SubmitPendingWork).
+    LegacyListSubmits = 8,
+    /// Vulkan: a render target that was given up is used for a new one only when the GPU is done
+    /// with all it was used for, as before (VideoCore::RasterizerCache::CreateSurface).
+    LegacySurfaceReuse = 16,
+    /// Code is translated when it is asked for and no sooner (Core::AheadTranslation). Read, like
+    /// the next one, when a game's recompiler is made: set before the game starts.
+    NoAheadTranslation = 64,
+    /// All of a game's code goes the long way through the recompiler, as before ARM code was
+    /// translated straight into the host's, a group of basic blocks at a time
+    /// (Dynarmic::A32::UserConfig::translate_directly).
+    LegacyTranslation = 128,
+};
+
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as
 /// "<milliseconds>/<every so many VBlanks>": "150/180" holds it up for 150 ms every three
 /// seconds, "12/1" makes a game that runs slow all the time. For seeing how what depends on
@@ -394,6 +420,8 @@ std::uint32_t Experiments();
 std::uint32_t Experiments2();
 /// Currently active Experiment3 flags.
 std::uint32_t Experiments3();
+/// Currently active Experiment4 flags.
+std::uint32_t Experiments4();
 /// The hold-up currently asked for.
 InjectedStall Stall();
 /// Emulated time the recompiled code has run for, all cores, since the start
@@ -407,6 +435,9 @@ constexpr std::uint32_t Experiments2() {
     return 0;
 }
 constexpr std::uint32_t Experiments3() {
+    return 0;
+}
+constexpr std::uint32_t Experiments4() {
     return 0;
 }
 constexpr InjectedStall Stall() {

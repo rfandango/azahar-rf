@@ -244,7 +244,12 @@ object NativeLibrary {
     /**
      * Sets how the screens are brought to the size they are shown in, from the next frame on.
      */
-    external fun setScreenUpscaling(upscaling: Int, sharpness: Int)
+    external fun setScreenUpscaling(
+        upscaling: Int,
+        sharpness: Int,
+        bottomScreen: Boolean,
+        outputResolution: Int
+    )
 
     /**
      * Opens Vulkan with the given driver in place of the system's, if there is one. With

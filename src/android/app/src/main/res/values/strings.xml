@@ -289,13 +289,20 @@
     <string name="async_shaders">Enable Asynchronous Shader Compilation</string>
     <string name="async_shaders_description">Compiles shaders in the background to reduce stuttering during gameplay. When enabled expect temporary graphical glitches</string>
     <string name="screen_upscaling">Screen Upscaling</string>
-    <string name="screen_upscaling_description">How the screens are brought to the size they are shown in, when the internal resolution is lower. SGSR is Snapdragon Game Super Resolution, with None it is left to Linear Filtering. Vulkan only.</string>
+    <string name="screen_upscaling_description">How the screens are brought to the size they are shown in, when the internal resolution is lower. Light costs the least, then Cubic, then SGSR (Snapdragon Game Super Resolution). With None it is left to Linear Filtering. Vulkan only.</string>
     <string name="screen_upscaling_filter">None</string>
+    <string name="screen_upscaling_light">Light</string>
+    <string name="screen_upscaling_cubic">Cubic</string>
     <string name="screen_upscaling_sgsr1" translatable="false">SGSR 1</string>
     <string name="screen_upscaling_sgsr1_edge" translatable="false">SGSR 1 Edge</string>
     <string name="screen_upscaling_sharpness">Upscaling Sharpness</string>
     <string name="screen_upscaling_sharpness_value">Upscaling Sharpness: %1$d%%</string>
-    <string name="screen_upscaling_sharpness_description">How much SGSR sharpens the picture it enlarges. Below 100% it makes it softer.</string>
+    <string name="screen_upscaling_sharpness_description">How much the upscaler sharpens the picture. Below 100% it makes it softer.</string>
+    <string name="screen_upscaling_bottom">Upscale the Bottom Screen</string>
+    <string name="screen_upscaling_bottom_description">Has the bottom screen upscaled as well, and not only the top screen.</string>
+    <string name="output_resolution">Output Resolution</string>
+    <string name="output_resolution_description">The share of the display\'s resolution that is drawn, the display scales it up. Lower is faster on weak graphics chips, also with no upscaling. Vulkan only.</string>
+    <string name="output_resolution_value">Output Resolution: %1$d%%</string>
     <string name="linear_filtering">Linear Filtering</string>
     <string name="linear_filtering_description">Enables linear filtering, which causes game visuals to appear smoother.</string>
     <string name="use_integer_scaling">Integer Scaling</string>

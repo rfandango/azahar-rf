@@ -120,6 +120,17 @@ void RasterizerCache<T>::TickFrame() {
     ServeLateReadbacks();
     custom_tex_manager.TickFrame();
     RunGarbageCollector();
+#ifdef CITRA_ENABLE_TRACE_MARKERS
+    if (late_frame % 300 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Surfaces in 300 VBlanks: {} taken over, {} of which the GPU was not through "
+                 "with, {} targets made new ({} of them while one like it was given up), {} given "
+                 "up and kept",
+                 taken_over + taken_over_early, taken_over_early, made_new, made_new_waiting,
+                 sentenced.size());
+        taken_over = taken_over_early = made_new = made_new_waiting = 0;
+    }
+#endif
 
     const auto new_filter = Settings::values.texture_filter.GetValue();
     if (filter != new_filter) [[unlikely]] {
@@ -2343,27 +2354,52 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
     surface_set_epoch++;
     const SurfaceId surface_id = [&] {
         const u64 resource_free_tick = runtime.GetResourceFreeTick();
-        // Try to find a matching texture in the deletion queue
-        const auto it = std::find_if(sentenced.begin(), sentenced.end(), [&](const auto& entry) {
+        const auto matches = [&](const auto& entry) {
             const Surface& candidate = slot_surfaces[entry.surface_id];
             return
-                // Only recycle the texture if:
-                // The texture-runtime is completely done with it
-                (resource_free_tick > entry.last_used_tick)
                 // The surface parameters match the incoming texture
-                && (candidate == params)
+                (candidate == params)
                 // Its resolution scale is equal or less than the incoming texture
                 && (candidate.res_scale <= params.res_scale) &&
                 (candidate.half_scale_x == params.half_scale_x) &&
                 (candidate.half_scale_y == params.half_scale_y)
                 // Its sample count is equal or less than the incoming texture
                 && (candidate.sample_count <= params.sample_count);
+        };
+        // Try to find a matching texture in the deletion queue that the texture-runtime is
+        // completely done with
+        auto it = std::find_if(sentenced.begin(), sentenced.end(), [&](const auto& entry) {
+            return resource_free_tick > entry.last_used_tick && matches(entry);
         });
+        // Otherwise the one that was given up first, and has exactly the images that are needed,
+        // although the GPU is not through with it. A game that fills its targets' memory gives
+        // each of them up every frame, and a GPU that is kept busy is through with nothing of
+        // that for a frame or two: at a high resolution a new image for every target of those
+        // frames was hundreds of megabytes.
+        if (it == sentenced.end()) {
+            it = std::find_if(sentenced.begin(), sentenced.end(), [&](const auto& entry) {
+                const Surface& candidate = slot_surfaces[entry.surface_id];
+                return matches(entry) && candidate.res_scale == params.res_scale &&
+                       candidate.sample_count == params.sample_count &&
+                       runtime.MayTakeOverNow(candidate);
+            });
+            if (it != sentenced.end()) {
+                taken_over_early++;
+            }
+        } else {
+            taken_over++;
+        }
         // If a matching texture was found in the deletion queue, recycle it.
         if (it != sentenced.end()) {
             const SurfaceId surface_id = it->surface_id;
             sentenced.erase(it);
             return surface_id;
+        }
+        if (params.type != SurfaceType::Texture) {
+            made_new++;
+            if (std::ranges::any_of(sentenced, matches)) {
+                made_new_waiting++;
+            }
         }
         return slot_surfaces.insert(runtime, params, initial_flags);
     }();

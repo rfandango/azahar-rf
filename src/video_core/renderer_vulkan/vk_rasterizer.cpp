@@ -1396,6 +1396,15 @@ void RasterizerVulkan::FlushAll() {
 }
 
 void RasterizerVulkan::SubmitPendingWork() {
+    // For the GPU to have something to do early, and something more when that is done. While it
+    // has both, what is recorded by now is kept, and what comes next for the same target goes on
+    // in the render pass that is open. A submission ends the pass, and the one after it has to
+    // load all that was stored. A game that draws its scene with a dozen command lists and more,
+    // one after the other, paid that for each of them.
+    if ((Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyListSubmits) == 0 &&
+        (!scheduler.HasUnsentWork() || !scheduler.IsGpuRunningOut())) {
+        return;
+    }
     scheduler.Flush();
 }
 

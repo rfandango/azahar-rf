@@ -335,12 +335,16 @@
 
     <string-array name="screenUpscalingNames">
         <item>@string/screen_upscaling_filter</item>
+        <item>@string/screen_upscaling_light</item>
+        <item>@string/screen_upscaling_cubic</item>
         <item>@string/screen_upscaling_sgsr1</item>
         <item>@string/screen_upscaling_sgsr1_edge</item>
     </string-array>
 
     <integer-array name="screenUpscalingValues">
         <item>0</item>
+        <item>3</item>
+        <item>4</item>
         <item>1</item>
         <item>2</item>
     </integer-array>
