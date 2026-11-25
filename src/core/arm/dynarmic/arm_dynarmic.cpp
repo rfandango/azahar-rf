@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <csignal>
@@ -16,6 +17,10 @@
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/trace_markers.h"
+#include "common/arch.h"
+#if CITRA_ARCH(arm64)
+#include "core/arm/dynarmic/ahead_translation.h"
+#endif
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_cp15.h"
 #include "core/arm/dynarmic/arm_exclusive_monitor.h"
@@ -51,6 +56,26 @@ public:
 
     std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) override {
         return memory.Read32OrNullopt(vaddr);
+    }
+
+    bool MemoryHoldsCode(VAddr vaddr, const std::uint32_t* words, std::size_t count) override {
+        auto& pointers = parent.current_page_table->GetPointerArray();
+        while (count != 0) {
+            const u32 offset = vaddr & Memory::CITRA_PAGE_MASK;
+            const std::size_t here =
+                std::min<std::size_t>(count, (Memory::CITRA_PAGE_SIZE - offset) / 4);
+            if (const u8* const page = pointers[vaddr >> Memory::CITRA_PAGE_BITS]) {
+                if (std::memcmp(page + offset, words, here * 4) != 0) {
+                    return false;
+                }
+            } else if (!UserCallbacks::MemoryHoldsCode(vaddr, words, here)) {
+                return false;
+            }
+            vaddr += static_cast<u32>(here * 4);
+            words += here;
+            count -= here;
+        }
+        return true;
     }
 
     std::uint8_t MemoryRead8(VAddr vaddr) override {
@@ -89,7 +114,8 @@ public:
         if (!parent.fold_read_only_loads) {
             return false;
         }
-        const std::shared_ptr<Kernel::Process> process = parent.system.Kernel().GetCurrentProcess();
+        const std::shared_ptr<Kernel::Process>& process =
+            parent.system.Kernel().GetCurrentProcess();
         if (!process) {
             return false;
         }
@@ -197,6 +223,14 @@ public:
             Core::LogException(parent.system, exc_type);
         }
     }
+
+#if CITRA_ARCH(arm64)
+    void TranslatedOnDemand(std::uint64_t location) override {
+        if (AheadTranslation* const ahead = parent.system.GetAheadTranslation()) {
+            ahead->NoteOnDemand(location, parent.system.Kernel().GetCurrentProcess().get());
+        }
+    }
+#endif
 
     void AddTicks(std::uint64_t ticks) override {
         Common::TraceMarkers::NoteGuestTicks(ticks);
@@ -437,6 +471,25 @@ void ARM_Dynarmic::DumpBlockLocations(std::FILE* out) const {
     }
 }
 
+void ARM_Dynarmic::DumpRecompiledCode(std::FILE* out) const {
+    const auto write = [out](const auto& value) { std::fwrite(&value, sizeof(value), 1, out); };
+    for (const auto& [page_table, table_jit] : jits) {
+        for (const Dynarmic::A32::Jit::BlockLocation& block : table_jit->GetBlockLocations()) {
+            write(u32{0x4B4C4252}); // "RBLK"
+            write(static_cast<u32>(GetID()));
+            write(static_cast<u64>(block.host_address));
+            write(static_cast<u64>(block.location));
+            write(static_cast<u32>(block.host_size));
+            write(static_cast<u32>(block.instruction_offsets.size()));
+            for (const auto& [offset, pc] : block.instruction_offsets) {
+                write(static_cast<u32>(offset));
+                write(static_cast<u32>(pc));
+            }
+            std::fwrite(reinterpret_cast<const void*>(block.host_address), 1, block.host_size, out);
+        }
+    }
+}
+
 void ARM_Dynarmic::ClearExclusiveState() {
     jit->ClearExclusiveState();
 }
@@ -501,6 +554,8 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
         // for that access
         if (u8* const view = current_page_table->pointers.HostView()) {
             config.fastmem_pointer = reinterpret_cast<std::uintptr_t>(view);
+            config.fastmem_guard_size = current_page_table->pointers.HostViewGuard();
+            config.page_access = current_page_table->pointers.HostViewAccess();
         }
     }
     config.coprocessors[15] = std::make_shared<DynarmicCP15>(cp15_state);
@@ -540,6 +595,15 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
     config.fold_read_only_loads = fold_read_only_loads;
     config.share_host_addresses =
         (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ShareHostAddresses) != 0;
+
+#if CITRA_ARCH(arm64) && defined(__linux__)
+    config.translate_directly =
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyTranslation) == 0;
+    if (AheadTranslation* const ahead = system.GetAheadTranslation();
+        ahead && config.translate_directly) {
+        config.translated_ahead = &ahead->Translated();
+    }
+#endif
 
     // Multi-process state
     config.processor_id = GetID();

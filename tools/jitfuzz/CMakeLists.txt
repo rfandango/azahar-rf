@@ -37,3 +37,25 @@ target_include_directories(jitfuzz PRIVATE
 )
 target_link_libraries(jitfuzz PRIVATE dynarmic fmt::fmt merry::mcl)
 target_link_options(jitfuzz PRIVATE -static-libstdc++)
+
+# What the direct translator makes of a program's code
+add_executable(directdump directdump.cpp)
+target_include_directories(directdump PRIVATE
+    "${AZAHAR_ROOT}/externals/dynarmic/src"
+    "${AZAHAR_ROOT}/externals/dynarmic/externals/oaknut/include"
+    "${AZAHAR_ROOT}/externals/dynarmic/externals/robin-map/include"
+    "${AZAHAR_ROOT}/externals/boost"
+)
+target_link_libraries(directdump PRIVATE dynarmic fmt::fmt merry::mcl)
+target_link_options(directdump PRIVATE -static-libstdc++)
+
+# How long the direct translator takes
+add_executable(directbench directbench.cpp)
+target_include_directories(directbench PRIVATE
+    "${AZAHAR_ROOT}/externals/dynarmic/src"
+    "${AZAHAR_ROOT}/externals/dynarmic/externals/oaknut/include"
+    "${AZAHAR_ROOT}/externals/dynarmic/externals/robin-map/include"
+    "${AZAHAR_ROOT}/externals/boost"
+)
+target_link_libraries(directbench PRIVATE dynarmic fmt::fmt merry::mcl)
+target_link_options(directbench PRIVATE -static-libstdc++)

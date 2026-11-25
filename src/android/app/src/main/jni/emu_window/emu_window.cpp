@@ -215,6 +215,13 @@ void PollBlockDumpRequest() {
         system.GetCore(core).DumpBlockLocations(out);
     }
     std::fclose(out);
+    const std::string code_path = dir + "/recompiler-code.bin";
+    if (std::FILE* const code = std::fopen(code_path.c_str(), "wb")) {
+        for (u32 core = 0; core < system.GetNumCores(); core++) {
+            system.GetCore(core).DumpRecompiledCode(code);
+        }
+        std::fclose(code);
+    }
     LOG_INFO(Frontend, "Wrote the recompiler's blocks to {}", path);
     // With it, for a count of what ran between two of these: the emulated time so far
     LOG_INFO(Frontend, "Guest time so far: {} ticks at {} ns (request {})",

@@ -43,23 +43,40 @@ SharedBacking::~SharedBacking() {
     }
 }
 
-AddressSpaceView::AddressSpaceView(const SharedBacking& backing_, std::size_t size_)
+AddressSpaceView::AddressSpaceView(const SharedBacking& backing_, std::size_t size_,
+                                   std::size_t guard, std::size_t alignment)
     : backing{backing_} {
-    if (!backing.IsValid() || size_ == 0 || size_ % EMULATED_PAGE_SIZE != 0) {
+    if (!backing.IsValid() || size_ == 0 || size_ % EMULATED_PAGE_SIZE != 0 ||
+        guard % EMULATED_PAGE_SIZE != 0 || alignment % EMULATED_PAGE_SIZE != 0) {
         return;
     }
+    const std::size_t wanted = size_ + 2 * guard;
+    const std::size_t asked_for = wanted + (alignment - EMULATED_PAGE_SIZE);
     void* const memory =
-        mmap(nullptr, size_, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        mmap(nullptr, asked_for, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (memory == MAP_FAILED) {
         return;
     }
-    base = static_cast<u8*>(memory);
+    // What is too much on either side goes back
+    u8* const start = static_cast<u8*>(memory);
+    const std::uintptr_t aligned =
+        (reinterpret_cast<std::uintptr_t>(start) + guard + alignment - 1) & ~(alignment - 1);
+    base = reinterpret_cast<u8*>(aligned);
     size = size_;
+    access.resize(size / EMULATED_PAGE_SIZE);
+    reserved = base - guard;
+    reserved_size = wanted;
+    if (reserved != start) {
+        munmap(start, static_cast<std::size_t>(reserved - start));
+    }
+    if (reserved + wanted != start + asked_for) {
+        munmap(reserved + wanted, static_cast<std::size_t>(start + asked_for - reserved - wanted));
+    }
 }
 
 AddressSpaceView::~AddressSpaceView() {
     if (base != nullptr) {
-        munmap(base, size);
+        munmap(reserved, reserved_size);
     }
 }
 
@@ -83,6 +100,8 @@ bool AddressSpaceView::Map(std::size_t offset, std::size_t backing_offset, std::
         Unmap(offset, length);
         return false;
     }
+    std::memset(access.data() + offset / EMULATED_PAGE_SIZE,
+                writable ? AccessRead | AccessWrite : AccessRead, length / EMULATED_PAGE_SIZE);
     return true;
 }
 
@@ -90,6 +109,7 @@ void AddressSpaceView::Unmap(std::size_t offset, std::size_t length) {
     if (base == nullptr || length == 0 || offset > size || length > size - offset) {
         return;
     }
+    std::memset(access.data() + offset / EMULATED_PAGE_SIZE, 0, length / EMULATED_PAGE_SIZE);
     // A mapping of nothing in place of what was there: the stretch stays reserved
     mmap(base + offset, length, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
          -1, 0);
@@ -101,7 +121,8 @@ SharedBacking::SharedBacking(std::size_t) {}
 
 SharedBacking::~SharedBacking() = default;
 
-AddressSpaceView::AddressSpaceView(const SharedBacking& backing_, std::size_t)
+AddressSpaceView::AddressSpaceView(const SharedBacking& backing_, std::size_t, std::size_t,
+                                   std::size_t)
     : backing{backing_} {}
 
 AddressSpaceView::~AddressSpaceView() = default;

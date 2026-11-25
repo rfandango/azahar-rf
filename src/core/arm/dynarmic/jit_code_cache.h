@@ -63,10 +63,15 @@ private:
     struct Entry {
         std::size_t offset;
         u32 size;
+        u32 check;
+        /// Found to be what was stored
+        bool checked;
     };
 
     void Load();
     bool ParseRecords();
+    void RemoveWhatIsNotUsed();
+    bool WriteBeside(std::span<const std::byte> records);
     void LogActivity(std::chrono::steady_clock::time_point now);
     /// On the writer's thread: writes the file from scratch with these records, or adds them
     void WriteOut(std::span<const std::byte> records, bool whole_file);

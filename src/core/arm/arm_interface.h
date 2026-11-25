@@ -93,6 +93,13 @@ public:
      */
     virtual void DumpBlockLocations([[maybe_unused]] std::FILE* out) const {}
 
+    /**
+     * For profiling: writes the blocks' host code, each with what DumpBlockLocations says of it
+     * and, where that is known, where the code of each of the game's instructions begins.
+     * Nothing without a recompiler.
+     */
+    virtual void DumpRecompiledCode([[maybe_unused]] std::FILE* out) const {}
+
     /// Clears the exclusive monitor's state.
     virtual void ClearExclusiveState() = 0;
 

@@ -55,6 +55,7 @@ public:
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u32 start_address, std::size_t length) override;
     void DumpBlockLocations(std::FILE* out) const override;
+    void DumpRecompiledCode(std::FILE* out) const override;
     void ClearExclusiveState() override;
     void SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) override;
 

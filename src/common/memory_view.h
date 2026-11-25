@@ -63,8 +63,11 @@ private:
  */
 class AddressSpaceView {
 public:
-    /// `size` is a multiple of 4 KiB. The backing has to outlive the view.
-    AddressSpaceView(const SharedBacking& backing, std::size_t size);
+    /// `size` is a multiple of 4 KiB, and so is `guard`: that many bytes before the stretch and
+    /// after it are reserved with it and stay empty. The stretch begins at a multiple of
+    /// `alignment`, a power of two. The backing has to outlive the view.
+    AddressSpaceView(const SharedBacking& backing, std::size_t size, std::size_t guard = 0,
+                     std::size_t alignment = 4096);
     ~AddressSpaceView();
 
     AddressSpaceView(const AddressSpaceView&) = delete;
@@ -76,6 +79,14 @@ public:
 
     [[nodiscard]] u8* Base() const {
         return base;
+    }
+
+    /// For each page of 4 KiB what an access there may do: AccessRead, AccessWrite. In step with
+    /// what Map and Unmap have done, for code that would rather ask than fault.
+    static constexpr u8 AccessRead = 1;
+    static constexpr u8 AccessWrite = 2;
+    [[nodiscard]] const u8* Access() const {
+        return access.data();
     }
 
     /// Shows `length` bytes of the backing, from `backing_offset` on, at `offset` of the view,
@@ -92,6 +103,10 @@ private:
     const SharedBacking& backing;
     u8* base = nullptr;
     std::size_t size = 0;
+    std::vector<u8> access;
+    /// All that was reserved
+    u8* reserved = nullptr;
+    std::size_t reserved_size = 0;
 };
 
 } // namespace Common

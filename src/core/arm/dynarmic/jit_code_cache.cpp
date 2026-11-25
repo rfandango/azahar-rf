@@ -7,6 +7,7 @@
 #include <thread>
 #include <fmt/format.h>
 #include "common/alignment.h"
+#include "common/arch.h"
 #include "common/file_util.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
@@ -20,7 +21,7 @@ namespace {
 
 constexpr u32 FILE_MAGIC = 0x434A5A41; // "AZJC"
 /// Changes with the layout of the file
-constexpr u32 FILE_VERSION = 1;
+constexpr u32 FILE_VERSION = 2;
 
 /// Blocks are written to the file when this much has gathered, or after this long
 constexpr std::size_t FLUSH_SIZE = 256 * 1024;
@@ -31,6 +32,9 @@ constexpr std::chrono::milliseconds SLOW_WRITE{100};
 constexpr std::size_t MAX_SIZE = 256 * 1024 * 1024;
 /// Blocks kept per location: code of other programs or modules at the same address
 constexpr std::size_t MAX_BLOCKS_PER_LOCATION = 4;
+/// What is in the file and will not be looked at any more is taken out of it when it is more than
+/// this part of it, in percent
+constexpr std::size_t MOST_UNUSED = 25;
 
 struct FileHeader {
     u32 magic;
@@ -43,9 +47,17 @@ static_assert(sizeof(FileHeader) == 24);
 struct RecordHeader {
     u64 location;
     u32 size;
-    u32 reserved;
+    /// Of the block. What is in the file is run as it is: a block that was not written whole, as
+    /// when the power goes, has to be told from one that was. (The size of a file can have been
+    /// written where what is in it has not: a stretch of zeros between blocks that are good.)
+    u32 check;
 };
 static_assert(sizeof(RecordHeader) == 16);
+
+u32 CheckOf(u64 location, std::span<const std::byte> block) {
+    return static_cast<u32>(
+        Common::HashCombine(Common::ComputeHash64(block.data(), block.size()), location));
+}
 
 /// Records start at multiples of this
 constexpr std::size_t RECORD_ALIGNMENT = 8;
@@ -63,9 +75,18 @@ u64 BuildKey(bool host_mmu) {
     return Common::ComputeHash64(recompiler.data(), recompiler.size());
 }
 
+/// What the direct translator makes is not kept, but made anew before it is needed
+/// (Core::AheadTranslation). What the recompiler makes beside it is not what it makes without it:
+/// in a file of its own. (A file without such a name is from before that, and stays as it is.)
 std::string CachePath(u64 program_id) {
-    return fmt::format("{}jit/{:016X}.bin", FileUtil::GetUserPath(FileUtil::UserPath::CacheDir),
-                       program_id);
+#if CITRA_ARCH(arm64) && defined(__linux__)
+    const bool direct =
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyTranslation) == 0;
+#else
+    constexpr bool direct = false;
+#endif
+    return fmt::format("{}jit/{:016X}{}.bin", FileUtil::GetUserPath(FileUtil::UserPath::CacheDir),
+                       program_id, direct ? "-rest" : "-all");
 }
 
 } // Anonymous namespace
@@ -123,7 +144,8 @@ void JitCodeCache::Load() {
     const bool complete = ParseRecords();
     flushed_size = data.size();
     rewrite_file = !complete;
-    if (complete) {
+    RemoveWhatIsNotUsed();
+    if (!rewrite_file) {
         // Opened for adding to it now, while the game is still starting: on the storage of a
         // phone this can take a tenth of a second, which the first new block of a session
         // would otherwise wait for in the middle of the game
@@ -151,7 +173,7 @@ bool JitCodeCache::ParseRecords() {
         if (blocks.size() == MAX_BLOCKS_PER_LOCATION) {
             blocks.erase(blocks.begin());
         }
-        blocks.push_back(Entry{block_offset, record.size});
+        blocks.push_back(Entry{block_offset, record.size, record.check, false});
         offset = Common::AlignUp(block_offset + record.size, RECORD_ALIGNMENT);
         if (offset > data.size()) {
             // The padding of the last record is missing, which is all that is
@@ -165,9 +187,54 @@ bool JitCodeCache::ParseRecords() {
     return false;
 }
 
+void JitCodeCache::RemoveWhatIsNotUsed() {
+    std::size_t used = 0;
+    for (const auto& [location, blocks] : entries) {
+        for (const Entry& entry : blocks) {
+            used += Common::AlignUp(sizeof(RecordHeader) + entry.size, RECORD_ALIGNMENT);
+        }
+    }
+    if (data.size() - used <= data.size() / 100 * MOST_UNUSED) {
+        return;
+    }
+    std::vector<std::byte> kept;
+    kept.reserve(used);
+    for (auto& [location, blocks] : entries) {
+        for (Entry& entry : blocks) {
+            const std::size_t from = entry.offset - sizeof(RecordHeader);
+            const std::size_t size =
+                Common::AlignUp(sizeof(RecordHeader) + entry.size, RECORD_ALIGNMENT);
+            entry.offset = kept.size() + sizeof(RecordHeader);
+            kept.insert(kept.end(), data.begin() + static_cast<std::ptrdiff_t>(from),
+                        data.begin() + static_cast<std::ptrdiff_t>(from + size));
+        }
+    }
+    LOG_INFO(Core_ARM11, "Recompiled code of title {:016X}: {} KB of {} KB are of use", program_id,
+             kept.size() / 1024, data.size() / 1024);
+    data = std::move(kept);
+    rewrite_file = true;
+}
+
 std::span<const std::byte> JitCodeCache::Lookup(u64 location, std::size_t index) {
     const auto it = entries.find(location);
-    if (it == entries.end() || index >= it->second.size()) {
+    if (it == entries.end()) {
+        return {};
+    }
+    // What is asked for is looked at once. One that is not what was stored is gone, and what
+    // comes after it takes its place.
+    while (index < it->second.size()) {
+        const std::size_t at = it->second.size() - 1 - index;
+        Entry& entry = it->second[at];
+        if (entry.checked ||
+            CheckOf(location, std::span{data}.subspan(entry.offset, entry.size)) == entry.check) {
+            entry.checked = true;
+            break;
+        }
+        LOG_WARNING(Core_ARM11, "A block of the recompiled code of title {:016X} was damaged",
+                    program_id);
+        it->second.erase(it->second.begin() + static_cast<std::ptrdiff_t>(at));
+    }
+    if (index >= it->second.size()) {
         return {};
     }
     if (index == 0) {
@@ -207,7 +274,7 @@ void JitCodeCache::Store(u64 location, std::span<const std::byte> block) {
     const RecordHeader record{
         .location = location,
         .size = static_cast<u32>(block.size()),
-        .reserved = 0,
+        .check = CheckOf(location, block),
     };
     const std::size_t record_offset = data.size();
     data.resize(Common::AlignUp(record_offset + sizeof(record) + block.size(), RECORD_ALIGNMENT));
@@ -218,7 +285,7 @@ void JitCodeCache::Store(u64 location, std::span<const std::byte> block) {
     if (blocks.size() == MAX_BLOCKS_PER_LOCATION) {
         blocks.erase(blocks.begin());
     }
-    blocks.push_back(Entry{record_offset + sizeof(record), record.size});
+    blocks.push_back(Entry{record_offset + sizeof(record), record.size, record.check, true});
 
     if (data.size() - flushed_size >= FLUSH_SIZE || now - last_flush >= FLUSH_INTERVAL) {
         Flush();
@@ -262,28 +329,14 @@ void JitCodeCache::WriteOut(std::span<const std::byte> records, bool whole_file)
     }
     if (whole_file) {
         append_file.Close();
-        if (!FileUtil::CreateFullPath(path)) {
-            LOG_ERROR(Core_ARM11, "Could not create the directory of {}", path);
-            write_gave_up = true;
-            return;
-        }
-        // The file stays open: what comes later is added through the same handle
-        append_file = FileUtil::IOFile{path, "wb"};
-        const FileHeader header{
-            .magic = FILE_MAGIC,
-            .version = FILE_VERSION,
-            .program_id = program_id,
-            .build_key = BuildKey(host_mmu),
-        };
-        if (!append_file.IsOpen() ||
-            append_file.WriteBytes(&header, sizeof(header)) != sizeof(header) ||
-            append_file.WriteBytes(records.data(), records.size()) != records.size() ||
-            !append_file.Flush()) {
+        if (!FileUtil::CreateFullPath(path) || !WriteBeside(records)) {
             LOG_ERROR(Core_ARM11, "Could not write {}", path);
             append_file.Close();
             write_gave_up = true;
             return;
         }
+        // The file stays open: what comes later is added through the same handle
+        append_file = FileUtil::IOFile{path, "ab"};
         writer_needs_whole = false;
     } else {
         if (!append_file.IsOpen()) {
@@ -309,6 +362,29 @@ void JitCodeCache::WriteOut(std::span<const std::byte> records, bool whole_file)
                     std::chrono::duration_cast<std::chrono::milliseconds>(took).count(),
                     records.size() / 1024);
     }
+}
+
+bool JitCodeCache::WriteBeside(std::span<const std::byte> records) {
+    // Not over the one that is there, which is good for as long as this one is not complete
+    const std::string beside = path + ".new";
+    const FileHeader header{
+        .magic = FILE_MAGIC,
+        .version = FILE_VERSION,
+        .program_id = program_id,
+        .build_key = BuildKey(host_mmu),
+    };
+    {
+        FileUtil::IOFile file{beside, "wb"};
+        if (!file.IsOpen() || file.WriteBytes(&header, sizeof(header)) != sizeof(header) ||
+            file.WriteBytes(records.data(), records.size()) != records.size() || !file.Flush()) {
+            return false;
+        }
+    }
+    if (FileUtil::Rename(beside, path)) {
+        return true;
+    }
+    // (Not every kind of storage replaces what is there)
+    return FileUtil::Delete(path) && FileUtil::Rename(beside, path);
 }
 
 void JitCodeCache::LogActivity(std::chrono::steady_clock::time_point now) {

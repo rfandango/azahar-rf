@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -36,7 +38,9 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include <signal.h>
@@ -46,6 +50,9 @@
 
 #include <mcl/stdint.hpp>
 
+#if defined(__aarch64__)
+#include "dynarmic/backend/arm64/a32_direct_statistics.h"
+#endif
 #include "dynarmic/frontend/A32/a32_location_descriptor.h"
 #include "dynarmic/frontend/A32/a32_types.h"
 #include "dynarmic/frontend/A32/disassembler/disassembler.h"
@@ -53,6 +60,10 @@
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
 #include "dynarmic/interface/A32/coprocessor.h"
+#if defined(__aarch64__)
+#include "dynarmic/interface/A32/translated_ahead.h"
+#endif
+#include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/opcodes.h"
 #include "dynarmic/ir/opt/passes.h"
@@ -69,11 +80,22 @@ constexpr u32 DATA_SIZE = 0x4000;
 /// Undefined in ARM state (the run stops there), a branch to itself in Thumb
 /// state
 constexpr u32 STOP_WORD = 0xE7FEE7FE;
-constexpr u64 TIME_GIVEN = 3000;
+u64 TIME_GIVEN = 3000;
 
 /// faults=N: how often an access faults before its block is made again the slow
 /// way (the emulator's 8 unless given; 1 has every fault remake its block)
 u32 g_faults_before_recompile = 8;
+
+/// corpus=FILE: not made-up programs but a game's own code (lines "w ADDRESS WORD" and
+/// "e ADDRESS", hexadecimal), entered at one of the addresses with made-up registers and memory
+struct Corpus {
+  std::unordered_map<u32, u32> words;
+  std::vector<u32> entries;
+  /// Filled anew for each program
+  std::vector<u8> data;
+  bool Has(u32 vaddr) const { return words.count(vaddr & ~3u) != 0; }
+};
+Corpus g_corpus;
 
 /// HostMmuFaults is how the emulator runs once it has pages protected: the page
 /// table and the host's view are both given, and some pages cannot be written,
@@ -118,8 +140,12 @@ public:
     code = program;
     written.clear();
     if (data) {
-      for (u32 i = 0; i < DATA_SIZE; i++) {
-        data[i] = static_cast<u8>(i * 7 + (i >> 8));
+      if (!g_corpus.data.empty()) {
+        std::memcpy(data, g_corpus.data.data(), DATA_SIZE);
+      } else {
+        for (u32 i = 0; i < DATA_SIZE; i++) {
+          data[i] = static_cast<u8>(i * 7 + (i >> 8));
+        }
       }
       if (spare_page) {
         std::memset(data + DATA_SIZE, 0, 4096);
@@ -134,6 +160,9 @@ public:
   }
 
   bool InCode(u32 vaddr) const {
+    if (!g_corpus.words.empty()) {
+      return g_corpus.Has(vaddr);
+    }
     return vaddr >= CODE_BASE && vaddr - CODE_BASE < code.size() * sizeof(u32);
   }
   /// The page behind the data counts where there is one: the code reaches it by
@@ -158,6 +187,10 @@ public:
   }
 
   std::optional<std::uint32_t> MemoryReadCode(u32 vaddr) override {
+    if (!g_corpus.words.empty()) {
+      const auto found = g_corpus.words.find(vaddr & ~3u);
+      return found != g_corpus.words.end() ? found->second : STOP_WORD;
+    }
     if (InCode(vaddr) && InCode(vaddr + 3)) {
       u32 value;
       std::memcpy(
@@ -173,6 +206,10 @@ public:
       return data[vaddr - DATA_BASE];
     }
     if (InCode(vaddr)) {
+      if (!g_corpus.words.empty()) {
+        return static_cast<u8>(g_corpus.words.at(vaddr & ~3u) >>
+                               ((vaddr & 3) * 8));
+      }
       return reinterpret_cast<const u8 *>(code.data())[vaddr - CODE_BASE];
     }
     if (const auto iter = written.find(vaddr); iter != written.end()) {
@@ -208,6 +245,28 @@ public:
   void MemoryWrite64(u32 vaddr, std::uint64_t value) override {
     MemoryWrite32(vaddr, static_cast<u32>(value));
     MemoryWrite32(vaddr + 4, static_cast<u32>(value >> 32));
+  }
+
+  // (One processor: nothing comes in between)
+  bool MemoryWriteExclusive8(u32 vaddr, std::uint8_t value,
+                             std::uint8_t) override {
+    MemoryWrite8(vaddr, value);
+    return true;
+  }
+  bool MemoryWriteExclusive16(u32 vaddr, std::uint16_t value,
+                              std::uint16_t) override {
+    MemoryWrite16(vaddr, value);
+    return true;
+  }
+  bool MemoryWriteExclusive32(u32 vaddr, std::uint32_t value,
+                              std::uint32_t) override {
+    MemoryWrite32(vaddr, value);
+    return true;
+  }
+  bool MemoryWriteExclusive64(u32 vaddr, std::uint64_t value,
+                              std::uint64_t) override {
+    MemoryWrite64(vaddr, value);
+    return true;
   }
 
   void InterpreterFallback(u32 pc, size_t) override { Stop(pc, 0x100); }
@@ -333,12 +392,22 @@ private:
   Env &env;
 };
 
+#if defined(__aarch64__)
+class AheadMemory;
+#endif
+
 struct Machine {
   std::unique_ptr<Env> env;
   std::unique_ptr<
       std::array<std::uint8_t *, A32::UserConfig::NUM_PAGE_TABLE_ENTRIES>>
       pages;
+  std::vector<u8> access;
   u8 *view = nullptr;
+  std::unique_ptr<ExclusiveMonitor> monitor;
+#if defined(__aarch64__)
+  std::unique_ptr<A32::TranslatedAhead> ahead;
+  std::unique_ptr<AheadMemory> ahead_memory;
+#endif
   std::unique_ptr<A32::Jit> jit;
 };
 
@@ -391,7 +460,65 @@ void ApplySwitches(A32::UserConfig &config, u32 switches) {
   if (switches & 65536) {
     config.share_host_addresses = true;
   }
+  if (switches & 131072) {
+    config.translate_directly = true;
+  }
+  // (262144: translated ahead, see MakeMachine)
+  if (switches & 524288) {
+    config.tables_of_code_by_address = false;
+  }
 }
+
+/// The guest's address space in the host's, empty: at a multiple of 4 GiB, with
+/// room on either side that nothing is in
+constexpr u64 GUARD_SIZE = u64{8} << 30;
+
+u8 *MakeView(A32::UserConfig &config) {
+  const size_t size = (u64{4} << 30) * 2 + GUARD_SIZE * 2;
+  u8 *const reserved = static_cast<u8 *>(
+      mmap(nullptr, size, PROT_NONE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+  if (reserved == MAP_FAILED) {
+    std::perror("mmap of the guest's address space");
+    std::exit(2);
+  }
+  const u64 aligned =
+      (reinterpret_cast<u64>(reserved) + GUARD_SIZE + 0xFFFFFFFF) &
+      ~u64{0xFFFFFFFF};
+  config.fastmem_guard_size = GUARD_SIZE;
+  return reinterpret_cast<u8 *>(aligned);
+}
+
+#if defined(__aarch64__)
+/// 262144: the code is translated ahead, from a copy
+class AheadMemory final : public A32::TranslatedAhead::Memory {
+public:
+  Env &env;
+  std::vector<u32> code;
+  bool read_only = false;
+
+  explicit AheadMemory(Env &env) : env{env} {}
+  std::optional<std::uint32_t> Read(std::uint32_t vaddr) override {
+    if (!g_corpus.words.empty()) {
+      const auto found = g_corpus.words.find(vaddr & ~3u);
+      return found != g_corpus.words.end()
+                 ? std::optional<std::uint32_t>{found->second}
+                 : std::nullopt;
+    }
+    if (vaddr < CODE_BASE || (vaddr - CODE_BASE) / 4 >= code.size()) {
+      return std::nullopt;
+    }
+    return code[(vaddr - CODE_BASE) / 4];
+  }
+  bool IsReadOnly(std::uint32_t vaddr) override {
+    return read_only && Read(vaddr & ~3u).has_value();
+  }
+  std::uint64_t GetTicksForCode(std::uint32_t vaddr,
+                                std::uint32_t instruction) override {
+    return env.GetTicksForCode(false, vaddr, instruction);
+  }
+};
+#endif
 
 Machine MakeMachine(Mode mode, u32 switches) {
   Machine m;
@@ -399,11 +526,14 @@ Machine MakeMachine(Mode mode, u32 switches) {
   m.env->fold_read_only = (switches & 32768) != 0;
   A32::UserConfig config;
   config.callbacks = m.env.get();
+  m.monitor = std::make_unique<ExclusiveMonitor>(1);
+  config.global_monitor = m.monitor.get();
   config.define_unpredictable_behaviour = true;
   config.fastmem_faults_before_recompile = g_faults_before_recompile;
+  config.direct_faults_before_check = g_faults_before_recompile;
   // A program is a few dozen instructions, and the room for code is emptied
   // before each one
-  config.code_cache_size = 8 * 1024 * 1024;
+  config.code_cache_size = (g_corpus.words.empty() ? 8 : 100) * 1024 * 1024;
   for (auto &coprocessor : config.coprocessors) {
     coprocessor = std::make_shared<TestCoprocessor>(*m.env);
   }
@@ -424,22 +554,12 @@ Machine MakeMachine(Mode mode, u32 switches) {
     }
     config.page_table = m.pages.get();
   } else if (mode == Mode::HostMmu) {
-    const size_t size = (u64{1} << 32) + 4096;
-    m.view = static_cast<u8 *>(mmap(nullptr, size, PROT_NONE,
-                                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                                    -1, 0));
-    if (m.view == MAP_FAILED) {
-      std::perror("mmap of the guest's address space");
-      std::exit(2);
-    }
+    m.view = MakeView(config);
     mprotect(m.view + DATA_BASE, DATA_SIZE, PROT_READ | PROT_WRITE);
     m.env->data = m.view + DATA_BASE;
     config.fastmem_pointer = reinterpret_cast<std::uintptr_t>(m.view);
   } else if (mode == Mode::HostMmuFaults) {
-    const size_t size = (u64{1} << 32) + 4096;
-    m.view = static_cast<u8 *>(mmap(nullptr, size, PROT_NONE,
-                                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                                    -1, 0));
+    m.view = MakeView(config);
     // The same bytes twice: in the view, with what the code may do there, and
     // where the callbacks and the page table reach all of them. One page more,
     // as for the page table.
@@ -463,6 +583,8 @@ Machine MakeMachine(Mode mode, u32 switches) {
     m.pages = std::make_unique<
         std::array<std::uint8_t *, A32::UserConfig::NUM_PAGE_TABLE_ENTRIES>>();
     m.pages->fill(nullptr);
+    m.access.resize(A32::UserConfig::NUM_PAGE_TABLE_ENTRIES);
+    config.page_access = m.access.data();
     for (u32 i = 0; i < DATA_SIZE / 4096; i++) {
       // Page 1 is read where it is and written through the callbacks (a page
       // the emulator watches), page 2 is not reached at all (one it has shut)
@@ -473,11 +595,20 @@ Machine MakeMachine(Mode mode, u32 switches) {
                         : PROT_NONE);
       (*m.pages)[(DATA_BASE >> 12) + i] =
           direct ? m.env->data + i * 4096 : nullptr;
+      m.access[(DATA_BASE >> 12) + i] = direct ? 3 : i == 1 ? 1 : 0;
     }
     config.page_table = m.pages.get();
     config.fastmem_pointer = reinterpret_cast<std::uintptr_t>(m.view);
   }
   ApplySwitches(config, switches);
+#if defined(__aarch64__)
+  if (switches & 262144) {
+    m.ahead = std::make_unique<A32::TranslatedAhead>();
+    m.ahead_memory = std::make_unique<AheadMemory>(*m.env);
+    m.ahead_memory->read_only = m.env->fold_read_only;
+    config.translated_ahead = m.ahead.get();
+  }
+#endif
   m.jit = std::make_unique<A32::Jit>(config);
   m.env->jit = m.jit.get();
   return m;
@@ -605,6 +736,8 @@ const Generators &AllGenerators(bool with_simd) {
   return with_simd ? simd : plain;
 }
 
+/// modes=0: the floating point mode is left alone
+bool g_with_modes = true;
 bool g_with_simd = false;
 
 /// A random instruction for the middle of a program
@@ -694,6 +827,32 @@ u32 Slot(u32 pc, u32 keep, u32 left_after) {
 
 void Fill(std::vector<u32> &program, u32 count, u32 keep) {
   for (u32 i = 0; i < count; i++) {
+    // Now and then the floating point mode is read, set, or put back
+    if (g_with_modes && Chance(5)) {
+      if (Chance(40)) {
+        program.push_back(0xEEF16A10); // vmrs r6, fpscr
+        continue;
+      }
+      if (Chance(30)) {
+        program.push_back(0xEEE16A10); // vmsr fpscr, r6
+        continue;
+      }
+      if (count - i >= 3) {
+        static constexpr std::array<u32, 5> modes{
+            0xE3A07403,  // mov r7, #0x03000000
+            0xE3A07407,  // #0x07000000
+            0xE3A075C0,  // #0x30000000: flags, and nothing else
+            0xE3A07000,  // #0
+            0xE3A075F0}; // #0x3C000000
+        program.push_back(modes[Bits(4)]);
+        // orr r7, r7, #LENGTH << 16, or the distance of two besides
+        program.push_back(Chance(75) ? 0xE3877800 | Bits(7)
+                                     : 0xE3877833 | Bits(7));
+        program.push_back(0xEEE17A10); // vmsr fpscr, r7
+        i += 2;
+        continue;
+      }
+    }
     const u32 pc = CODE_BASE + static_cast<u32>(program.size()) * 4;
     program.push_back(Slot(pc, keep, count - 1 - i));
   }
@@ -855,8 +1014,76 @@ Start MakeStart() {
   // User mode, ARM state, the four flags, the sticky flag and the four "greater
   // or equal"
   s.cpsr = 0x10 | (Bits(0xF) << 28) | (Bits(1) << 27) | (Bits(0xF) << 16);
-  // Rounding mode, flush to zero, default NaN; no vectors of the old kind
+  // Rounding mode, flush to zero, default NaN; now and then vectors of the old
+  // kind, also such as there are not
   s.fpscr = Bits(3) << 22 | Bits(1) << 24 | Bits(1) << 25;
+  if (g_with_modes && Chance(25)) {
+    s.fpscr |= Bits(7) << 16 | (Chance(25) ? 3u << 20 : 0);
+  }
+  return s;
+}
+
+void LoadCorpus(const char *path) {
+  std::FILE *const file = std::fopen(path, "r");
+  if (!file) {
+    std::perror(path);
+    std::exit(2);
+  }
+  char line[128];
+  while (std::fgets(line, sizeof(line), file)) {
+    unsigned a = 0, b = 0;
+    if (std::sscanf(line, "w %x %x", &a, &b) == 2) {
+      g_corpus.words[a] = b;
+    } else if (std::sscanf(line, "e %x", &a) == 1) {
+      g_corpus.entries.push_back(a);
+    }
+  }
+  std::fclose(file);
+  TIME_GIVEN = 8000;
+}
+
+u32 SomeFloat() {
+  const float values[] = {0.0f, 1.0f, -1.0f, 0.5f, 2.0f, 1.0f / 3, 100.0f};
+  float value = Chance(40) ? values[Bits(6)]
+                           : static_cast<float>(static_cast<s32>(Bits(20000)) -
+                                                10000) /
+                                 (1 + Bits(99));
+  u32 word;
+  std::memcpy(&word, &value, 4);
+  return word;
+}
+
+u32 SomePointer() { return DATA_BASE + 0x400 + (Bits(0x2B00) & ~15u); }
+
+/// A word as a game's memory and registers have them
+u32 SomeWord() {
+  const u32 kind = Bits(99);
+  return kind < 45   ? SomePointer()
+         : kind < 60 ? Bits(16)
+         : kind < 70 ? Bits(1)
+         : kind < 90 ? SomeFloat()
+                     : RandInt<u32>(0, 0xFFFFFFFF);
+}
+
+/// Registers for a game's code, and memory
+Start MakeCorpusStart() {
+  g_corpus.data.resize(DATA_SIZE);
+  for (u32 i = 0; i < DATA_SIZE; i += 4) {
+    const u32 word = SomeWord();
+    std::memcpy(&g_corpus.data[i], &word, 4);
+  }
+  Start s;
+  for (u32 &r : s.regs) {
+    r = Chance(70) ? SomePointer() : SomeWord();
+  }
+  s.regs[13] = DATA_BASE + DATA_SIZE - 0x800;
+  s.regs[14] = 0x00000100; // nothing there: the program stops
+  s.regs[15] = g_corpus.entries[RandInt<size_t>(0, g_corpus.entries.size() - 1)];
+  for (u32 &r : s.ext_regs) {
+    r = SomeFloat();
+  }
+  s.cpsr = 0x10 | (Bits(0xF) << 28);
+  s.fpscr = Chance(75) ? 0x03000000 : Bits(3) << 22 | Bits(1) << 24 | Bits(1) << 25;
   return s;
 }
 
@@ -880,11 +1107,51 @@ struct Result {
   std::vector<u8> data;
 };
 
+#if defined(__aarch64__)
+/// Some of the program is translated ahead, now and then from a copy that is not what will be in
+/// memory, and what was translated of the program before is mostly still there: code of something
+/// else at the same addresses, which must not be taken
+void TranslateAhead(Machine &m, const std::vector<u32> &program,
+                    const Start &start) {
+  if (Chance(30)) {
+    m.ahead->Clear();
+  }
+  m.ahead_memory->code = program;
+  if (Chance(20) && !program.empty()) {
+    m.ahead_memory->code[Bits(static_cast<u32>(program.size()) - 1)] ^=
+        1u << Bits(27);
+  }
+  const u32 times = Bits(6);
+  for (u32 i = 0; i < times; i++) {
+    const u32 pc =
+        i == 0 && Chance(70)
+            ? start.regs[15]
+            : CODE_BASE + 4 * Bits(static_cast<u32>(program.size()) - 1);
+    const A32::LocationDescriptor location{pc & ~3u, A32::PSR{start.cpsr},
+                                           A32::FPSCR{start.fpscr}};
+    m.ahead->Translate(location.UniqueHash(), *m.ahead_memory);
+  }
+}
+#endif
+
 Result RunOn(Machine &m, const std::vector<u32> &program, const Start &start,
              u32 spoil) {
   m.env->Begin(program);
-  m.jit->ClearCache();
+#if defined(__aarch64__)
+  if (m.ahead && g_corpus.words.empty() && Chance(60)) {
+    // The program has changed, and that is all the recompiler is told
+    m.jit->InvalidateCacheRange(CODE_BASE, 0x8000);
+  } else
+#endif
+  if (g_corpus.words.empty()) {
+    m.jit->ClearCache();
+  }
   m.jit->Reset();
+#if defined(__aarch64__)
+  if (m.ahead && g_corpus.words.empty()) {
+    TranslateAhead(m, program, start);
+  }
+#endif
   m.jit->Regs() = start.regs;
   m.jit->ExtRegs() = start.ext_regs;
   m.jit->SetCpsr(start.cpsr);
@@ -1005,6 +1272,17 @@ void Show(const std::vector<u32> &program, const Start &start) {
     std::printf("r%d=%08x%s", i, start.regs[i], i == 7 ? "\n  " : " ");
   }
   std::printf("\n");
+  if (program.empty()) {
+    // A game's code: the first instructions at the entry
+    for (u32 pc = start.regs[15]; pc < start.regs[15] + 4 * 60; pc += 4) {
+      const auto word = g_corpus.words.find(pc);
+      if (word == g_corpus.words.end()) {
+        break;
+      }
+      std::printf("  %08x  %08x  %s\n", pc, word->second,
+                  A32::DisassembleArm(word->second).c_str());
+    }
+  }
   for (size_t i = 0; i < program.size(); i++) {
     std::printf("  %08x  %08x  %s\n", CODE_BASE + static_cast<u32>(i) * 4,
                 program[i], A32::DisassembleArm(program[i]).c_str());
@@ -1048,9 +1326,138 @@ void OnAbort(int) {
   _exit(4);
 }
 
+/// stuck SWITCHES: a program that goes round and round by returns to an address it has made up,
+/// which is nowhere the recompiler has it look at its time: it has to come back all the same
+int Stuck(u32 switches) {
+  Machine m = MakeMachine(Mode::HostMmu, switches);
+  // ldr lr, [pc]; bx lr; and the address of the first of them
+  const std::vector<u32> program{0xE59FE000, 0xE12FFF1E, CODE_BASE};
+  for (int i = 0; i < 3; i++) {
+    m.env->Begin(program);
+    m.jit->Regs()[15] = CODE_BASE;
+    m.jit->SetCpsr(0x10);
+    const u64 before = m.env->ticks_left;
+    alarm(10);
+    m.jit->Run();
+    alarm(0);
+    std::printf("came back with %" PRIu64 " of %" PRIu64
+                " ticks left, at %08x\n",
+                m.env->ticks_left, before, m.jit->Regs()[15]);
+  }
+  return 0;
+}
+
 } // namespace
 
+/// demote SWITCHES: how long a copy loop takes, before and after its accesses have faulted as
+/// often as it takes for them to be made the slow way
+int Demote(u32 switches) {
+  Machine m = MakeMachine(Mode::HostMmuFaults, switches);
+  const std::vector<u32> program{
+      0xE8B107F8, // ldm r1!, {r3-r10}
+      0xE2522020, // subs r2, r2, #32
+      0xE8A007F8, // stm r0!, {r3-r10}
+      0xCAFFFFFB, // bgt to the first
+      0xE5914000, // ldr r4, [r1]
+      0xE12FFF1E, // bx lr
+  };
+  m.env->Begin(program);
+  const auto copy = [&](u32 to, u32 from, u32 times) {
+    const auto start = std::chrono::steady_clock::now();
+    for (u32 i = 0; i < times; i++) {
+      m.jit->Regs()[0] = to;
+      m.jit->Regs()[1] = from;
+      m.jit->Regs()[2] = 0x800;
+      m.jit->Regs()[14] = 0x100;
+      m.jit->Regs()[15] = CODE_BASE;
+      m.jit->SetCpsr(0x10);
+      m.env->stopped = false;
+      m.env->ticks_left = 100000;
+      while (!m.env->stopped && m.env->ticks_left > 0) {
+        m.jit->Run();
+      }
+    }
+    return std::chrono::duration<double, std::nano>(
+               std::chrono::steady_clock::now() - start)
+               .count() /
+           (times * 64.0);
+  };
+  std::printf("a turn of the loop (32 bytes), ns: %.1f before\n",
+              copy(DATA_BASE + 0x3000, DATA_BASE, 20000));
+  // Page 1 takes no writes and page 2 nothing at all
+  std::printf("  %.0f where it faults\n",
+              copy(DATA_BASE + 0x1000, DATA_BASE, 3));
+  std::printf("  %.1f after\n",
+              copy(DATA_BASE + 0x3000, DATA_BASE, 20000));
+  std::printf("  %.0f where it faulted\n",
+              copy(DATA_BASE + 0x1000, DATA_BASE, 300));
+  return 0;
+}
+
+/// modes SWITCHES: how long it takes to go to another floating point mode and back, and through a
+/// loop in it
+int Modes(u32 switches) {
+  const auto time = [&](u32 bits, const char *name) {
+    Machine m = MakeMachine(Mode::HostMmu, switches);
+    const std::vector<u32> program{
+        0xEEF11A10,        // vmrs r1, fpscr
+        0xE3812000 | bits, // orr r2, r1, #bits
+        0xE3A03014,        // 0x08: mov r3, #20
+        0xEEE12A10,        // vmsr fpscr, r2
+        0xE58D3000,        // 0x10: str r3, [sp]
+        0xEE084A00,        // vmla.f32 s8, s16, s0
+        0xE59D3000,        // ldr r3, [sp]
+        0xEE4A4A20,        // vmla.f32 s9, s20, s1
+        0xE2533001,        // subs r3, r3, #1
+        0x1AFFFFF9,        // bne 0x10
+        0xEEE11A10,        // vmsr fpscr, r1
+        0xEB000003,        // bl 0x40
+        0xE2500001,        // subs r0, r0, #1
+        0x1AFFFFF3,        // bne 0x08
+        0xE1A0F00B,        // mov pc, r11
+        0xE1A00000,        // nop
+        0xE12FFF1E,        // 0x40: bx lr
+    };
+    m.env->Begin(program);
+    double ns = 0;
+    for (int i = 0; i < 3; i++) {
+      m.jit->SetCpsr(0x10);
+      m.jit->SetFpscr(0x03000000);
+      m.jit->Regs()[0] = 300;
+      m.jit->Regs()[11] = 0x100;
+      m.jit->Regs()[13] = DATA_BASE + 0x100;
+      m.jit->Regs()[15] = CODE_BASE;
+      m.env->stopped = false;
+      m.env->ticks_left = 100000000;
+      const auto start = std::chrono::steady_clock::now();
+      while (!m.env->stopped && m.env->ticks_left > 0) {
+        m.jit->Run();
+      }
+      ns = std::chrono::duration<double, std::nano>(
+               std::chrono::steady_clock::now() - start)
+               .count() /
+           300;
+    }
+    std::printf("%s: %.0f ns for there and back with 20 turns of the loop\n",
+                name, ns);
+  };
+  time(0, "the same mode   ");
+  time(0x501, "another rounding"); // #0x00400000
+  time(0x803, "vectors of four "); // #0x00030000
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc == 3 && std::strcmp(argv[1], "modes") == 0) {
+    return Modes(static_cast<u32>(std::strtoul(argv[2], nullptr, 0)));
+  }
+  if (argc == 3 && std::strcmp(argv[1], "demote") == 0) {
+    return Demote(static_cast<u32>(std::strtoul(argv[2], nullptr, 0)));
+  }
+  if (argc == 3 && std::strcmp(argv[1], "stuck") == 0) {
+    signal(SIGALRM, OnTooLong);
+    return Stuck(static_cast<u32>(std::strtoul(argv[2], nullptr, 0)));
+  }
   if (argc < 6) {
     std::fprintf(stderr, "jitfuzz MODE(cb|pt|fm|ff) COUNT SEED REFERENCE TEST "
                          "[LENGTH] [simd] [spoil] [slice=N] [from=N] [show]\n");
@@ -1093,6 +1500,12 @@ int main(int argc, char **argv) {
       skip_last = rest && *rest == '-' ? std::strtoull(rest + 1, nullptr, 0)
                                        : skip_first;
     }
+    if (std::strcmp(argv[i], "modes=0") == 0) {
+      g_with_modes = false;
+    }
+    if (std::strncmp(argv[i], "corpus=", 7) == 0) {
+      LoadCorpus(argv[i] + 7);
+    }
     if (std::strncmp(argv[i], "faults=", 7) == 0) {
       g_faults_before_recompile =
           static_cast<u32>(std::strtoul(argv[i] + 7, nullptr, 0));
@@ -1111,6 +1524,33 @@ int main(int argc, char **argv) {
   reference.env->slice = g_slice;
   test.env->slice = g_slice;
 
+#if defined(__aarch64__)
+  // A game's code: translated on a thread while the programs run
+  std::atomic<bool> enough{false};
+  std::thread ahead_thread;
+  if (test.ahead && !g_corpus.words.empty()) {
+    ahead_thread = std::thread{[&] {
+      for (size_t i = seed % 7; i < g_corpus.entries.size() && !enough;
+           i += 1 + i % 3) {
+        const A32::LocationDescriptor location{
+            g_corpus.entries[(i * 7919) % g_corpus.entries.size()],
+            A32::PSR{0x10}, A32::FPSCR{0x03000000}};
+        std::vector<u32> next{location.PC()};
+        for (int depth = 0; depth < 3 && !enough; depth++) {
+          std::vector<u32> after;
+          for (const u32 pc : next) {
+            const u64 at = location.SetPC(pc).UniqueHash();
+            test.ahead->Translate(at, *test.ahead_memory);
+            const auto leads = test.ahead->LeadsTo(at);
+            after.insert(after.end(), leads.begin(), leads.end());
+          }
+          next = std::move(after);
+        }
+      }
+    }};
+  }
+#endif
+
   u64 compared = 0, unsettled = 0, one_sided = 0, different = 0,
       kernel_calls = 0;
   for (u64 n = first; n < first + count; n++) {
@@ -1119,8 +1559,12 @@ int main(int argc, char **argv) {
     }
     // Each program from a seed of its own, so one can be run again alone
     detail::g_rand_int_generator.seed(seed * 1000003u + static_cast<u32>(n));
-    std::vector<u32> program = MakeProgram(4 + Bits(length));
-    const Start start = MakeStart();
+    std::vector<u32> program;
+    if (g_corpus.words.empty()) {
+      program = MakeProgram(4 + Bits(length));
+    }
+    const Start start =
+        g_corpus.words.empty() ? MakeStart() : MakeCorpusStart();
     if (cut != 0 && program.size() > cut) {
       program.resize(cut);
     }
@@ -1131,7 +1575,8 @@ int main(int argc, char **argv) {
     }
     g_program_running = n;
     g_side_running = 0;
-    alarm(5);
+    // (With the first one the decode tables are made)
+    alarm(g_corpus.words.empty() && n != first ? 5 : 120);
     const Result a = RunOn(reference, program, start, 0);
     g_side_running = 1;
     const Result b =
@@ -1162,6 +1607,19 @@ int main(int argc, char **argv) {
       }
     }
   }
+#if defined(__aarch64__)
+  enough = true;
+  if (ahead_thread.joinable()) {
+    ahead_thread.join();
+  }
+  if (test.ahead) {
+    const auto s = test.ahead->GetStatistics();
+    std::printf("mode %s: translated ahead: %zu regions with %zu locations in "
+                "%zu KB there; %zu along, %zu taken, %zu stale, %zu not there\n",
+                mode_name.c_str(), s.regions, s.locations, s.host_bytes / 1024,
+                s.along, s.taken, s.stale, s.missed);
+  }
+#endif
   std::printf("mode %s, switches %#x against %#x, seed %u: %" PRIu64
               " programs, %" PRIu64 " compared (%" PRIu64
               " kernel calls), %" PRIu64
@@ -1179,5 +1637,16 @@ int main(int argc, char **argv) {
                 " accesses were made at a shared host address\n",
                 mode_name.c_str(), shared);
   }
+#if defined(__aarch64__)
+  if (const auto &direct = Backend::Arm64::Direct::statistics;
+      direct.regions != 0) {
+    std::printf("mode %s: translated directly %" PRIu64 " regions, %" PRIu64
+                " blocks, %" PRIu64 " instructions into %" PRIu64
+                " of the host's; %" PRIu64 " accesses carried out by calls\n",
+                mode_name.c_str(), direct.regions.load(), direct.blocks.load(),
+                direct.instructions.load(), direct.host_instructions.load(),
+                direct.slow_accesses.load());
+  }
+#endif
   return different || one_sided ? 1 : 0;
 }

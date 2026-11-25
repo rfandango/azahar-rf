@@ -120,6 +120,12 @@ struct PageTable {
          */
         [[nodiscard]] u8* HostView() const;
 
+        /// How many bytes before the 4 GiB at HostView, and after them, are empty as well
+        [[nodiscard]] std::size_t HostViewGuard() const;
+
+        /// For each page what an access in the view may do, see AddressSpaceView::Access
+        [[nodiscard]] const u8* HostViewAccess() const;
+
         /// Between the two, changes to the entries are gathered and brought to the host's
         /// view at the end, a run of pages at a time. They nest.
         void BeginChanges();
@@ -140,6 +146,7 @@ struct PageTable {
         std::array<u8*, PAGE_TABLE_NUM_ENTRIES> raw;
         std::array<MemoryRef, PAGE_TABLE_NUM_ENTRIES> refs;
         std::unique_ptr<Common::AddressSpaceView> host_view;
+        std::size_t host_view_guard = 0;
         const Common::SharedBacking* host_view_backing = nullptr;
         u32 changes_depth = 0;
         std::vector<u32> changed;

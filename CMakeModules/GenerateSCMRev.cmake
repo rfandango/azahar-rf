@@ -69,6 +69,8 @@ set(COMBINED "")
 # taken out of it, which left the hash as it was.
 set(RECOMPILER_STORE_SUM_jit_code_cache.cpp "e33e6f25e1cc32e814d73b657b2ad3bf")
 set(RECOMPILER_STORE_SUM_jit_code_cache.h "014b5cd2fb3d16c3fc87a2e5dad67118")
+# Nor does what translates ahead, of which nothing is kept.
+list(FILTER RECOMPILER_FILES EXCLUDE REGEX "/(ahead_translation|a32_translated_ahead|translated_ahead)\\.(h|cpp)$")
 foreach (F IN LISTS RECOMPILER_FILES)
     file(RELATIVE_PATH NAME "${CMAKE_SOURCE_DIR}" "${F}")
     get_filename_component(BASENAME "${F}" NAME)

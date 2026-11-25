@@ -24,6 +24,9 @@
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #endif
+#if CITRA_ARCH(arm64)
+#include "core/arm/dynarmic/ahead_translation.h"
+#endif
 #include "core/arm/dynarmic/jit_code_cache.h"
 #include "core/arm/dyncom/arm_dyncom.h"
 #ifdef HAVE_FASTINTERP
@@ -551,6 +554,11 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
         }
     }
     kernel->SetCurrentProcess(process);
+#if CITRA_ARCH(arm64)
+    if (ahead_translation) {
+        ahead_translation->Begin(*process);
+    }
+#endif
     title_id = 0;
     if (app_loader->ReadProgramId(title_id) != Loader::ResultStatus::Success) {
         LOG_ERROR(Core, "Failed to find title id for ROM (Error {})",
@@ -709,6 +717,17 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
         } else if (!jit_code_cache || jit_code_cache->GetProgramId() != program_id) {
             jit_code_cache.reset();
             jit_code_cache = std::make_unique<JitCodeCache>(program_id, memory->UsesHostMmu());
+        }
+        const bool translate_ahead =
+            keep_code && memory->UsesHostMmu() &&
+            (Common::TraceMarkers::Experiments4() &
+             (Common::TraceMarkers::LegacyTranslation |
+              Common::TraceMarkers::NoAheadTranslation)) == 0;
+        if (!translate_ahead) {
+            ahead_translation.reset();
+        } else if (!ahead_translation || ahead_translation->GetProgramId() != program_id) {
+            ahead_translation.reset();
+            ahead_translation = std::make_shared<AheadTranslation>(program_id);
         }
 #endif
         for (u32 i = 0; i < num_cores; ++i) {
@@ -918,6 +937,16 @@ void System::Shutdown(bool is_deserializing) {
             jit_code_cache.reset();
         }
     }
+#if CITRA_ARCH(arm64)
+    if (ahead_translation) {
+        // Likewise
+        if (is_deserializing) {
+            ahead_translation->Flush();
+        } else {
+            ahead_translation.reset();
+        }
+    }
+#endif
     exclusive_monitor.reset();
     timing.reset();
 

@@ -74,6 +74,7 @@ class AppLoader;
 
 namespace Core {
 
+class AheadTranslation;
 class ARM_Interface;
 class JitCodeCache;
 class ExclusiveMonitor;
@@ -348,6 +349,11 @@ public:
         return jit_code_cache.get();
     }
 
+    /// What translates the running title's code before it is asked for, if there is one
+    [[nodiscard]] AheadTranslation* GetAheadTranslation() const {
+        return ahead_translation.get();
+    }
+
     void SetStatus(ResultStatus new_status, const char* details = nullptr) {
         status = new_status;
         if (details) {
@@ -523,6 +529,8 @@ private:
     /// ARM11 CPU core
     /// Declared before the cores, which use it for as long as they exist
     std::unique_ptr<JitCodeCache> jit_code_cache;
+    /// (Shared for its type to be unknown here: there is none but on one kind of host)
+    std::shared_ptr<AheadTranslation> ahead_translation;
     std::vector<std::shared_ptr<ARM_Interface>> cpu_cores;
     ARM_Interface* running_core = nullptr;
 

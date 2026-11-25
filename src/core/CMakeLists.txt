@@ -553,6 +553,8 @@ endif()
 
 if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)
     target_sources(citra_core PRIVATE
+        arm/dynarmic/ahead_translation.cpp
+        arm/dynarmic/ahead_translation.h
         arm/dynarmic/arm_dynarmic.cpp
         arm/dynarmic/arm_dynarmic.h
         arm/dynarmic/arm_dynarmic_cp15.cpp

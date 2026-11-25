@@ -67,11 +67,15 @@ constexpr std::size_t BACKING_N3DS = BACKING_VRAM + VRAM_SIZE;
 constexpr std::size_t BACKING_DSP = BACKING_N3DS + N3DS_EXTRA_RAM_SIZE;
 constexpr std::size_t BACKING_SIZE = BACKING_DSP + DSP_RAM_SIZE;
 
-/// A view takes in all 32 bits of an emulated address. One page more is reserved behind it and
-/// never filled: an access that starts in the last bytes of the address space runs into it
-/// and faults, instead of reaching whatever the host has there.
+/// A view takes in all 32 bits of an emulated address, and starts at a multiple of that: the
+/// lower half of a host address in it is the emulated one. What is reserved before it and behind
+/// it is never filled: code that moves host addresses instead of emulated ones (an index of a
+/// word of up to 31 bits and a sign, added to an address) faults where it has left the address
+/// space, instead of reaching whatever the host has there. Where the host has no room for that
+/// much, a little of it keeps accesses right that start in the last bytes of the address space.
 constexpr std::size_t HOST_VIEW_SIZE = std::size_t{1} << 32;
-constexpr std::size_t HOST_VIEW_GUARD = CITRA_PAGE_SIZE;
+constexpr std::size_t HOST_VIEW_GUARD = std::size_t{1} << 33;
+constexpr std::size_t HOST_VIEW_SMALL_GUARD = 16 * 1024 * 1024;
 
 /// Whether the recompiled code is to reach the emulated memory through views of it: the
 /// host's own address translation in place of a lookup for every access (measured on an
@@ -149,12 +153,17 @@ PageTable::~PageTable() = default;
 
 PageTable::Pointers::Pointers() {
     if (host_backing) {
-        auto view = std::make_unique<Common::AddressSpaceView>(*host_backing,
-                                                               HOST_VIEW_SIZE + HOST_VIEW_GUARD);
-        if (view->IsValid()) {
-            host_view = std::move(view);
-            host_view_backing = host_backing;
-        } else {
+        for (const std::size_t guard : {HOST_VIEW_GUARD, HOST_VIEW_SMALL_GUARD}) {
+            auto view = std::make_unique<Common::AddressSpaceView>(*host_backing, HOST_VIEW_SIZE,
+                                                                   guard, HOST_VIEW_SIZE);
+            if (view->IsValid()) {
+                host_view = std::move(view);
+                host_view_guard = guard;
+                host_view_backing = host_backing;
+                break;
+            }
+        }
+        if (!host_view) {
             LOG_ERROR(HW_Memory, "No room for a view of an address space: its code will look "
                                  "every address up");
         }
@@ -165,6 +174,14 @@ PageTable::Pointers::~Pointers() = default;
 
 u8* PageTable::Pointers::HostView() const {
     return host_view ? host_view->Base() : nullptr;
+}
+
+std::size_t PageTable::Pointers::HostViewGuard() const {
+    return host_view ? host_view_guard : 0;
+}
+
+const u8* PageTable::Pointers::HostViewAccess() const {
+    return host_view ? host_view->Access() : nullptr;
 }
 
 void PageTable::Pointers::BeginChanges() {
