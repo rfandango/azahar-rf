@@ -29,8 +29,13 @@
     <string name="custom_driver_non_adreno_warning">Non Adreno GPU detected</string>
     <string name="custom_driver_non_adreno_warning_description">Most custom drivers are built for Qualcomm Adreno GPUs, only install a driver made for your GPU. If a driver fails to load, Azahar will fall back to the system driver. If applications crash, select \"System GPU driver\".</string>
     <string name="share_log_not_found">No log file found</string>
-    <string name="select_games_folder">Select Applications Folder</string>
-    <string name="select_games_folder_description">Allows Azahar to populate the application list</string>
+    <string name="select_games_folder">Applications Folders</string>
+    <string name="select_games_folder_description">Allow Azahar to populate the application list</string>
+    <string name="games_folders_message">Azahar lists the applications in these folders. Removing a folder from the list deletes nothing.</string>
+    <string name="games_folders_empty">No folder added yet</string>
+    <string name="add_games_folder">Add Folder</string>
+    <string name="remove_games_folder">Remove from List</string>
+    <string name="games_folder_already_added">This folder is in the list already</string>
     <string name="about">About</string>
     <string name="citra_description">An open-source 3DS emulator\nLicensed under GPLv3 or any later version</string>
     <string name="about_description">Build version, credits, and more</string>

@@ -21,7 +21,6 @@ import org.citra.citra_emu.model.Game
 import org.citra.citra_emu.model.GameInfo
 
 object GameHelper {
-    const val KEY_GAME_PATH = "game_path"
     const val KEY_GAMES = "Games"
 
     // Since the game val in GetGame is tied to the JNI we need to cache the game list in order to use it elsewhere
@@ -32,10 +31,11 @@ object GameHelper {
         val games = mutableListOf<Game>()
         val context = CitraApplication.appContext
         preferences = PreferenceManager.getDefaultSharedPreferences(context)
-        val gamesDir = preferences.getString(KEY_GAME_PATH, "")
-        val gamesUri = Uri.parse(gamesDir)
 
-        addGamesRecursive(games, FileUtil.listFiles(gamesUri), 3)
+        val found = mutableSetOf<String>()
+        GameFolders.folders.forEach {
+            addGamesRecursive(games, found, FileUtil.listFiles(it), 3)
+        }
         NativeLibrary.getInstalledGamePaths().forEach {
             games.add(
                 getGame(Uri.parse(it.path), isInstalled = true, addedToLibrary = true, it.mediaType)
@@ -58,6 +58,7 @@ object GameHelper {
 
     private fun addGamesRecursive(
         games: MutableList<Game>,
+        found: MutableSet<String>,
         files: Array<CheapDocument>,
         depth: Int
     ) {
@@ -71,9 +72,12 @@ object GameHelper {
                 return@forEach
             }
             if (it.isDirectory) {
-                addGamesRecursive(games, FileUtil.listFiles(it.uri), depth - 1)
+                addGamesRecursive(games, found, FileUtil.listFiles(it.uri), depth - 1)
             } else {
-                if (Game.extensions.contains(FileUtil.getExtension(it.uri))) {
+                // (Once, also where one of the folders lies within another)
+                if (Game.extensions.contains(FileUtil.getExtension(it.uri)) &&
+                    found.add(GameFolders.identify(it.uri))
+                ) {
                     games.add(
                         getGame(
                             it.uri,

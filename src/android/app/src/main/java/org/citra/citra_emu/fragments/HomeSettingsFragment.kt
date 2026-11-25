@@ -11,7 +11,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewGroup.MarginLayoutParams
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -39,7 +38,6 @@ import org.citra.citra_emu.features.settings.utils.SettingsFile
 import org.citra.citra_emu.model.Game
 import org.citra.citra_emu.model.HomeSetting
 import org.citra.citra_emu.ui.main.MainActivity
-import org.citra.citra_emu.utils.GameHelper
 import org.citra.citra_emu.utils.GpuDriverHelper
 import org.citra.citra_emu.utils.Log
 import org.citra.citra_emu.utils.PermissionsHandler
@@ -179,7 +177,12 @@ class HomeSettingsFragment : Fragment() {
                 R.string.select_games_folder,
                 R.string.select_games_folder_description,
                 R.drawable.ic_add,
-                { getGamesDirectory.launch(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).data) },
+                {
+                    GameFoldersDialogFragment().show(
+                        childFragmentManager,
+                        GameFoldersDialogFragment.TAG
+                    )
+                },
                 details = homeViewModel.gamesDir
             ),
             HomeSetting(
@@ -226,32 +229,6 @@ class HomeSettingsFragment : Fragment() {
         super.onDestroyView()
         _binding = null
     }
-
-    private val getGamesDirectory =
-        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { result ->
-            if (result == null) {
-                return@registerForActivityResult
-            }
-
-            requireContext().contentResolver.takePersistableUriPermission(
-                result,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
-
-            // When a new directory is picked, we currently will reset the existing games
-            // database. This effectively means that only one game directory is supported.
-            preferences.edit()
-                .putString(GameHelper.KEY_GAME_PATH, result.toString())
-                .apply()
-
-            Toast.makeText(
-                CitraApplication.appContext,
-                R.string.games_dir_selected,
-                Toast.LENGTH_LONG
-            ).show()
-
-            homeViewModel.setGamesDir(requireActivity(), result.path!!)
-        }
 
     private fun shareLog() {
         // The file is otherwise only as far as the last error line: the end of the session,

@@ -102,20 +102,29 @@ class GamesViewModel : ViewModel() {
         _searchFocused.value = searchFocused
     }
 
+    // What to search has changed while it was being searched
+    private var reloadAgain = false
+
     fun reloadGames(directoryChanged: Boolean) {
         if (isReloading.value) {
+            reloadAgain = reloadAgain || directoryChanged
             return
         }
         _isReloading.value = true
 
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                setGames(GameHelper.getGames())
-                _isReloading.value = false
-
-                if (directoryChanged) {
-                    setShouldSwapData(true)
+            var swapData = directoryChanged
+            do {
+                reloadAgain = false
+                withContext(Dispatchers.IO) {
+                    setGames(GameHelper.getGames())
                 }
+                swapData = swapData || reloadAgain
+            } while (reloadAgain)
+            _isReloading.value = false
+
+            if (swapData) {
+                setShouldSwapData(true)
             }
         }
     }

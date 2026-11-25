@@ -98,10 +98,9 @@ class HomeSettingAdapter(
         }
 
         private fun updateOptionDetails(detailString: String) {
-            if (detailString != "") {
-                binding.optionDetail.text = detailString
-                binding.optionDetail.visibility = View.VISIBLE
-            }
+            binding.optionDetail.text = detailString
+            binding.optionDetail.visibility =
+                if (detailString != "") View.VISIBLE else View.GONE
         }
     }
 }

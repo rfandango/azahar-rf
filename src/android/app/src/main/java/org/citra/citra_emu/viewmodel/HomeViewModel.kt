@@ -17,7 +17,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import org.citra.citra_emu.CitraApplication
 import org.citra.citra_emu.R
 import org.citra.citra_emu.fragments.CitraDirectoryDialogFragment
-import org.citra.citra_emu.utils.GameHelper
+import org.citra.citra_emu.utils.GameFolders
 import org.citra.citra_emu.utils.PermissionsHandler
 
 class HomeViewModel : ViewModel() {
@@ -39,12 +39,7 @@ class HomeViewModel : ViewModel() {
     )
 
     val gamesDir get() = _gamesDir.asStateFlow()
-    private val _gamesDir = MutableStateFlow(
-        Uri.parse(
-            PreferenceManager.getDefaultSharedPreferences(CitraApplication.appContext)
-                .getString(GameHelper.KEY_GAME_PATH, "")
-        ).path ?: ""
-    )
+    private val _gamesDir = MutableStateFlow(GameFolders.summary)
 
     var directoryListener: CitraDirectoryDialogFragment.Listener? = null
 
@@ -107,9 +102,9 @@ class HomeViewModel : ViewModel() {
         _userDir.value = dir
     }
 
-    fun setGamesDir(activity: FragmentActivity, dir: String) {
+    fun onGameFoldersChanged(activity: FragmentActivity) {
         ViewModelProvider(activity)[GamesViewModel::class.java].reloadGames(true)
-        _gamesDir.value = dir
+        _gamesDir.value = GameFolders.summary
     }
 
     fun clearCopyInfo() {
