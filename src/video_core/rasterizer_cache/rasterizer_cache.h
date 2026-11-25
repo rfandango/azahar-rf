@@ -285,10 +285,38 @@ bool RasterizerCache<T>::AccelerateTextureCopy(const Pica::DisplayTransferConfig
     dst_params.res_scale = src_info.res_scale;
     dst_params.UpdateParams();
 
-    const auto [dst_surface_id, dst_rect] =
-        GetSurfaceSubRect(dst_params, ScaleMatch::Upscale, false);
+    auto [dst_surface_id, dst_rect] = GetSurfaceSubRect(dst_params, ScaleMatch::Upscale, false);
     if (!dst_surface_id) {
         return false;
+    }
+    if (output_gap != 0) {
+        // Images are put together out of columns. The column that comes first after a save state
+        // was loaded, or after everything was dropped, makes an image that begins with that
+        // column, in the middle of the rows of the image it is a part of. Both hold the column
+        // from then on: it goes into the one that begins first and has the others as well, or
+        // the columns would be in two images that cannot be copied to each other other than row
+        // by row, and what is shown would be read back from the GPU to be loaded again.
+        const u32 row_bytes = dst_params.BytesInPixels(dst_params.stride) *
+                              (dst_params.is_tiled ? 8 : 1);
+        SurfaceId first_id = dst_surface_id;
+        ForEachSurfaceInRegion(
+            dst_params.addr, dst_params.size, [&](SurfaceId surface_id, Surface& surface) {
+                const Surface& first = slot_surfaces[first_id];
+                if (surface.addr < first.addr && surface.levels == 1 &&
+                    surface.type != SurfaceType::Texture && surface.stride == first.stride &&
+                    surface.res_scale == first.res_scale &&
+                    surface.half_scale_x == first.half_scale_x &&
+                    surface.half_scale_y == first.half_scale_y &&
+                    surface.sample_count == first.sample_count &&
+                    (first.addr - surface.addr) % row_bytes != 0 &&
+                    surface.CanSubRect(dst_params)) {
+                    first_id = surface_id;
+                }
+            });
+        if (first_id != dst_surface_id) {
+            dst_surface_id = first_id;
+            dst_rect = slot_surfaces[first_id].GetScaledSubRect(dst_params);
+        }
     }
 
     // A copy with an output gap writes rows of the destination and leaves the bytes between

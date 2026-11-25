@@ -2,6 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <cstring>
+#include <vector>
+#include "common/alignment.h"
 #include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/rasterizer_cache/texture_codec.h"
 #include "video_core/rasterizer_cache/utils.h"
@@ -36,7 +39,29 @@ void EncodeTexture(const SurfaceParams& surface_info, PAddr start_addr, PAddr en
         const LinearFunc LinearEncodeImpl =
             (convert ? LINEAR_ENCODE_TABLE_CONVERTED : LINEAR_ENCODE_TABLE)[func_index];
         if (LinearEncodeImpl) {
-            LinearEncodeImpl(source, dest);
+            // The image handed over begins with the row that start_addr lies in, not with
+            // start_addr itself. (Luigi's Mansion 2 puts its picture together out of columns, and
+            // after a save state was loaded one that began in the middle of a row was an image of
+            // its own: what was read back from it came to lie that far beside its place in every
+            // row, and the picture was shown wrapped round.)
+            const u32 bytes_per_pixel = surface_info.GetFormatBpp() / 8;
+            const u32 host_bytes_per_pixel = convert ? 4 : bytes_per_pixel;
+            const u32 offset = start_addr - surface_info.addr;
+            const u32 first_pixel = offset / bytes_per_pixel;
+            const u32 lead = offset % bytes_per_pixel;
+            const std::size_t source_offset = std::size_t{first_pixel} * host_bytes_per_pixel;
+            if (source_offset >= source.size()) {
+                return;
+            }
+            source = source.subspan(source_offset);
+            if (lead == 0 && dest.size() % bytes_per_pixel == 0) {
+                LinearEncodeImpl(source, dest);
+                return;
+            }
+            // Begins or ends inside a pixel
+            std::vector<u8> pixels(Common::AlignUp(lead + dest.size(), bytes_per_pixel));
+            LinearEncodeImpl(source, pixels);
+            std::memcpy(dest.data(), pixels.data() + lead, dest.size());
             return;
         }
     }
