@@ -864,6 +864,23 @@ public:
         u32 written_again{};
     };
     VolatileAges VolatileAgesNow();
+    /// Writes of the game to pages that are shut because the emulated GPU writes them, which
+    /// waited for the decoder, since this was last asked: by how long ago the emulated GPU was
+    /// last known to write there (within 2 VBlanks, within 4 seconds, longer ago), how many of
+    /// them touched nothing a surface covers, how many pages have been taken to be the game's
+    /// again, and the pages most of them went to with how many and the VBlanks since then.
+    struct GpuWrittenFigures {
+        std::array<u32, 3> waited{};
+        u32 beside_surfaces{};
+        u32 given_back{};
+        struct Page {
+            PAddr address;
+            u32 times;
+            u64 age;
+        };
+        std::vector<Page> most;
+    };
+    GpuWrittenFigures TakeGpuWrittenFigures();
     void Disarm(PAddr addr, u32 size, bool written);
 
     /// For what the rasterizer gives the game late (a small image the game reads back every

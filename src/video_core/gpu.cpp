@@ -854,6 +854,19 @@ void GPU::ReportDecoderWaits() {
                         ages.kinds[2], ages.kinds_read[2], ages.kinds[3], ages.kinds_read[3],
                         ages.kinds[4], ages.kinds_read[4], ages.kinds[0], ages.kinds_read[0]);
     }
+    if (const auto written = impl->memory.TakeGpuWrittenFigures();
+        written.waited[0] + written.waited[1] + written.waited[2] != 0) {
+        waits += fmt::format("; of the writes to what the gpu writes that waited it had written "
+                             "there within 2 VBlanks {}, within 240 {}, longer ago {}, {} of them "
+                             "touched nothing a surface covers; {} pages are the game's again; "
+                             "most:",
+                             written.waited[0], written.waited[1], written.waited[2],
+                             written.beside_surfaces, written.given_back);
+        for (const auto& page : written.most) {
+            waits += fmt::format(" {:08X} {} times (written {} VBlanks ago)", page.address,
+                                 page.times, page.age);
+        }
+    }
     const auto called = impl->pica.TakeCalledListFigures();
     const u64 called_taken = std::exchange(impl->called_taken, 0);
     const u64 called_taken_bytes = std::exchange(impl->called_taken_bytes, 0);

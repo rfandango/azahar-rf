@@ -417,6 +417,18 @@ public:
     std::vector<u32> to_arm;
     std::vector<u32> to_arm_transfer;
     std::vector<u32> to_shut;
+    /// Emulation thread: for each page the VBlank (late_vblank) at which the emulated GPU was last
+    /// known to write it. A command names what it writes; what a list draws to is noted by the
+    /// decoder, anew every WRITTEN_NOTED_EVERY VBlanks, when note_written_anew is set.
+    std::vector<u64> gpu_wrote;
+    std::atomic<bool> note_written_anew{false};
+    u64 next_note_written{};
+    static constexpr u64 WRITTEN_NOTED_EVERY = 120;
+    /// Memory is used again for something else: a page the game writes, and that the emulated GPU
+    /// has not written for this many VBlanks, is not one it writes any more.
+    static constexpr u64 WRITTEN_FOR = 240;
+    GpuWrittenFigures gpu_written_figures;
+    std::unordered_map<u32, u32> gpu_written_pages;
     /// Emulation thread: the volatile pages (bit 5 of reference_state), in the order of their
     /// numbers. A page that is written while it is armed becomes one: it is copied at every
     /// hand-over instead of armed.
@@ -694,6 +706,24 @@ public:
             }
         }
         return found;
+    }
+
+    /// For the log: a write is about to wait for the decoder because of where it goes
+    void NoteWriteToGpuWritten(PAddr paddr, u32 size) {
+        const auto page = CellPage(paddr);
+        if (!page) {
+            return;
+        }
+        const u64 age = late_vblank - gpu_wrote[*page];
+        gpu_written_figures.waited[age <= 2 ? 0 : age <= WRITTEN_FOR ? 1 : 2]++;
+        const u32 in_page = paddr & CITRA_PAGE_MASK;
+        const u32 last = std::min<u32>(in_page + size, CITRA_PAGE_SIZE) - 1;
+        if ((surface_cells[*page] & CellMask(in_page, last)) == 0) {
+            gpu_written_figures.beside_surfaces++;
+        }
+        if (gpu_written_pages.size() < 4096) {
+            gpu_written_pages[static_cast<u32>(*page)]++;
+        }
     }
 
     /// Whether a read goes straight to a cached page's memory: nothing newer is held of it,
@@ -1125,6 +1155,10 @@ public:
                 }
                 return;
             }
+            if (kind == VideoCore::GPU::WaitReason::WriteGpuWritten &&
+                system.GPU().HasPendingWork()) {
+                NoteWriteToGpuWritten(physical_start, overlap_size);
+            }
             system.GPU().WaitIdle(kind);
 
             auto* rasterizer = renderer.Rasterizer();
@@ -1219,6 +1253,7 @@ MemorySystem::Impl::Impl(Core::System& system_)
     reference_kind.resize(surface_cells.size());
     reference_cells.resize(surface_cells.size());
     reference_state.resize(surface_cells.size());
+    gpu_wrote.resize(surface_cells.size());
     looks_taken.resize(surface_cells.size());
     armed_again_at.resize(surface_cells.size());
     snapshot_slot.resize(surface_cells.size());
@@ -2043,6 +2078,14 @@ void MemorySystem::NoteGpuWritten(PAddr addr, u32 size) {
 
 void MemorySystem::SetGpuReader(bool transfer) {
     impl->gpu_reader = transfer ? 16 : 1;
+    if (impl->note_written_anew.load(std::memory_order_relaxed)) [[unlikely]] {
+        // What is written is noted again, so that it shows what is not written any more
+        impl->note_written_anew.store(false, std::memory_order_relaxed);
+        for (u8& noted : impl->reference_noted) {
+            noted &= static_cast<u8>(~2);
+        }
+        impl->noted_stretches.fill({});
+    }
     if (impl->has_forgotten.load(std::memory_order_relaxed)) [[unlikely]] {
         // Pages the emulation thread has forgotten (see FORGET_AFTER): noted anew the next
         // time something is read from them
@@ -2092,6 +2135,9 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
         fresh_transfer.swap(impl->new_transfer_references);
         fresh_written.swap(impl->new_written);
     }
+    for (const u32 page : fresh_written) {
+        impl->gpu_wrote[page] = impl->late_vblank;
+    }
     if (for_transfer && source_size != 0) {
         // Known from the command, without the decoder having been there: learnt and armed
         // (or copied, if the game keeps writing them) below, for this very command
@@ -2111,7 +2157,11 @@ void MemorySystem::ArmGpuReferences(bool for_list, bool for_transfer, u64 queued
         const u64 last = u64{addr} + size - 1;
         for (u64 at = addr & ~CITRA_PAGE_MASK; at <= last; at += CITRA_PAGE_SIZE) {
             const auto page = Impl::CellPage(static_cast<PAddr>(at));
-            if (page && (impl->reference_state[*page] & 4) == 0) {
+            if (!page) {
+                continue;
+            }
+            impl->gpu_wrote[*page] = impl->late_vblank;
+            if ((impl->reference_state[*page] & 4) == 0) {
                 fresh_written.push_back(static_cast<u32>(*page));
             }
         }
@@ -2311,9 +2361,29 @@ void MemorySystem::Disarm(PAddr addr, u32 size, bool written) {
         if ((bits & 8) != 0) {
             MarkRegionForRasterizer(static_cast<PAddr>(at), CITRA_PAGE_SIZE, false, 3);
             bits &= static_cast<u8>(~8);
-            impl->to_shut.push_back(static_cast<u32>(*page));
+            if (written && impl->late_vblank - impl->gpu_wrote[*page] > Impl::WRITTEN_FOR) {
+                // The game's again. (Shut again once the emulated GPU writes it.)
+                bits &= static_cast<u8>(~4);
+                impl->gpu_written_figures.given_back++;
+            } else {
+                impl->to_shut.push_back(static_cast<u32>(*page));
+            }
         }
     }
+}
+
+MemorySystem::GpuWrittenFigures MemorySystem::TakeGpuWrittenFigures() {
+    GpuWrittenFigures figures = std::exchange(impl->gpu_written_figures, {});
+    std::vector<std::pair<u32, u32>> pages(impl->gpu_written_pages.begin(),
+                                           impl->gpu_written_pages.end());
+    impl->gpu_written_pages.clear();
+    std::sort(pages.begin(), pages.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (std::size_t i = 0; i < std::min<std::size_t>(pages.size(), 6); i++) {
+        figures.most.push_back({Impl::CellPageAddress(pages[i].first), pages[i].second,
+                                impl->late_vblank - impl->gpu_wrote[pages[i].first]});
+    }
+    return figures;
 }
 
 void MemorySystem::ExemptReads(PAddr addr, u32 size) {
@@ -2337,6 +2407,10 @@ void MemorySystem::PostLateWrite(PAddr addr, std::vector<u8>&& bytes) {
 
 void MemorySystem::ApplyLateWrites() {
     impl->late_vblank++;
+    if (impl->late_vblank >= impl->next_note_written) {
+        impl->next_note_written = impl->late_vblank + Impl::WRITTEN_NOTED_EVERY;
+        impl->note_written_anew.store(true, std::memory_order_relaxed);
+    }
     if (!impl->has_late_writes.load(std::memory_order_relaxed)) {
         return;
     }
