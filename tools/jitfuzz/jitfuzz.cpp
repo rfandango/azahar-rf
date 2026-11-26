@@ -467,6 +467,7 @@ void ApplySwitches(A32::UserConfig &config, u32 switches) {
   if (switches & 524288) {
     config.tables_of_code_by_address = false;
   }
+  config.direct_translation_without = switches >> 20 & 31;
 }
 
 /// The guest's address space in the host's, empty: at a multiple of 4 GiB, with
@@ -852,6 +853,44 @@ void Fill(std::vector<u32> &program, u32 count, u32 keep) {
         i += 2;
         continue;
       }
+    }
+    // A constant that is an address, and what is done there; or one of four by a register
+    if (count - i >= 6 && Chance(5)) {
+      const auto free_register = [&] {
+        u32 reg = Bits(10);
+        while ((keep >> reg) & 1) {
+          reg = Bits(10);
+        }
+        return reg;
+      };
+      const u32 base = free_register();
+      if (Chance(30)) {
+        const u32 index = free_register();
+        if (Chance(80)) {
+          program.push_back(0xE2000003 | index << 16 | index << 12); // and
+          i++;
+        }
+        // ldr base, [pc, index, lsl #2]; b over the words
+        program.push_back(0xE79F0100 | base << 12 | index);
+        program.push_back(Branch(4, false, 0xE0000000));
+        for (u32 n = 0; n < 4; n++) {
+          program.push_back(DATA_BASE + Bits(DATA_SIZE - 1));
+        }
+        i += 5;
+      } else {
+        // ldr base, [pc]; b over the word
+        program.push_back(0xE59F0000 | base << 12);
+        program.push_back(Branch(1, false, 0xE0000000));
+        program.push_back(DATA_BASE + (Bits(DATA_SIZE - 1) & (Chance(85) ? ~3u : ~0u)));
+        i += 2;
+      }
+      for (u32 n = 1 + Bits(2); n != 0 && i + 1 < count; n--, i++) {
+        static constexpr std::array<u32, 4> accesses{
+            0x05900000, 0x05800000, 0x05D00000, 0x05C00000}; // ldr, str, ldrb, strb
+        program.push_back(Condition() | accesses[Bits(3)] | base << 16 |
+                          free_register() << 12 | Bits(63) * 4);
+      }
+      continue;
     }
     const u32 pc = CODE_BASE + static_cast<u32>(program.size()) * 4;
     program.push_back(Slot(pc, keep, count - 1 - i));
@@ -1447,7 +1486,59 @@ int Modes(u32 switches) {
   return 0;
 }
 
+/// calls SWITCHES: how long calls take of a routine that calls another one, from many places
+int Calls(u32 switches) {
+  Machine m = MakeMachine(Mode::HostMmu, switches);
+  std::vector<u32> program{0xE3A04000}; // mov r4, #0
+  constexpr u32 PLACES = 24;
+  const u32 loop = static_cast<u32>(program.size());
+  std::vector<u32> calls;
+  for (u32 i = 0; i < PLACES; i++) {
+    program.push_back(0xE2844001); // add r4, r4, #1
+    calls.push_back(static_cast<u32>(program.size()));
+    program.push_back(0);
+  }
+  program.push_back(0xE2500001); // subs r0, r0, #1
+  program.push_back(0x1A000000 | ((loop - static_cast<u32>(program.size()) - 2) & 0xFFFFFF)); // bne
+  program.push_back(0xE1A0F00B); // mov pc, r11
+  const u32 routine = static_cast<u32>(program.size());
+  program.push_back(0xE92D4020); // push {r5, lr}
+  program.push_back(0xE0845004); // add r5, r4, r4
+  const u32 inner = static_cast<u32>(program.size());
+  program.push_back(0);
+  program.push_back(0xE0844005); // add r4, r4, r5
+  program.push_back(0xE8BD8020); // pop {r5, pc}
+  const u32 leaf = static_cast<u32>(program.size());
+  program.push_back(0xE0211004); // eor r1, r1, r4
+  program.push_back(0xE12FFF1E); // bx lr
+  for (const u32 call : calls) {
+    // Every other one calls the inner routine
+    program[call] = Branch((call % 4 == 1 ? leaf : routine) - call - 1, true, 0xE0000000);
+  }
+  program[inner] = Branch(leaf - inner - 1, true, 0xE0000000);
+  m.env->Begin(program);
+  for (int i = 0; i < 3; i++) {
+    m.jit->SetCpsr(0x10);
+    m.jit->Regs()[0] = 20000;
+    m.jit->Regs()[11] = 0x100;
+    m.jit->Regs()[13] = DATA_BASE + 0x800;
+    m.jit->Regs()[15] = CODE_BASE;
+    m.env->stopped = false;
+    m.env->ticks_left = 100000000;
+    const auto start = std::chrono::steady_clock::now();
+    while (!m.env->stopped && m.env->ticks_left > 0) {
+      m.jit->Run();
+    }
+    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+    std::printf("%.2f ns a call from the loop\n", ns / (20000.0 * PLACES));
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc == 3 && std::strcmp(argv[1], "calls") == 0) {
+    return Calls(static_cast<u32>(std::strtoul(argv[2], nullptr, 0)));
+  }
   if (argc == 3 && std::strcmp(argv[1], "modes") == 0) {
     return Modes(static_cast<u32>(std::strtoul(argv[2], nullptr, 0)));
   }

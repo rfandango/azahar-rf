@@ -402,6 +402,8 @@ enum Experiment4 : std::uint32_t {
     /// translated straight into the host's, a group of basic blocks at a time
     /// (Dynarmic::A32::UserConfig::translate_directly).
     LegacyTranslation = 128,
+    /// Five bits: parts of that left out (UserConfig::direct_translation_without)
+    TranslationWithout = 256 * 31,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as

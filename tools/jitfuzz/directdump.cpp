@@ -89,6 +89,12 @@ int main() {
       config.most_instructions = a;
     } else if (std::sscanf(line, "s %x", &a) == 1) {
       config.pinned_fp_registers = a;
+    } else if (std::sscanf(line, "C %x", &a) == 1) {
+      config.literal_constants = a != 0;
+    } else if (std::sscanf(line, "A %x", &a) == 1) {
+      config.literal_addresses = a != 0;
+    } else if (std::sscanf(line, "H %x", &a) == 1) {
+      config.host_returns = a != 0;
     } else if (std::sscanf(line, "e %x", &a) == 1) {
       const A32::LocationDescriptor location{a, A32::PSR{0x10},
                                              A32::FPSCR{fpscr}};

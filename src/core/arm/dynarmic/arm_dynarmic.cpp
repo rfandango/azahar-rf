@@ -599,6 +599,8 @@ std::unique_ptr<Dynarmic::A32::Jit> ARM_Dynarmic::MakeJit() {
 #if CITRA_ARCH(arm64) && defined(__linux__)
     config.translate_directly =
         (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyTranslation) == 0;
+    config.direct_translation_without =
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::TranslationWithout) / 256;
     if (AheadTranslation* const ahead = system.GetAheadTranslation();
         ahead && config.translate_directly) {
         config.translated_ahead = &ahead->Translated();
