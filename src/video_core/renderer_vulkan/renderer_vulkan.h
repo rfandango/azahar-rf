@@ -130,6 +130,9 @@ private:
     /// Begins the drawing of the frame. Without `clear` only the given parts of it are cleared.
     void PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout, bool clear,
                      std::vector<vk::ClearRect> parts_to_clear);
+    /// For native output: the share of the layout's size the screens shown in it take up in
+    /// the game's own pixels, the larger where they differ
+    float NativeScale(const Layout::FramebufferLayout& layout) const;
     void RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
                         bool flipped);
 
@@ -188,6 +191,8 @@ private:
     bool layer_blends{};
     /// Pixels of the frame being drawn for one of the layout
     float output_scale = 1.0f;
+    /// Pipeline switches since the last report
+    PipelineCache::SwitchCounts report_switches{};
     GpuSpanMeter draw_meter;
     std::vector<GpuPassMeter::Sum> reported_passes;
     std::chrono::nanoseconds reported_busy{};

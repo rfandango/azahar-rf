@@ -926,7 +926,9 @@ private:
         ++shader.scope;
         shader.AddLine("int fixed_offset = offset >= -128 && offset <= 127 ? offset : 0;");
         shader.AddLine("uint index = uint((base_index + fixed_offset) & 0x7F);");
-        shader.AddLine("return index < 96u ? uniforms.f[index] : vec4(1.0);");
+        // Past the 96 uniforms the entry after them, which holds (1, 1, 1, 1): one instruction,
+        // where a comparison and a choice for each component were six
+        shader.AddLine("return uniforms.f[min(index, 96u)];");
         --shader.scope;
         shader.AddLine("}}\n");
 

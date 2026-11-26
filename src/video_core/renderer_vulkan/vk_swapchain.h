@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <mutex>
@@ -40,6 +41,15 @@ public:
 
     /// Whether it was made for another output resolution than the settings ask for by now
     bool IsOutputOutdated() const;
+
+    /// Native output: the share of the display's lines and columns the screens take up in the
+    /// game's own pixels, for the images to be that much smaller; 0 for none. Any thread.
+    void SetNativeScale(float scale);
+
+    /// Whether the images are smaller than the display, which scales them up
+    bool IsOutputReduced() const {
+        return output_percent < 100 || applied_native != 0;
+    }
 
     /// Whether the swapchain cannot be used any more and has to be made anew
     bool NeedsRecreation() const {
@@ -164,6 +174,9 @@ private:
     vk::SurfaceTransformFlagBitsKHR transform;
     u32 pre_rotation{};
     u32 output_percent = 100;
+    /// The native scale asked for and the one the images were made with, in 1/4096ths
+    std::atomic<u32> native_scale{0};
+    u32 applied_native{};
     vk::CompositeAlphaFlagBitsKHR composite_alpha;
     std::vector<vk::Image> images;
     std::vector<vk::Semaphore> image_acquired;

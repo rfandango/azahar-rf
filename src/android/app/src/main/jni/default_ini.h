@@ -272,6 +272,8 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 )") DECLARE_KEY(screen_upscaling_bottom) BOOST_HANA_STRING(R"(
 
 # The share of the display's resolution that is drawn, in percent. The display scales it up.
+# Without an upscaler (screen_upscaling 0) the screens are drawn no larger than the game's own
+# pixels anyway, unless filter_mode is 0, integer scaling is on or a stereo mode is shown.
 # (Vulkan only)
 # 30 - 100 (default: 100)
 )") DECLARE_KEY(output_resolution) BOOST_HANA_STRING(R"(

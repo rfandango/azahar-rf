@@ -33,10 +33,31 @@ u32 WantedOutputPercent() {
 #endif
 }
 
+/// The native scale the images are made for (in 1/4096ths), or 0 where the share of the output
+/// resolution is as small or smaller, or the screens are as large as the display
+u32 AppliedNative(u32 native, u32 percent) {
+    return native != 0 && native * 100 < percent * 4096 ? native : 0;
+}
+
 } // Anonymous namespace
 
 bool Swapchain::IsOutputOutdated() const {
-    return output_percent != WantedOutputPercent();
+    const u32 percent = WantedOutputPercent();
+    const u32 native = AppliedNative(native_scale.load(std::memory_order_relaxed), percent);
+    if ((native == 0) != (applied_native == 0)) {
+        return true;
+    }
+    if (native != 0) {
+        // (Not for every small change, such as one of the layout by a pixel)
+        return native * 50 > applied_native * 51 || native * 51 < applied_native * 50;
+    }
+    return output_percent != percent;
+}
+
+void Swapchain::SetNativeScale(float scale) {
+    const u32 value = scale > 0.f ? std::clamp(static_cast<u32>(scale * 4096.f + 0.5f), 1u, 4096u)
+                                  : 0u;
+    native_scale.store(value, std::memory_order_relaxed);
 }
 
 Swapchain::Swapchain(const Instance& instance_, u32 width, u32 height, vk::SurfaceKHR surface_,
@@ -373,7 +394,22 @@ void Swapchain::SetSurfaceProperties() {
     // Android shows an image of another size than its surface's enlarged to that, where it can with the
     // scaler of the display's hardware
     output_percent = WantedOutputPercent();
-    if (output_percent < 100) {
+    applied_native = AppliedNative(native_scale.load(std::memory_order_relaxed), output_percent);
+    if (applied_native != 0) {
+        // As large as the screens are in the game's own pixels
+        output_percent = 100;
+        const auto reduce = [&](u32 size, u32 lowest, u32 highest) {
+            const u32 reduced = std::max(
+                static_cast<u32>((static_cast<u64>(size) * applied_native + 2048) / 4096) & ~1u,
+                2u);
+            return std::clamp(reduced, lowest, highest);
+        };
+        extent.width = reduce(extent.width, capabilities.minImageExtent.width,
+                              capabilities.maxImageExtent.width);
+        extent.height = reduce(extent.height, capabilities.minImageExtent.height,
+                               capabilities.maxImageExtent.height);
+    } else if (output_percent < 100) {
+        applied_native = 0;
         const auto reduce = [&](u32 size, u32 lowest, u32 highest) {
             const u32 reduced = std::max((size * output_percent / 100) & ~1u, 2u);
             return std::clamp(reduced, lowest, highest);

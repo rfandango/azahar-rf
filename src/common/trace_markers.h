@@ -403,6 +403,12 @@ enum Experiment4 : std::uint32_t {
     LegacyTranslation = 128,
     /// Five bits: parts of that left out (UserConfig::direct_translation_without)
     TranslationWithout = 256 * 31,
+    /// Vulkan: the combiners of fragment shaders work in full precision, as before
+    /// (Pica::Shader::Generator::SPIRV::FragmentModule)
+    FullPrecisionCombiners = 8192,
+    /// Vulkan, Android: also without an upscaler the screens are drawn at the display's size, as
+    /// before, not at the game's own (RendererVulkan::RenderToWindow)
+    LegacyFullSizeOutput = 16384,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as

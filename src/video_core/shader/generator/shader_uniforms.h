@@ -115,9 +115,12 @@ struct VSPicaUniformData {
 
     u32 b;
     alignas(16) std::array<Common::Vec4u, 4> i;
-    alignas(16) std::array<Common::Vec4f, 96> f;
+    /// The 96 float uniforms, and after them (1, 1, 1, 1): what a read relative to an address
+    /// register gives where it comes to no uniform. A shader then takes the lower of the index
+    /// and 96, where it would compare and pick each component.
+    alignas(16) std::array<Common::Vec4f, 97> f;
 };
-static_assert(sizeof(VSPicaUniformData) == 1616,
+static_assert(sizeof(VSPicaUniformData) == 1632,
               "The size of the VSPicaUniformData does not match the structure in the shader");
 static_assert(sizeof(VSPicaUniformData) < 16384,
               "VSPicaUniformData structure must be less than 16kb as per the OpenGL spec");

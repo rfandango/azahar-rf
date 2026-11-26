@@ -301,7 +301,7 @@
     <string name="screen_upscaling_bottom">Upscale the Bottom Screen</string>
     <string name="screen_upscaling_bottom_description">Has the bottom screen upscaled as well, and not only the top screen.</string>
     <string name="output_resolution">Output Resolution</string>
-    <string name="output_resolution_description">The share of the display\'s resolution that is drawn, the display scales it up. Lower is faster on weak graphics chips, also with no upscaling. Vulkan only.</string>
+    <string name="output_resolution_description">The share of the display\'s resolution that is drawn, the display scales it up. Lower is faster on weak graphics chips. Without an upscaler the screens are drawn no larger than the game\'s own pixels anyway, and the display scales them up. Vulkan only.</string>
     <string name="output_resolution_value">Output Resolution: %1$d%%</string>
     <string name="linear_filtering">Linear Filtering</string>
     <string name="linear_filtering_description">Enables linear filtering, which causes game visuals to appear smoother.</string>

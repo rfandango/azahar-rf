@@ -19,10 +19,12 @@ using TextureType = TexturingRegs::TextureConfig::TextureType;
 
 constexpr u32 SPIRV_VERSION_1_3 = 0x00010300;
 
-FragmentModule::FragmentModule(const FSConfig& config_, const Profile& profile_)
+FragmentModule::FragmentModule(const FSConfig& config_, const Profile& profile_,
+                               bool half_combiners_)
     : Sirit::Module{SPIRV_VERSION_1_3}, config{config_}, profile{profile_},
       use_fragment_shader_barycentric{profile.has_fragment_shader_barycentric &&
-                                      config.lighting.enable} {
+                                      config.lighting.enable},
+      half_combiners{half_combiners_} {
     config.ApplyProfile(profile_);
     DefineArithmeticTypes();
     DefineUniformStructs();
@@ -40,7 +42,9 @@ void FragmentModule::Generate() {
 
     legacy_rounding =
         (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyStageRounding) != 0;
+    relaxed = half_combiners;
     rounded_primary_color = Byteround(OpLoad(vec_ids.Get(4), primary_color_id), 4);
+    relaxed = false;
     // Without lighting both of its colours stay this zero, which the combiner stages that
     // take them then know
     primary_fragment_color = Note(ConstF32(0.f, 0.f, 0.f, 0.f), KnownZero | KnownRounded);
@@ -68,6 +72,8 @@ void FragmentModule::Generate() {
     // Write shader bytecode to emulate all enabled PICA lights
     WriteLighting();
 
+    relaxed = half_combiners;
+
     // Zero is a rounded value, and so are the two colours the game sets, the buffer's first
     // one here and the constant of each stage: they are handed over as the floats the
     // rounding gives for their bytes (the byte times 1/255, not the byte divided by 255).
@@ -80,6 +86,7 @@ void FragmentModule::Generate() {
         WriteTevStage(index);
     }
 
+    relaxed = false;
     WriteAlphaTestCondition(config.framebuffer.alpha_test_func);
 
     // Emulate the fog
@@ -95,7 +102,9 @@ void FragmentModule::Generate() {
         break;
     }
 
+    relaxed = half_combiners;
     Id color{Byteround(combiner_output, 4)};
+    relaxed = false;
     switch (config.framebuffer.logic_op) {
     case FramebufferRegs::LogicOp::Clear:
         color = ConstF32(0.f, 0.f, 0.f, 0.f);
@@ -208,6 +217,7 @@ void FragmentModule::WriteFog() {
     fog_factor = OpFClamp(f32_id, fog_factor, ConstF32(0.f), ConstF32(1.f));
 
     // Blend the fog
+    relaxed = half_combiners;
     const Id tex_env_rgb{
         OpVectorShuffle(vec_ids.Get(3), combiner_output, combiner_output, 0, 1, 2)};
     const Id fog_color{GetShaderDataMember(vec_ids.Get(3), ConstS32(19))};
@@ -215,6 +225,7 @@ void FragmentModule::WriteFog() {
         OpCompositeConstruct(vec_ids.Get(3), fog_factor, fog_factor, fog_factor)};
     const Id fog_result{OpFMix(vec_ids.Get(3), fog_color, tex_env_rgb, fog_factor_rgb)};
     combiner_output = OpVectorShuffle(vec_ids.Get(4), fog_result, combiner_output, 0, 1, 2, 6);
+    relaxed = false;
 }
 
 void FragmentModule::WriteGas() {
@@ -806,8 +817,12 @@ void FragmentModule::WriteAlphaTestCondition(FramebufferRegs::CompareFunc func) 
     case CompareFunc::LessThanOrEqual:
     case CompareFunc::GreaterThan:
     case CompareFunc::GreaterThanOrEqual: {
-        const Id alpha_scaled{
+        Id alpha_scaled{
             OpFMul(f32_id, OpCompositeExtract(f32_id, combiner_output, 3), ConstF32(255.f))};
+        if (half_combiners) {
+            // The value of a byte may be a little too small in half precision
+            alpha_scaled = OpRound(f32_id, alpha_scaled);
+        }
         const Id alpha_int{OpConvertFToS(i32_id, alpha_scaled)};
         const Id alphatest_ref{GetShaderDataMember(i32_id, ConstS32(1))};
         const Id alpha_comp_ref{compare(alpha_int, alphatest_ref)};
@@ -1061,16 +1076,26 @@ void FragmentModule::DefineTexSampler(u32 texture_unit) {
     // (See OpenGL 4.6 spec, 8.14.1 - Scale Factor and Level-of-Detail)
     const auto sample_lod = [&](Id tex_id) {
         const Id sampled_image{OpLoad(TypeSampledImage(image2d_id), tex_id)};
+        const auto sampled = [this](const auto& sample) {
+            relaxed = half_combiners;
+            const Id result{sample()};
+            relaxed = false;
+            return result;
+        };
         if (config.texture.single_level & (1u << texture_unit)) {
             // The one level the texture has, whatever the formula below would come to
-            return OpImageSampleExplicitLod(vec_ids.Get(4), sampled_image, texcoord,
-                                            spv::ImageOperandsMask::Lod, ConstF32(0.f));
+            return sampled([&] {
+                return OpImageSampleExplicitLod(vec_ids.Get(4), sampled_image, texcoord,
+                                                spv::ImageOperandsMask::Lod, ConstF32(0.f));
+            });
         }
         if (config.texture.hardware_lod) {
             // Above the console's resolution the GPU's own choice of level, with the bias
             const Id lod_bias{GetShaderDataMember(f32_id, ConstS32(27), ConstU32(texture_unit))};
-            return OpImageSampleImplicitLod(vec_ids.Get(4), sampled_image, texcoord,
-                                            spv::ImageOperandsMask::Bias, lod_bias);
+            return sampled([&] {
+                return OpImageSampleImplicitLod(vec_ids.Get(4), sampled_image, texcoord,
+                                                spv::ImageOperandsMask::Bias, lod_bias);
+            });
         }
         // The size of the texture comes with the uniforms. Asked of the texture here, it is one
         // more round trip to the GPU's texture unit for every fragment, before the derivatives
@@ -1087,8 +1112,10 @@ void FragmentModule::DefineTexSampler(u32 texture_unit) {
         const Id lod{OpLog2(f32_id, dx_dy_max)};
         const Id lod_bias{GetShaderDataMember(f32_id, ConstS32(27), ConstU32(texture_unit))};
         const Id biased_lod{OpFAdd(f32_id, lod, lod_bias)};
-        return OpImageSampleExplicitLod(vec_ids.Get(4), sampled_image, texcoord,
-                                        spv::ImageOperandsMask::Lod, biased_lod);
+        return sampled([&] {
+            return OpImageSampleExplicitLod(vec_ids.Get(4), sampled_image, texcoord,
+                                            spv::ImageOperandsMask::Lod, biased_lod);
+        });
     };
 
     const auto sample_3d = [&](Id tex_id, bool projection) {
@@ -1097,11 +1124,12 @@ void FragmentModule::DefineTexSampler(u32 texture_unit) {
         const Id texcoord0_w{OpLoad(f32_id, texcoord0_w_id)};
         const Id coord{OpCompositeConstruct(vec_ids.Get(3), OpCompositeExtract(f32_id, texcoord, 0),
                                             OpCompositeExtract(f32_id, texcoord, 1), texcoord0_w)};
-        if (projection) {
-            return OpImageSampleProjImplicitLod(vec_ids.Get(4), sampled_image, coord);
-        } else {
-            return OpImageSampleImplicitLod(vec_ids.Get(4), sampled_image, coord);
-        }
+        relaxed = half_combiners;
+        const Id result{projection
+                            ? OpImageSampleProjImplicitLod(vec_ids.Get(4), sampled_image, coord)
+                            : OpImageSampleImplicitLod(vec_ids.Get(4), sampled_image, coord)};
+        relaxed = false;
+        return result;
     };
 
     Id ret_val{void_id};
@@ -1549,6 +1577,21 @@ Id FragmentModule::AppendAlphaModifier(TevStageConfig::AlphaModifier modifier,
     }
 }
 
+Id FragmentModule::AddSigned(Id type, Id first, Id second) {
+    const bool vector = type.value != f32_id.value;
+    const auto constant = [&](f32 value) {
+        return vector ? ConstF32(value, value, value) : ConstF32(value);
+    };
+    if (!relaxed || !IsSnapped(first) || !IsSnapped(second)) {
+        return OpFSub(type, OpFAdd(type, first, second), constant(0.5f));
+    }
+    const auto whole = [&](Id value) {
+        return OpRound(type, OpFMul(type, value, constant(255.f)));
+    };
+    const Id sum{OpFSub(type, OpFAdd(type, whole(first), whole(second)), constant(127.5f))};
+    return Snapped(OpFMul(type, OpRound(type, sum), constant(1.f / 255.f)));
+}
+
 Id FragmentModule::AppendColorCombiner(Pica::TexturingRegs::TevStageConfig::Operation operation) {
     using Operation = TevStageConfig::Operation;
     const Id half_vec{ConstF32(0.5f, 0.5f, 0.5f)};
@@ -1596,8 +1639,8 @@ Id FragmentModule::AppendColorCombiner(Pica::TexturingRegs::TevStageConfig::Oper
         }
         break;
     case Operation::AddSigned:
-        color = OpFSub(vec_ids.Get(3), OpFAdd(vec_ids.Get(3), color_results_1, color_results_2),
-                       half_vec);
+        color = AddSigned(vec_ids.Get(3), color_results_1, color_results_2);
+        passed_on = IsSnapped(color);
         break;
     case Operation::Lerp:
         if (known_3 & KnownZero) {
@@ -1689,7 +1732,8 @@ Id FragmentModule::AppendAlphaCombiner(TevStageConfig::Operation operation) {
         }
         break;
     case Operation::AddSigned:
-        color = OpFSub(f32_id, OpFAdd(f32_id, alpha_results_1, alpha_results_2), ConstF32(0.5f));
+        color = AddSigned(f32_id, alpha_results_1, alpha_results_2);
+        passed_on = IsSnapped(color);
         break;
     case Operation::Lerp:
         if (known_3 & KnownZero) {
@@ -1819,6 +1863,7 @@ void FragmentModule::DefineUniformStructs() {
         TypePointer(spv::StorageClass::Uniform, shader_data_struct_id), spv::StorageClass::Uniform);
     Decorate(shader_data_id, spv::Decoration::DescriptorSet, 0);
     Decorate(shader_data_id, spv::Decoration::Binding, 2);
+
 }
 
 void FragmentModule::DefineInterface() {
@@ -1874,8 +1919,9 @@ void FragmentModule::DefineInterface() {
     }
 }
 
-std::vector<u32> GenerateFragmentShader(const FSConfig& config, const Profile& profile) {
-    FragmentModule module{config, profile};
+std::vector<u32> GenerateFragmentShader(const FSConfig& config, const Profile& profile,
+                                        bool half_combiners) {
+    FragmentModule module{config, profile, half_combiners};
     module.Generate();
     return module.Assemble();
 }

@@ -524,6 +524,33 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built, u32 vertic
 
     const bool is_dirty = scheduler.IsStateDirty(StateFlags::Pipeline);
     const bool pipeline_dirty = (current_pipeline != pipeline) || is_dirty;
+    switch_counts.draws++;
+    if (pipeline_dirty) {
+        const StaticPipelineInfo& was = last_bound_state;
+        const StaticPipelineInfo& now = info.state;
+        const bool same_vs = was.shader_ids[0] == now.shader_ids[0] &&
+                             was.shader_ids[2] == now.shader_ids[2];
+        const bool same_fs = was.shader_ids[1] == now.shader_ids[1];
+        switch_counts.switches++;
+        if (same_vs && same_fs) {
+            switch_counts.same_shaders++;
+            const auto differs = [](const auto& a, const auto& b) {
+                return std::memcmp(&a, &b, sizeof(a)) != 0;
+            };
+            switch_counts.state_differs[0] += differs(was.blending, now.blending);
+            switch_counts.state_differs[1] += differs(was.attachments, now.attachments);
+            switch_counts.state_differs[2] += differs(was.vertex_layout, now.vertex_layout);
+            switch_counts.state_differs[3] += differs(was.rasterization, now.rasterization);
+            switch_counts.state_differs[4] += differs(was.depth_stencil, now.depth_stencil);
+        } else if (same_vs) {
+            switch_counts.new_fragment++;
+        } else if (same_fs) {
+            switch_counts.new_vertex++;
+        } else {
+            switch_counts.both_new++;
+        }
+        last_bound_state = info.state;
+    }
     scheduler.Record([this, is_dirty, pipeline_dirty, pipeline, vertices,
                       current_dynamic = current_info.dynamic_info, dynamic = info.dynamic_info,
                       descriptor_sets = bound_descriptor_sets, offsets = offsets,

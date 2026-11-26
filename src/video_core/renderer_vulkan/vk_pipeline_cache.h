@@ -228,6 +228,31 @@ private:
     std::array<u64, MAX_SHADER_STAGES> shader_hashes;
     std::array<Shader*, MAX_SHADER_STAGES> current_shaders;
 
+public:
+    /// For the log: pipelines bound, by what changed from the one bound before. A switch costs
+    /// the GPU far more than a draw (on an A650 about 2 us at 400 MHz against 0.6), as the driver
+    /// renews the state of every stage and loads the shaders' code again.
+    struct SwitchCounts {
+        u32 draws{};
+        u32 switches{};
+        /// Of the switches: both shaders the same (only fixed state differs), only the
+        /// fragment shader new, only the vertex shader new, both new
+        u32 same_shaders{};
+        u32 new_fragment{};
+        u32 new_vertex{};
+        u32 both_new{};
+        /// Of those with the same shaders, where the state differs: blending, attachments,
+        /// vertex layout, rasterization, depth and stencil (a switch may count in several)
+        std::array<u32, 5> state_differs{};
+    };
+    SwitchCounts TakeSwitchCounts() {
+        return std::exchange(switch_counts, {});
+    }
+
+private:
+    SwitchCounts switch_counts;
+    StaticPipelineInfo last_bound_state{};
+
     /// The passthrough vertex shader, and the one for a top screen of another shape, by the ids
     /// pipelines know them by
     static constexpr u64 TRIVIAL_VERTEX_SHADER = 0;

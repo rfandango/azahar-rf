@@ -289,9 +289,14 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
     // One of the second set of switches changes the shaders too
     const bool legacy_rounding =
         (Common::TraceMarkers::Experiments2() & Common::TraceMarkers::LegacyStageRounding) != 0;
-    const auto named = [legacy_rounding](u64 hash, u32 with) {
+    const bool full_combiners =
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::FullPrecisionCombiners) != 0;
+    const auto named = [legacy_rounding, full_combiners](u64 hash, u32 with) {
         if (with != 0) {
             hash = Common::HashCombine(hash, u64{with});
+        }
+        if (full_combiners) {
+            hash = Common::HashCombine(hash, u64{1} << 41);
         }
         return legacy_rounding ? Common::HashCombine(hash, u64{1} << 40) : hash;
     };
@@ -307,7 +312,8 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
         LOG_NEW_OBJECT(Render_Vulkan, "New FS config {:016X}", fs_config_hash);
 
         parent.shader_workers.QueueWork([fs_config, user, this, &shader, fs_config_hash, variant,
-                                         legacy_rounding, queued = ShaderTiming::Clock::now()]() {
+                                         legacy_rounding, full_combiners,
+                                         queued = ShaderTiming::Clock::now()]() {
             CITRA_TRACE_SCOPE("Vulkan::CompileFS");
             CITRA_HITCH_SCOPE(ShaderCompile);
             CITRA_TRACE_COUNT(ShaderCompiles);
@@ -315,7 +321,7 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
             std::vector<u32> spirv;
             const bool use_spirv = parent.profile.vk_use_spirv_generator;
             if (use_spirv && !fs_config.UsesSpirvIncompatibleConfig()) {
-                spirv = SPIRV::GenerateFragmentShader(fs_config, parent.profile);
+                spirv = SPIRV::GenerateFragmentShader(fs_config, parent.profile, !full_combiners);
 #ifdef CITRA_ENABLE_TRACE_MARKERS
                 if (variant & Common::TraceMarkers::RelaxedShaderPrecision) {
                     spirv = RelaxPrecision(spirv);
@@ -345,7 +351,7 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
             }
 #endif
 
-            if (user.IsCacheable() && variant == 0 && !legacy_rounding) {
+            if (user.IsCacheable() && variant == 0 && !legacy_rounding && !full_combiners) {
                 // Only cache to disk if the user config is cacheable
                 AppendFSSPIRV(fs_cache, spirv, fs_config_hash);
                 FSConfigEntry entry{.version = FSConfigEntry::EXPECTED_VERSION,
@@ -1337,7 +1343,7 @@ bool ShaderDiskCache::InitFSCache(const std::atomic_bool& stop_loading,
             !entry->fs_config.UsesSpirvIncompatibleConfig()) {
             // Use SPIRV generator directly
 
-            spirv = SPIRV::GenerateFragmentShader(entry->fs_config, parent.profile);
+            spirv = SPIRV::GenerateFragmentShader(entry->fs_config, parent.profile, true);
             shader.module = CompileSPV(spirv, parent.instance.GetDevice());
         } else {
             // Use GLSL generator then convert to SPIRV

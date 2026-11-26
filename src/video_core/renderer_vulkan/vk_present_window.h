@@ -111,6 +111,15 @@ public:
         return swapchain.GetExtent();
     }
 
+    /// See Swapchain::SetNativeScale
+    void SetNativeScale(float scale) {
+        swapchain.SetNativeScale(scale);
+    }
+
+    bool IsOutputReduced() const noexcept {
+        return swapchain.IsOutputReduced();
+    }
+
     vk::Format GetSurfaceFormat() const noexcept {
         return swapchain.GetSurfaceFormat().format;
     }

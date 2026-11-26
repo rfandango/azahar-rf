@@ -139,6 +139,13 @@ private:
     RenderManager& renderpass_cache;
     DescriptorUpdateQueue& update_queue;
     PipelineCache pipeline_cache;
+
+public:
+    PipelineCache::SwitchCounts TakeSwitchCounts() {
+        return pipeline_cache.TakeSwitchCounts();
+    }
+
+private:
     TextureRuntime runtime;
     RasterizerCache res_cache;
 

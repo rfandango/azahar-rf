@@ -372,8 +372,42 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
     });
 }
 
+float RendererVulkan::NativeScale(const Layout::FramebufferLayout& layout) const {
+    float scale = 0.f;
+    const auto take = [&](bool shown, const Common::Rectangle<u32>& place, u32 screen_id) {
+        const float across = static_cast<float>(std::max(place.GetWidth(), place.GetHeight()));
+        const ScreenInfo& info = screen_infos[screen_id];
+        if (!shown || across < 1.f || info.image_width == 0) {
+            return;
+        }
+        // The screen's pixels in the image it is in, along its longer side
+        const auto& coords = info.texcoords;
+        const float wide = std::abs(coords.right - coords.left) * static_cast<float>(info.image_width);
+        const float high =
+            std::abs(coords.bottom - coords.top) * static_cast<float>(info.image_height);
+        scale = std::max(scale, std::max(wide, high) / across);
+    };
+    take(layout.top_screen_enabled, layout.top_screen, 0);
+    take(layout.bottom_screen_enabled, layout.bottom_screen, 2);
+    return std::min(scale, 1.f);
+}
+
 void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
                                     bool flipped) {
+#ifdef ANDROID
+    // The screens are drawn as large as they are in the game's own pixels, and the display's
+    // hardware enlarges the picture, as the console sends its pictures to its displays. Not where
+    // the enlarging is done here: by an upscaler, in steps of whole pixels or without filtering
+    // (the display filters), or for a stereo mode. (The swapchain is made anew at the next image
+    // where it asks for another size.)
+    const bool native =
+        Settings::values.screen_upscaling.GetValue() == Settings::ScreenUpscaling::Filter &&
+        Settings::values.filter_mode.GetValue() &&
+        !Settings::values.use_integer_scaling.GetValue() &&
+        layout.render_3d_mode == Settings::StereoRenderOption::Off &&
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyFullSizeOutput) == 0;
+    window.SetNativeScale(native ? NativeScale(layout) : 0.f);
+#endif
     if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
         Core::PerfStats::game_frames_updated) {
         const bool direct = window.DrawsIntoSwapchain();
@@ -392,7 +426,7 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
             u32 frame_width = sideways ? layout.height : layout.width;
             u32 frame_height = sideways ? layout.width : layout.height;
 #ifdef ANDROID
-            if (Settings::values.output_resolution.GetValue() != 100) {
+            if (window.IsOutputReduced()) {
                 frame_width = window.Extent().width;
                 frame_height = window.Extent().height;
             }
@@ -1539,6 +1573,18 @@ void RendererVulkan::ReportGpuTime() {
         add(reported_copies[1], secondary_present_window_ptr->TakeCopyTime());
     }
 
+    {
+        const auto counts = rasterizer.TakeSwitchCounts();
+        report_switches.draws += counts.draws;
+        report_switches.switches += counts.switches;
+        report_switches.same_shaders += counts.same_shaders;
+        report_switches.new_fragment += counts.new_fragment;
+        report_switches.new_vertex += counts.new_vertex;
+        report_switches.both_new += counts.both_new;
+        for (std::size_t i = 0; i < counts.state_differs.size(); i++) {
+            report_switches.state_differs[i] += counts.state_differs[i];
+        }
+    }
     for (const GpuPassMeter::Sum& sum : renderpass_cache.TakePassTimes()) {
         const auto same = std::ranges::find_if(reported_passes, [&](const auto& one) {
             return one.target.framebuffer == sum.target.framebuffer &&
@@ -1593,6 +1639,20 @@ void RendererVulkan::ReportGpuTime() {
              GetResolutionScaleFactor().Factor(),
              static_cast<u32>(Settings::values.screen_upscaling.GetValue()),
              Settings::values.screen_upscaling_sharpness.GetValue());
+    if (const auto& counts = report_switches; counts.draws != 0) {
+        const auto per = [](u32 value) { return static_cast<double>(value) / REPORT_VBLANKS; };
+        LOG_INFO(Render_Vulkan,
+                 "Pipelines, a VBlank: {:.1f} draws, {:.1f} switches; of the switches {:.1f} with "
+                 "the same shaders (state differing: blending {:.1f}, attachments {:.1f}, vertex "
+                 "layout {:.1f}, rasterization {:.1f}, depth and stencil {:.1f}), {:.1f} with a new "
+                 "fragment shader only, {:.1f} a new vertex shader only, {:.1f} both new",
+                 per(counts.draws), per(counts.switches), per(counts.same_shaders),
+                 per(counts.state_differs[0]), per(counts.state_differs[1]),
+                 per(counts.state_differs[2]), per(counts.state_differs[3]),
+                 per(counts.state_differs[4]), per(counts.new_fragment), per(counts.new_vertex),
+                 per(counts.both_new));
+    }
+    report_switches = {};
     std::vector<GpuPassMeter::Sum> passes = std::move(reported_passes);
     reported_passes.clear();
     std::ranges::sort(passes, [](const auto& a, const auto& b) { return a.time > b.time; });

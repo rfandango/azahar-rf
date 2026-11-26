@@ -38,7 +38,7 @@ class FragmentModule : public Sirit::Module {
     static constexpr u32 NUM_NON_PROC_TEX_UNITS = 3;
 
 public:
-    explicit FragmentModule(const FSConfig& config, const Profile& profile);
+    explicit FragmentModule(const FSConfig& config, const Profile& profile, bool half_combiners);
     ~FragmentModule();
 
     /// Emits SPIR-V bytecode corresponding to the provided pica fragment configuration
@@ -82,6 +82,87 @@ private:
 
     [[nodiscard]] Id AppendProcTexCombineAndMap(Pica::TexturingRegs::ProcTexCombiner combiner, Id u,
                                                 Id v, Id offset);
+
+    // While `relaxed` is on, what the instructions that follow work out is marked as needing no
+    // more than half precision, where it is a float. The combiners work with bytes, which half
+    // holds exactly: what comes out of one after the rounding is the same byte or, for a product
+    // in 2 to 5 out of a hundred pairs of bytes, the one next to it.
+    [[nodiscard]] bool IsFloat(Id type) const {
+        return type.value == f32_id.value || type.value == vec_ids.ids[0].value ||
+               type.value == vec_ids.ids[1].value || type.value == vec_ids.ids[2].value;
+    }
+    Id Marked(Id type, Id result) {
+        if (relaxed && IsFloat(type)) {
+            Decorate(result, spv::Decoration::RelaxedPrecision);
+        }
+        return result;
+    }
+    template <typename... Args>
+    Id OpLoad(Id type, Args... args) {
+        return Marked(type, Module::OpLoad(type, args...));
+    }
+    template <typename... Args>
+    Id OpFunctionCall(Id type, Args... args) {
+        return Marked(type, Module::OpFunctionCall(type, args...));
+    }
+    template <typename... Args>
+    Id OpVectorShuffle(Id type, Id vector_1, Id vector_2, Args... args) {
+        return Marked(type, Module::OpVectorShuffle(type, vector_1, vector_2, args...));
+    }
+    template <typename... Args>
+    Id OpCompositeExtract(Id type, Id composite, Args... args) {
+        return Marked(type, Module::OpCompositeExtract(type, composite, args...));
+    }
+    template <typename... Args>
+    Id OpCompositeConstruct(Id type, Args... args) {
+        return Marked(type, Module::OpCompositeConstruct(type, args...));
+    }
+    template <typename... Args>
+    Id OpImageSampleImplicitLod(Id type, Args... args) {
+        return Marked(type, Module::OpImageSampleImplicitLod(type, args...));
+    }
+    template <typename... Args>
+    Id OpImageSampleExplicitLod(Id type, Args... args) {
+        return Marked(type, Module::OpImageSampleExplicitLod(type, args...));
+    }
+    template <typename... Args>
+    Id OpImageSampleProjImplicitLod(Id type, Args... args) {
+        return Marked(type, Module::OpImageSampleProjImplicitLod(type, args...));
+    }
+    Id OpVectorTimesScalar(Id type, Id a, Id b) {
+        return Marked(type, Module::OpVectorTimesScalar(type, a, b));
+    }
+    Id OpFAdd(Id type, Id a, Id b) {
+        return Marked(type, Module::OpFAdd(type, a, b));
+    }
+    Id OpFSub(Id type, Id a, Id b) {
+        return Marked(type, Module::OpFSub(type, a, b));
+    }
+    Id OpFMul(Id type, Id a, Id b) {
+        return Marked(type, Module::OpFMul(type, a, b));
+    }
+    Id OpDot(Id type, Id a, Id b) {
+        return Marked(type, Module::OpDot(type, a, b));
+    }
+    Id OpFMin(Id type, Id a, Id b) {
+        return Marked(type, Module::OpFMin(type, a, b));
+    }
+    Id OpFClamp(Id type, Id value, Id low, Id high) {
+        return Marked(type, Module::OpFClamp(type, value, low, high));
+    }
+    Id OpFma(Id type, Id a, Id b, Id c) {
+        return Marked(type, Module::OpFma(type, a, b, c));
+    }
+    Id OpFMix(Id type, Id x, Id y, Id a) {
+        return Marked(type, Module::OpFMix(type, x, y, a));
+    }
+    Id OpRound(Id type, Id value) {
+        return Marked(type, Module::OpRound(type, value));
+    }
+
+    /// The sum of two values less a half. Of two bytes that is always halfway between two bytes:
+    /// where only half precision is kept, it is worked out in whole numbers, which are exact.
+    [[nodiscard]] Id AddSigned(Id type, Id first, Id second);
 
     /// Rounds the provided variable to the nearest 1/255th, unless it is known to hold
     /// nothing else already
@@ -250,6 +331,9 @@ private:
     const Profile& profile;
 
     bool use_fragment_shader_barycentric{};
+    /// Whether the combiners work in half precision, and whether that is what is being written
+    bool half_combiners{};
+    bool relaxed{};
 
     Id void_id{};
     Id bool_id{};
@@ -321,9 +405,10 @@ private:
  * Generates the SPIR-V fragment shader program source code for the current Pica state
  * @param config ShaderCacheKey object generated for the current Pica state, used for the shader
  *               configuration (NOTE: Use state in this struct only, not the Pica registers!)
- * @param separable_shader generates shader that can be used for separate shader object
- * @returns String of the shader source code
+ * @param half_combiners whether the combiners are marked as needing no more than half precision
+ * @returns The words of the SPIR-V module
  */
-std::vector<u32> GenerateFragmentShader(const FSConfig& config, const Profile& profile);
+std::vector<u32> GenerateFragmentShader(const FSConfig& config, const Profile& profile,
+                                        bool half_combiners);
 
 } // namespace Pica::Shader::Generator::SPIRV
