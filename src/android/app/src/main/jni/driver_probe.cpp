@@ -31,10 +31,13 @@ bool ProbeTurnipDriver(void* vulkan_library, std::string& description) {
         return false;
     }
 
+    // Under the names the renderer goes by (VideoCore's CreateInstance): what Turnip is told of an
+    // application it may take once for the process, from whoever comes first, such as that it
+    // renders directly for this one on a6xx.
     const VkApplicationInfo application = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pApplicationName = "Azahar",
-        .pEngineName = "Azahar",
+        .pApplicationName = "Citra",
+        .pEngineName = "Citra Vulkan",
         .apiVersion = VK_API_VERSION_1_1,
     };
     const VkInstanceCreateInfo instance_info = {
