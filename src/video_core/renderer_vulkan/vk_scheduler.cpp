@@ -227,6 +227,104 @@ std::array<GpuSpanMeter::Sum, GpuSpanMeter::KINDS> GpuSpanMeter::Take() {
     return sums;
 }
 
+GpuPassMeter::GpuPassMeter(const Instance& instance_) : instance{instance_} {
+    const vk::PhysicalDevice physical_device = instance.GetPhysicalDevice();
+    const auto families = physical_device.getQueueFamilyProperties();
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const u32 valid_bits = family < families.size() ? families[family].timestampValidBits : 0;
+    if (valid_bits == 0) {
+        return;
+    }
+    valid_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
+    tick_ns = physical_device.getProperties().limits.timestampPeriod;
+    const vk::QueryPoolCreateInfo pool_info = {
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = SLOTS * 2,
+    };
+    try {
+        pool = instance.GetDevice().createQueryPoolUnique(pool_info);
+    } catch (const vk::SystemError&) {
+        // Nothing is measured then
+    }
+}
+
+GpuPassMeter::~GpuPassMeter() = default;
+
+void GpuPassMeter::Begin(vk::CommandBuffer cmdbuf) {
+    is_open = false;
+    if (!pool) {
+        return;
+    }
+    {
+        std::scoped_lock lock{mutex};
+        if (pending.size() >= SLOTS - 1) {
+            return;
+        }
+    }
+    open_slot = next_slot;
+    next_slot = (next_slot + 1) % SLOTS;
+    is_open = true;
+    cmdbuf.resetQueryPool(*pool, open_slot * 2, 2);
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *pool, open_slot * 2);
+}
+
+void GpuPassMeter::End(vk::CommandBuffer cmdbuf, const Target& target, u32 draws) {
+    if (!is_open) {
+        return;
+    }
+    is_open = false;
+    cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *pool, open_slot * 2 + 1);
+    std::scoped_lock lock{mutex};
+    pending.push_back(Pending{.slot = open_slot, .target = target, .draws = draws});
+}
+
+std::vector<GpuPassMeter::Sum> GpuPassMeter::Take() {
+    std::vector<Sum> sums;
+    while (pool) {
+        Pending entry;
+        {
+            std::scoped_lock lock{mutex};
+            if (pending.empty()) {
+                break;
+            }
+            entry = pending.front();
+        }
+        std::array<u64, 4> data{};
+        const vk::Result result = instance.GetDevice().getQueryPoolResults(
+            *pool, entry.slot * 2, 2, sizeof(data), data.data(), sizeof(u64) * 2,
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        if (result != vk::Result::eSuccess || data[1] == 0 || data[3] == 0 ||
+            data[0] == last_begin[entry.slot]) {
+            break;
+        }
+        last_begin[entry.slot] = data[0];
+        {
+            std::scoped_lock lock{mutex};
+            pending.pop_front();
+        }
+        const u64 begin = data[0] & valid_mask;
+        const u64 end = data[2] & valid_mask;
+        auto sum = std::ranges::find_if(sums, [&](const Sum& one) {
+            return one.target.framebuffer == entry.target.framebuffer &&
+                   one.target.loads == entry.target.loads &&
+                   one.target.width == entry.target.width &&
+                   one.target.height == entry.target.height;
+        });
+        if (sum == sums.end()) {
+            sums.push_back({.target = entry.target});
+            sum = sums.end() - 1;
+        }
+        if (end > begin) {
+            sum->time += std::chrono::nanoseconds{
+                static_cast<s64>(static_cast<double>(end - begin) * tick_ns)};
+        }
+        sum->passes++;
+        sum->draws += entry.draws;
+    }
+    std::ranges::sort(sums, [](const Sum& a, const Sum& b) { return a.time > b.time; });
+    return sums;
+}
+
 void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf) {
     auto command = first;
     while (command != nullptr) {

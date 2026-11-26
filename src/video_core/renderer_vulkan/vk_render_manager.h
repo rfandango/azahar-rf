@@ -11,6 +11,7 @@
 
 #include "common/math_util.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace VideoCore {
 enum class PixelFormat : u32;
@@ -19,7 +20,6 @@ enum class PixelFormat : u32;
 namespace Vulkan {
 
 class Instance;
-class Scheduler;
 class Framebuffer;
 
 struct RenderPass {
@@ -70,6 +70,11 @@ public:
     /// Exits from any currently active renderpass instance, and carries out the clears that
     /// were held back. Everything that records commands of its own calls this first.
     void EndRendering();
+
+    /// How long the GPU took for the passes that were finished since this was last called
+    [[nodiscard]] std::vector<GpuPassMeter::Sum> TakePassTimes() {
+        return pass_meter.Take();
+    }
 
     /// While this is on, clears given to DeferClear are held back. A render pass that begins
     /// on their images, with an area that can be theirs, clears as it begins: a GPU that
@@ -130,6 +135,9 @@ private:
     bool shadow_rendering{};
     RenderPass pass{};
     u32 num_draws{};
+    GpuPassMeter pass_meter;
+    GpuPassMeter::Target pass_target, next_target;
+    u32 pass_draws{};
 };
 
 } // namespace Vulkan

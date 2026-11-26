@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include "common/assert.h"
 #include "common/diagnostics.h"
 #include "common/hash.h"
@@ -1494,6 +1495,37 @@ void RendererVulkan::Compose() {
     ReportGpuTime();
 }
 
+namespace {
+
+/// What the system says of the GPU's clock, where an app may read it
+std::string GpuClockText() {
+    const auto read = [](const char* path) -> std::string {
+        std::FILE* const file = std::fopen(path, "r");
+        if (!file) {
+            return {};
+        }
+        char line[64]{};
+        const bool got = std::fgets(line, sizeof(line), file) != nullptr;
+        std::fclose(file);
+        std::string text = got ? line : "";
+        while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) {
+            text.pop_back();
+        }
+        return text;
+    };
+    std::string now = read("/sys/class/kgsl/kgsl-3d0/gpuclk");
+    if (now.empty()) {
+        now = read("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq");
+    }
+    if (now.empty()) {
+        return {};
+    }
+    const std::string most = read("/sys/class/kgsl/kgsl-3d0/max_gpuclk");
+    return fmt::format(" (GPU clock {} of {} Hz)", now, most.empty() ? "?" : most);
+}
+
+} // Anonymous namespace
+
 void RendererVulkan::ReportGpuTime() {
     const auto add = [](GpuSpanMeter::Sum& to, const GpuSpanMeter::Sum& sum) {
         to.time += sum.time;
@@ -1505,6 +1537,21 @@ void RendererVulkan::ReportGpuTime() {
     add(reported_copies[0], main_present_window.TakeCopyTime());
     if (secondary_present_window_ptr) {
         add(reported_copies[1], secondary_present_window_ptr->TakeCopyTime());
+    }
+
+    for (const GpuPassMeter::Sum& sum : renderpass_cache.TakePassTimes()) {
+        const auto same = std::ranges::find_if(reported_passes, [&](const auto& one) {
+            return one.target.framebuffer == sum.target.framebuffer &&
+                   one.target.loads == sum.target.loads && one.target.width == sum.target.width &&
+                   one.target.height == sum.target.height;
+        });
+        if (same == reported_passes.end()) {
+            reported_passes.push_back(sum);
+            continue;
+        }
+        same->time += sum.time;
+        same->passes += sum.passes;
+        same->draws += sum.draws;
     }
 
     static constexpr u32 REPORT_VBLANKS = 300;
@@ -1546,6 +1593,35 @@ void RendererVulkan::ReportGpuTime() {
              GetResolutionScaleFactor().Factor(),
              static_cast<u32>(Settings::values.screen_upscaling.GetValue()),
              Settings::values.screen_upscaling_sharpness.GetValue());
+    std::vector<GpuPassMeter::Sum> passes = std::move(reported_passes);
+    reported_passes.clear();
+    std::ranges::sort(passes, [](const auto& a, const auto& b) { return a.time > b.time; });
+    if (!passes.empty()) {
+        std::chrono::nanoseconds whole{};
+        u32 count = 0;
+        std::string text;
+        for (const GpuPassMeter::Sum& sum : passes) {
+            whole += sum.time;
+            count += sum.passes;
+        }
+        for (std::size_t i = 0; i < std::min<std::size_t>(passes.size(), 9); i++) {
+            const GpuPassMeter::Sum& sum = passes[i];
+            text += fmt::format("{} {:X} {}x{} formats {}/{}{}{}{}: {:.2f} passes of {:.0f} draws, "
+                                "{:.2f} ms",
+                                i == 0 ? "" : ";", sum.target.framebuffer & 0xFFFFF,
+                                sum.target.width, sum.target.height, sum.target.color,
+                                sum.target.depth, (sum.target.loads & 1) != 0 ? " loads colour" : "",
+                                (sum.target.loads & 2) != 0 ? " loads depth" : "",
+                                (sum.target.loads & 4) != 0 ? " stores depth" : "",
+                                static_cast<double>(sum.passes) / REPORT_VBLANKS,
+                                sum.passes != 0 ? static_cast<double>(sum.draws) / sum.passes : 0.0,
+                                ms(sum.time) / REPORT_VBLANKS);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Render passes, a VBlank: {:.1f} in {:.2f} ms{}, into {} targets:{}",
+                 static_cast<double>(count) / REPORT_VBLANKS, ms(whole) / REPORT_VBLANKS,
+                 GpuClockText(), passes.size(), text);
+    }
     report_vblanks = 0;
     report_start = now;
     reported_busy = {};

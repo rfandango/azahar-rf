@@ -189,6 +189,7 @@ private:
     /// Pixels of the frame being drawn for one of the layout
     float output_scale = 1.0f;
     GpuSpanMeter draw_meter;
+    std::vector<GpuPassMeter::Sum> reported_passes;
     std::chrono::nanoseconds reported_busy{};
     std::array<GpuSpanMeter::Sum, GpuSpanMeter::KINDS> reported_draws{};
     std::array<GpuSpanMeter::Sum, 2> reported_copies{};

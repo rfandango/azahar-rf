@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 #include "common/alignment.h"
 #include "common/common_funcs.h"
 #include "common/polyfill_thread.h"
@@ -131,6 +132,59 @@ private:
     std::deque<Pending> pending;
     // Of the thread that takes them in: where the stretch that last had a slot began, to tell
     // the old figures of a slot, which the GPU has not got to clearing yet, from new ones
+    std::array<u64, SLOTS> last_begin{};
+};
+
+/// Measures how long the GPU takes for each render pass, and adds it up by what they draw into.
+/// As GpuSpanMeter.
+class GpuPassMeter {
+public:
+    /// What a pass draws into, and what it does to that as it begins and ends
+    struct Target {
+        u64 framebuffer{};
+        u32 width{};
+        u32 height{};
+        /// Pixel formats, as numbers
+        u32 color{};
+        u32 depth{};
+        /// 1: loads colour, 2: loads depth, 4: stores depth
+        u32 loads{};
+    };
+    struct Sum {
+        Target target;
+        std::chrono::nanoseconds time{};
+        u32 passes{};
+        u32 draws{};
+    };
+
+    explicit GpuPassMeter(const Instance& instance);
+    ~GpuPassMeter();
+
+    void Begin(vk::CommandBuffer cmdbuf);
+    void End(vk::CommandBuffer cmdbuf, const Target& target, u32 draws);
+
+    /// What was finished since this was last called, by target, the ones that took longest first.
+    /// One thread at a time.
+    [[nodiscard]] std::vector<Sum> Take();
+
+private:
+    static constexpr u32 SLOTS = 512;
+
+    struct Pending {
+        u32 slot;
+        Target target;
+        u32 draws;
+    };
+
+    const Instance& instance;
+    vk::UniqueQueryPool pool;
+    double tick_ns{};
+    u64 valid_mask{};
+    u32 next_slot{};
+    u32 open_slot{};
+    bool is_open{};
+    std::mutex mutex;
+    std::deque<Pending> pending;
     std::array<u64, SLOTS> last_begin{};
 };
 

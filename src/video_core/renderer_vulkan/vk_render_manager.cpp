@@ -23,7 +23,7 @@ using VideoCore::PixelFormat;
 using VideoCore::SurfaceType;
 
 RenderManager::RenderManager(const Instance& instance, Scheduler& scheduler)
-    : instance{instance}, scheduler{scheduler} {}
+    : instance{instance}, scheduler{scheduler}, pass_meter{instance} {}
 
 RenderManager::~RenderManager() = default;
 
@@ -65,6 +65,7 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer, Common::Recta
         if (render_area == open) {
             // Whatever it loaded when it began, the pass that is open is the one to go on with
             num_draws++;
+            pass_draws++;
             return;
         }
     }
@@ -116,6 +117,9 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer, Common::Recta
     const bool never_store_depth = (experiments2 & Common::TraceMarkers::NoDepthStores) != 0;
     const VideoCore::PixelFormat color = framebuffer->Format(SurfaceType::Color);
     const VideoCore::PixelFormat depth = framebuffer->Format(SurfaceType::Depth);
+    next_target.color = static_cast<u32>(color);
+    next_target.depth = static_cast<u32>(depth);
+    next_target.loads = 7;
     if (!legacy && framebuffer->Samples() == 1) {
         const bool at_start = render_area == drawn_to;
         const auto load_op = [&](u32 index, VideoCore::PixelFormat format, bool overwritten) {
@@ -131,6 +135,9 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer, Common::Recta
         const vk::AttachmentLoadOp color_load = load_op(0, color, overwrites_color);
         const vk::AttachmentLoadOp depth_load = load_op(1, depth, overwrites_depth);
         const bool store_depth = !never_store_depth || depth == PixelFormat::Invalid;
+        next_target.loads = (color_load == vk::AttachmentLoadOp::eLoad ? 1u : 0u) |
+                            (depth_load == vk::AttachmentLoadOp::eLoad ? 2u : 0u) |
+                            (store_depth ? 4u : 0u);
         if (color_load != vk::AttachmentLoadOp::eLoad ||
             depth_load != vk::AttachmentLoadOp::eLoad || !store_depth) {
             const auto is = [&](vk::AttachmentLoadOp op, const char* colour_text,
@@ -169,6 +176,7 @@ void RenderManager::BeginRendering(const Framebuffer* framebuffer, Common::Recta
 void RenderManager::BeginRendering(const RenderPass& new_pass) {
     if (pass == new_pass) [[likely]] {
         num_draws++;
+        pass_draws++;
         return;
     }
 
@@ -179,7 +187,8 @@ void RenderManager::BeginRendering(const RenderPass& new_pass) {
                      new_pass.render_area.offset.x, new_pass.render_area.offset.y,
                      new_pass.render_area.extent.width, new_pass.render_area.extent.height,
                      new_pass.do_clear);
-    scheduler.Record([info = new_pass](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, info = new_pass](vk::CommandBuffer cmdbuf) {
+        pass_meter.Begin(cmdbuf);
         const vk::RenderPassBeginInfo renderpass_begin_info = {
             .renderPass = info.render_pass,
             .framebuffer = info.framebuffer,
@@ -191,6 +200,13 @@ void RenderManager::BeginRendering(const RenderPass& new_pass) {
     });
 
     pass = new_pass;
+    pass_draws = 1;
+    pass_target = next_target;
+    next_target = {};
+    pass_target.framebuffer =
+        reinterpret_cast<uintptr_t>(static_cast<VkFramebuffer>(new_pass.framebuffer));
+    pass_target.width = new_pass.render_area.extent.width;
+    pass_target.height = new_pass.render_area.extent.height;
 }
 
 void RenderManager::EndRendering() {
@@ -238,8 +254,9 @@ void RenderManager::EndPass() {
     }
 
     CITRA_FRAME_DUMP("vk renderpass end");
-    scheduler.Record([images = images, aspects = aspects,
-                      shadow_rendering = shadow_rendering](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, images = images, aspects = aspects,
+                      shadow_rendering = shadow_rendering, target = pass_target,
+                      draws = pass_draws](vk::CommandBuffer cmdbuf) {
         u32 num_barriers = 0;
         vk::PipelineStageFlags pipeline_flags{};
         vk::AccessFlags src_access_flags{};
@@ -279,6 +296,7 @@ void RenderManager::EndPass() {
             };
         }
         cmdbuf.endRenderPass();
+        pass_meter.End(cmdbuf, target, draws);
         if (num_barriers == 0) {
             return;
         }
