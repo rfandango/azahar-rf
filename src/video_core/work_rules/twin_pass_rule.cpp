@@ -3,12 +3,13 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <bit>
+#include <chrono>
 #include <string>
 #include <fmt/format.h>
 #include "common/logging/log.h"
-#include "common/settings.h"
 #include "common/trace_markers.h"
 #include "video_core/pica/regs_internal.h"
+#include "video_core/pica/used_of_light.h"
 #include "video_core/work_rules/twin_pass_rule.h"
 
 namespace VideoCore {
@@ -46,12 +47,74 @@ void TwinPassRule::EndRuns() {
     run_draws = 0;
 }
 
-bool TwinPassRule::IsTwinOf(const DrawRecord& record, bool clears, DrawFacts& facts) {
-    if (record.clear != clears || record.state != facts.StateHash(clears)) {
+TwinPassRule::FirstDraw::FirstDraw(DrawFacts& facts, bool clears) : draw{facts, clears} {
+    if (!clears) {
+        draw.state = facts.StateHashButLightVectors();
+        num_lights = LightsOf(facts, lights);
+    }
+}
+
+u32 TwinPassRule::LightsOf(DrawFacts& facts, std::array<std::array<float, 6>, 8>& lights) {
+    const auto& lighting = facts.Regs().lighting;
+    if (lighting.disable) {
+        return 0;
+    }
+    const u32 count = lighting.max_light_index + 1;
+    for (u32 index = 0; index < count; index++) {
+        const auto& light = lighting.light[lighting.light_enable.GetNum(index)];
+        const Pica::UsedOfLight used = Pica::UsedOf(lighting, index);
+        lights[index] = {};
+        if (used.vector) {
+            lights[index][0] = Pica::f16::FromRaw(light.x).ToFloat32();
+            lights[index][1] = Pica::f16::FromRaw(light.y).ToFloat32();
+            lights[index][2] = Pica::f16::FromRaw(light.z).ToFloat32();
+        }
+        if (used.spot) {
+            lights[index][3] = static_cast<float>(light.spot_x) / 2047.f;
+            lights[index][4] = static_cast<float>(light.spot_y) / 2047.f;
+            lights[index][5] = static_cast<float>(light.spot_z) / 2047.f;
+        }
+    }
+    return count;
+}
+
+float TwinPassRule::LightShift(const FirstDraw& record, DrawFacts& facts) {
+    std::array<std::array<float, 6>, 8> lights;
+    const u32 count = LightsOf(facts, lights);
+    if (count != record.num_lights) {
+        return std::numeric_limits<float>::infinity();
+    }
+    float largest = 0.f;
+    for (u32 index = 0; index < count; index++) {
+        // Where it is, and where it points
+        for (u32 part = 0; part < 6; part += 3) {
+            float scale = 1e-4f;
+            float apart = 0.f;
+            for (u32 i = part; i < part + 3; i++) {
+                scale = std::max(scale, std::abs(record.lights[index][i]));
+                apart = std::max(apart, std::abs(lights[index][i] - record.lights[index][i]));
+                if (!(lights[index][i] == lights[index][i]) ||
+                    !(record.lights[index][i] == record.lights[index][i])) {
+                    return std::numeric_limits<float>::infinity();
+                }
+            }
+            largest = std::max(largest, apart / scale);
+        }
+    }
+    return largest;
+}
+
+bool TwinPassRule::IsTwinOf(const FirstDraw& first_draw, bool clears, DrawFacts& facts) {
+    const DrawRecord& record = first_draw.draw;
+    if (record.clear != clears) {
         return false;
     }
     if (clears) {
-        return true;
+        return record.state == facts.StateHash(true);
+    }
+    if (record.state != facts.StateHashButLightVectors() ||
+        !(LightShift(first_draw, facts) <= MAX_SHIFT)) {
+        return false;
     }
     const UniformDifference difference = CompareUniforms(record, facts, MAX_DIFFERING, MAX_SHIFT);
     if (difference.differing > MAX_DIFFERING || !(difference.largest_shift <= MAX_SHIFT)) {
@@ -63,21 +126,25 @@ bool TwinPassRule::IsTwinOf(const DrawRecord& record, bool clears, DrawFacts& fa
 }
 
 void TwinPassRule::ExplainNoTwin(bool clears, DrawFacts& facts) {
-    if (explained >= 12) {
+    // One of them a second is enough
+    const auto now_is = std::chrono::steady_clock::now();
+    if (explained >= 300 || (explained != 0 && now_is - last_explained < std::chrono::seconds{1})) {
         return;
     }
     explained++;
+    last_explained = now_is;
     const Pica::RegsInternal& regs = facts.Regs();
     std::string why;
     if (at >= first.size()) {
         why = fmt::format("the first pass has only {} draws on record", first.size());
     } else {
-        const DrawRecord& record = first[at];
+        const DrawRecord& record = first[at].draw;
+        const u64 state = clears ? facts.StateHash(true) : facts.StateHashButLightVectors();
         if (record.clear != clears) {
             why = fmt::format("it {} all of its viewport, its counterpart {}",
                               clears ? "overwrites" : "does not overwrite",
                               record.clear ? "does" : "does not");
-        } else if (record.state != facts.StateHash(clears)) {
+        } else if (record.state != state) {
             why = "registers differ:";
             u32 listed = 0;
             if (at < first_regs.size()) {
@@ -93,8 +160,32 @@ void TwinPassRule::ExplainNoTwin(bool clears, DrawFacts& facts) {
                 });
             }
             if (listed == 0) {
-                why += " none of those that are compared now, so the vertex shader's program "
-                       "or which registers are in use";
+                why += " none of those that are compared now, so the vertex shader's program, the "
+                       "fog table or which registers are in use";
+            }
+        } else if (const float shift = LightShift(first[at], facts); !(shift <= MAX_SHIFT)) {
+            why = fmt::format("its lights are off by {:.4f}", shift);
+            std::array<std::array<float, 6>, 8> now_lights;
+            const u32 count = LightsOf(facts, now_lights);
+            const auto& lighting = regs.lighting;
+            why += fmt::format(" (configuration {:08X} {:08X}, inputs {:08X}, {} lights, {} before)",
+                               regs.reg_array[0x1C3], lighting.config1.raw,
+                               regs.reg_array[0x1D1], count, first[at].num_lights);
+            for (u32 i = 0; i < std::min(count, first[at].num_lights); i++) {
+                const u32 num = lighting.light_enable.GetNum(i);
+                const auto& light = lighting.light[num];
+                const auto& was = first[at].lights[i];
+                const auto& is = now_lights[i];
+                why += fmt::format(
+                    "; light {} {}{} colours {:08X} {:08X} {:08X} {:08X}: ({:.4f} {:.4f} {:.4f}) "
+                    "spot ({:.4f} {:.4f} {:.4f}) -> ({:.4f} {:.4f} {:.4f}) spot ({:.4f} {:.4f} "
+                    "{:.4f})",
+                    num, light.config.directional ? "directional" : "with a place",
+                    lighting.IsSpotAttenDisabled(num) ? "" : ", a spot",
+                    regs.reg_array[0x140 + num * 0x10], regs.reg_array[0x141 + num * 0x10],
+                    regs.reg_array[0x142 + num * 0x10], regs.reg_array[0x143 + num * 0x10], was[0],
+                    was[1], was[2], was[3], was[4], was[5], is[0], is[1], is[2], is[3], is[4],
+                    is[5]);
             }
         } else {
             const UniformDifference difference =
@@ -152,7 +243,6 @@ bool TwinPassRule::LeavesOut(DrawFacts& facts) {
             left_out_now = 0;
             twins = compared;
             leaving_out = compared && frames_alike >= FRAMES_ALIKE &&
-                          Settings::values.resolution_factor.GetValue() != 1.f &&
                           (Common::TraceMarkers::Experiments3() &
                            Common::TraceMarkers::KeepSecondScenePass) == 0;
         } else {
@@ -183,8 +273,7 @@ bool TwinPassRule::LeavesOut(DrawFacts& facts) {
                              "(kept at {:08X}): {} draws each, every one of the second pass like "
                              "the one at its place in the first but for {} float uniforms at "
                              "the most, off by {:.4f} of what is around them at the most. The "
-                             "second pass is left out from here on where the resolution is "
-                             "above the console's.",
+                             "second pass is left out from here on.",
                              target, keep, first_draws, most_differing, largest_shift);
                 } else if (!alike) {
                     if (frames_alike >= FRAMES_ALIKE) {
@@ -211,8 +300,10 @@ bool TwinPassRule::LeavesOut(DrawFacts& facts) {
                 is_twin = IsTwinOf(first[at], as_clear, facts);
             }
             if (!is_twin) {
-                if (twins && (Common::TraceMarkers::Experiments3() &
-                              Common::TraceMarkers::ExplainScenePasses) != 0) {
+                // (Why a pass that was left out is not any more is always said)
+                if (twins && (frames_alike >= FRAMES_ALIKE ||
+                              (Common::TraceMarkers::Experiments3() &
+                               Common::TraceMarkers::ExplainScenePasses) != 0)) {
                     ExplainNoTwin(as_clear, facts);
                 }
                 twins = false;
@@ -259,8 +350,9 @@ bool TwinPassRule::LeavesOut(DrawFacts& facts) {
     if (phase == Phase::First) {
         if (color == watched_target && first.size() == run_draws && run_draws < MAX_DRAWS) {
             first.emplace_back(facts, clears());
-            if ((Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) !=
-                0) {
+            if (first_regs.size() < KEPT_REGISTERS ||
+                (Common::TraceMarkers::Experiments3() & Common::TraceMarkers::ExplainScenePasses) !=
+                    0) {
                 first_regs.emplace_back(regs.reg_array.begin(), regs.reg_array.end());
             }
         }

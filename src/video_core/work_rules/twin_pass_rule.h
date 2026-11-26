@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <vector>
 #include "video_core/work_rules/draw_record.h"
 
@@ -17,7 +18,9 @@ namespace VideoCore {
  * pixel apart, and blending the two images (the "MT Framework" games do while the 3D effect
  * is off; in Monster Hunter 4 Ultimate it is a quarter of a frame's GPU time). Above the
  * console's resolution the host's pixels are smaller than that shift, and the second image
- * only costs. So this pattern is watched for: a run of draws to a target, a quad that copies
+ * only costs. At the console's it smooths the edges, for the price of the scene once more: left
+ * out there too, so that a slow GPU has the scene to draw once at every resolution. So this
+ * pattern is watched for: a run of draws to a target, a quad that copies
  * the target elsewhere, a second run to the target, and a quad that blends the copy over it.
  * Where it is seen the draws of the second run are compared with those of the first, place by
  * place. A twin goes by the same registers, the same vertex shader and the same float
@@ -61,7 +64,20 @@ private:
     static constexpr float MAX_SHIFT = 0.02f;
 
     bool LeavesOut(DrawFacts& facts);
-    bool IsTwinOf(const DrawRecord& first, bool clears, DrawFacts& facts);
+    /// A draw of the first pass, with where the lights that are on are and where they point, as
+    /// far as its fragments go by that (nothing else of the draw's is in the camera's space, which
+    /// is not quite the same)
+    struct FirstDraw {
+        DrawRecord draw;
+        u32 num_lights{};
+        std::array<std::array<float, 6>, 8> lights{};
+
+        FirstDraw(DrawFacts& facts, bool clears);
+    };
+    static u32 LightsOf(DrawFacts& facts, std::array<std::array<float, 6>, 8>& lights);
+    /// How far the lights are off, as CompareUniforms tells it of the uniforms
+    static float LightShift(const FirstDraw& first, DrawFacts& facts);
+    bool IsTwinOf(const FirstDraw& first, bool clears, DrawFacts& facts);
     void ExplainNoTwin(bool clears, DrawFacts& facts);
     /// A fill, a transfer or a copy is carried out: what runs of draws were under way are over
     void EndRuns();
@@ -86,10 +102,13 @@ private:
     u32 left_out_now{};
     /// Frames in a row in which the whole second pass was twins
     u32 frames_alike{};
-    std::vector<DrawRecord> first;
-    /// With ExplainScenePasses: the registers of each of them, and lines written so far
+    std::vector<FirstDraw> first;
+    /// The registers of the first few of them (of all with ExplainScenePasses), and how often and
+    /// when last it was said why a draw was no twin
+    static constexpr std::size_t KEPT_REGISTERS = 4;
     std::vector<std::vector<u32>> first_regs;
     u32 explained{};
+    std::chrono::steady_clock::time_point last_explained{};
     /// For the log: the most float uniforms that differed, and by how much
     u32 most_differing{};
     float largest_shift{};

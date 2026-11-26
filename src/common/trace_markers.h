@@ -222,8 +222,7 @@ enum Experiment2 : std::uint32_t {
 /// A third word of them (`debug.azahar.experiment3`): the first two are full.
 enum Experiment3 : std::uint32_t {
     /// A game that draws its scene twice, a part of a pixel apart, and blends the two images
-    /// (its own anti-aliasing) has both passes drawn, as before, also above the console's
-    /// resolution. See Pica::PicaCore::TwinPass.
+    /// (its own anti-aliasing) has both passes drawn. See VideoCore::TwinPassRule.
     KeepSecondScenePass = 1,
     /// For finding out why a scene drawn twice is not taken for one: the first draw of a
     /// second pass that is not like its counterpart in the first is described in the log

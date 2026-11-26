@@ -31,6 +31,7 @@
 #include "video_core/frame_state_dump.h"
 #include "video_core/pica/output_vertex.h"
 #include "video_core/pica/pica_core.h"
+#include "video_core/pica/used_of_light.h"
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader/debug_data.h"
@@ -511,7 +512,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
 }
 
 template <typename Func>
-void PicaCore::ForTwinRegisters(bool clears, Func&& func) const {
+void PicaCore::ForTwinRegisters(bool clears, Func&& func, bool light_vectors) const {
     const auto& texturing = regs.internal.texturing;
     // What the fragments go by. Culling, viewport, depth range and scissor, and the output
     // map as far as it is used
@@ -533,7 +534,15 @@ void PicaCore::ForTwinRegisters(bool clears, Func&& func) const {
     if (texturing.main_config.texture3_enable) {
         func(0x0A8, 0x0AE);
     }
-    func(0x0C0, 0x100);
+    // (The fog's colour and the gas where the draw has fog, and what is left there by other draws
+    // where it has none. Not the fog table's port, which holds what was last put through it: that
+    // was before the draw or after the one before it, as it comes, and what a draw goes by is the
+    // table, see TwinState)
+    func(0x0C0, PICA_REG_INDEX(texturing.fog_color));
+    if (texturing.fog_mode != TexturingRegs::FogMode::None) {
+        func(PICA_REG_INDEX(texturing.fog_color), PICA_REG_INDEX(texturing.fog_lut_offset));
+    }
+    func(PICA_REG_INDEX(texturing.fog_lut_data[0]) + 8, 0x100);
     // Blending, the tests and the masks; the target
     func(0x100, 0x108);
     func(0x116, 0x11F);
@@ -551,8 +560,22 @@ void PicaCore::ForTwinRegisters(bool clears, Func&& func) const {
         // draws most of a scene with the first of two, and the second holds what the frame
         // before or this frame last set)
         for (u32 index = 0; index <= lighting.max_light_index; index++) {
+            // (Its colours say whether the rest of it is used)
             const u32 light = 0x140 + lighting.light_enable.GetNum(index) * 0x10;
-            func(light, light + 0x0C);
+            const UsedOfLight used = UsedOf(lighting, index);
+            func(light, light + 0x04);
+            if (used.vector) {
+                if (light_vectors) {
+                    func(light + 0x04, light + 0x06);
+                }
+                func(light + 0x09, light + 0x0A);
+            }
+            if (used.spot && light_vectors) {
+                func(light + 0x06, light + 0x08);
+            }
+            if (used.distance) {
+                func(light + 0x0A, light + 0x0C);
+            }
         }
         func(0x1C0, 0x1C5);
         func(0x1D0, 0x1D3);
@@ -570,13 +593,19 @@ void PicaCore::ForTwinRegisters(bool clears, Func&& func) const {
     }
 }
 
-u64 PicaCore::TwinState(bool clears) {
+u64 PicaCore::TwinState(bool clears, bool light_vectors) {
     const auto& array = regs.internal.reg_array;
-    u64 state = clears ? 1 : 2;
-    ForTwinRegisters(clears, [&](u32 from, u32 to) {
-        state = Common::HashCombine(state,
-                                    Common::ComputeHash64(&array[from], (to - from) * sizeof(u32)));
-    });
+    u64 state = clears ? 1 : light_vectors ? 2 : 3;
+    ForTwinRegisters(
+        clears,
+        [&](u32 from, u32 to) {
+            state = Common::HashCombine(
+                state, Common::ComputeHash64(&array[from], (to - from) * sizeof(u32)));
+        },
+        light_vectors);
+    if (regs.internal.texturing.fog_mode != TexturingRegs::FogMode::None) {
+        state = Common::HashCombine(state, Common::ComputeHash64(fog.lut.data(), sizeof(fog.lut)));
+    }
     if (clears) {
         return state;
     }
@@ -2510,6 +2539,13 @@ public:
         }
         return hash[which];
     }
+    u64 StateHashButLightVectors() override {
+        if (!hash_but_known) {
+            hash_but = pica.TwinState(false, false);
+            hash_but_known = true;
+        }
+        return hash_but;
+    }
     void ForStateRegisters(bool as_clear,
                            const std::function<void(u32, u32)>& stretch) const override {
         pica.ForTwinRegisters(as_clear, stretch);
@@ -2565,6 +2601,8 @@ private:
     u64 output_hash{};
     Overwrites may;
     std::array<bool, 2> hash_known{};
+    u64 hash_but{};
+    bool hash_but_known{};
     std::array<u64, 2> hash{};
 };
 

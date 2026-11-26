@@ -124,6 +124,9 @@ public:
     /// What makes a draw the same draw as another: a hash over the registers it goes by and
     /// its vertex shader. For a clear only over what the fragments go by.
     virtual u64 StateHash(bool as_clear) = 0;
+    /// The same, of a draw that is no clear, without where its lights are and where they point:
+    /// for comparing those with a tolerance. (They are worked out in the camera's space.)
+    virtual u64 StateHashButLightVectors() = 0;
     /// The stretches of registers [from, to) that hash goes over
     virtual void ForStateRegisters(bool as_clear,
                                    const std::function<void(u32, u32)>& stretch) const = 0;

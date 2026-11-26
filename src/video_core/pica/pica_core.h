@@ -332,7 +332,8 @@ private:
 
     /// What makes a draw the same draw as another: a hash over the registers it goes by
     /// and its vertex shader; for a clear done by drawing only over what the fragments go by
-    u64 TwinState(bool clears);
+    /// `light_vectors`: with where the lights are and where they point
+    u64 TwinState(bool clears, bool light_vectors = true);
     /// A hash over what a shader can run from its entry point: the instructions that can be
     /// reached, where they are, and their operand patterns. Not over the whole of the program
     /// memory, as the hash of a program is: what a game uploads is written over what was
@@ -344,7 +345,7 @@ private:
     /// Calls back with each stretch of registers [from, to) that a draw goes by as the
     /// registers are now
     template <typename Func>
-    void ForTwinRegisters(bool clears, Func&& func) const;
+    void ForTwinRegisters(bool clears, Func&& func, bool light_vectors = true) const;
     /// The float uniforms the vertex shader's program can read from its entry point, a bit
     /// for each (96 of them). Worked out once for each program.
     using UniformSet = std::array<u64, 2>;
