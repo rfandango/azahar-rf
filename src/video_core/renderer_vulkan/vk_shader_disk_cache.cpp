@@ -264,10 +264,12 @@ std::vector<u32> RelaxPrecision(const std::vector<u32>& spirv) {
 
 std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFragmentShader(
     const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user, bool depth_from_viewport,
-    bool host_scissor, bool color_unused) {
+    bool host_scissor, bool color_unused, u32 rows_from_top) {
 
     FSConfig fs_config{regs};
     fs_config.framebuffer.depth_from_viewport.Assign(depth_from_viewport);
+    // Which units' textures have their rows from the top is known only from the surfaces bound
+    fs_config.texture.rows_from_top.Assign(rows_from_top);
     // A scissor that keeps what is inside a rectangle is the host's own scissor test, which
     // the rasterizer sets for the draw. A shader that tests it has to be able to drop
     // fragments, and with such a shader the GPU tests depth only after shading: every hidden

@@ -100,8 +100,6 @@ layout (binding = 2, std140) uniform fs_data {
     vec3 tex_lod_bias;
     vec4 tex_border_color[3];
     vec4 blend_color;
-    // z: 1 where a 2D texture's rows go from the top and t is turned over (Vulkan)
-    vec4 tex_size[3];
 };
 )";
 
@@ -1765,29 +1763,40 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
     }
 
     // A 2D texture whose rows go from the top (an ETC1 texture kept in its blocks) has t turned
-    // over, see tex_size in the uniforms
-    const auto turned = [](u32 unit, std::string_view coord) {
-        return fmt::format("vec2({0}.x, mix({0}.y, 1.0 - {0}.y, tex_size[{1}].z))", coord, unit);
+    // over, for the units the configuration names (rows_from_top); the others are sampled as
+    // they were without such textures
+    const auto coord_of = [&](std::string_view coord) -> std::string {
+        if (((config.texture.rows_from_top >> texture_unit) & 1) == 0) {
+            return std::string{coord};
+        }
+        out += fmt::format("vec2 tc = vec2({0}.x, 1.0 - {0}.y);\n", coord);
+        return "tc";
     };
 
     switch (texture_unit) {
     case 0:
         switch (config.texture.texture0_type) {
-        case TexturingRegs::TextureConfig::Texture2D:
-            out += fmt::format("vec2 tc = {};\n", turned(0, "texcoord0"));
+        case TexturingRegs::TextureConfig::Texture2D: {
+            const std::string tc = coord_of("texcoord0");
             if (config.texture.single_level & 1u) {
-                out += "return textureLod(tex0, tc, 0.0);";
+                out += fmt::format("return textureLod(tex0, {}, 0.0);", tc);
             } else if (config.texture.hardware_lod) {
-                out += "return texture(tex0, tc, tex_lod_bias[0]);";
+                out += fmt::format("return texture(tex0, {}, tex_lod_bias[0]);", tc);
             } else {
-                out += "return textureLod(tex0, tc, getLod(tc * "
-                       "vec2(textureSize(tex0, 0))) + tex_lod_bias[0]);";
+                out += fmt::format("return textureLod(tex0, {0}, getLod({0} * "
+                                   "vec2(textureSize(tex0, 0))) + tex_lod_bias[0]);",
+                                   tc);
             }
             break;
+        }
         case TexturingRegs::TextureConfig::Projection2D:
             // TODO (wwylele): find the exact LOD formula for projection texture
-            out += "return textureProj(tex0, vec3(texcoord0.x, mix(texcoord0.y, texcoord0_w - "
-                   "texcoord0.y, tex_size[0].z), texcoord0_w));";
+            if ((config.texture.rows_from_top & 1u) != 0) {
+                out += "return textureProj(tex0, vec3(texcoord0.x, texcoord0_w - texcoord0.y, "
+                       "texcoord0_w));";
+            } else {
+                out += "return textureProj(tex0, vec3(texcoord0, texcoord0_w));";
+            }
             break;
         case TexturingRegs::TextureConfig::TextureCube:
             out += "return texture(tex0, vec3(texcoord0, texcoord0_w));";
@@ -1806,27 +1815,30 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
             break;
         }
         break;
-    case 1:
-        out += fmt::format("vec2 tc = {};\n", turned(1, "texcoord1"));
+    case 1: {
+        const std::string tc = coord_of("texcoord1");
         if (config.texture.single_level & 2u) {
-            out += "return textureLod(tex1, tc, 0.0);";
+            out += fmt::format("return textureLod(tex1, {}, 0.0);", tc);
         } else if (config.texture.hardware_lod) {
-            out += "return texture(tex1, tc, tex_lod_bias[1]);";
+            out += fmt::format("return texture(tex1, {}, tex_lod_bias[1]);", tc);
         } else {
-            out += "return textureLod(tex1, tc, getLod(tc * vec2(textureSize(tex1, "
-                   "0))) + tex_lod_bias[1]);";
+            out += fmt::format("return textureLod(tex1, {0}, getLod({0} * vec2(textureSize(tex1, "
+                               "0))) + tex_lod_bias[1]);",
+                               tc);
         }
         break;
+    }
     case 2: {
-        const char* texcoord = config.texture.texture2_use_coord1 ? "texcoord1" : "texcoord2";
-        out += fmt::format("vec2 tc = {};\n", turned(2, texcoord));
+        const std::string tc =
+            coord_of(config.texture.texture2_use_coord1 ? "texcoord1" : "texcoord2");
         if (config.texture.single_level & 4u) {
-            out += "return textureLod(tex2, tc, 0.0);";
+            out += fmt::format("return textureLod(tex2, {}, 0.0);", tc);
         } else if (config.texture.hardware_lod) {
-            out += "return texture(tex2, tc, tex_lod_bias[2]);";
+            out += fmt::format("return texture(tex2, {}, tex_lod_bias[2]);", tc);
         } else {
-            out += "return textureLod(tex2, tc, getLod(tc * "
-                   "vec2(textureSize(tex2, 0))) + tex_lod_bias[2]);";
+            out += fmt::format("return textureLod(tex2, {0}, getLod({0} * "
+                               "vec2(textureSize(tex2, 0))) + tex_lod_bias[2]);",
+                               tc);
         }
         break;
     }

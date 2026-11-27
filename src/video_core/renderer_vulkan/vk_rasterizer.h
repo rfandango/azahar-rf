@@ -88,6 +88,10 @@ private:
     void SyncTextureUnits(const Framebuffer* framebuffer, const Common::Rectangle<u32>& draw_rect,
                           bool overwrites_color);
 
+    /// A bit for each texture unit of the draw whose surface has its rows from the top (an ETC1
+    /// texture kept in its blocks), set by SyncTextureUnits for the fragment shader's choice
+    u32 rows_from_top{};
+
     /// Syncs all utility textures in the fragment shader.
     void SyncUtilityTextures(const Framebuffer* framebuffer);
 
@@ -203,6 +207,7 @@ private:
         bool fs_depth_from_viewport{};
         bool fs_host_scissor{};
         bool fs_color_unused{};
+        u8 fs_rows_from_top{};
         /// The lowest and highest index of the draw, good while has_index_range is set and
         /// InPlaceData::Generation() is index_generation
         bool has_index_range{};

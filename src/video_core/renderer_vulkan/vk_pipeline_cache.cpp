@@ -763,10 +763,10 @@ void PipelineCache::UseTrivialGeometryShader() {
 void PipelineCache::UseFragmentShader(const Pica::RegsInternal& regs,
                                       const Pica::Shader::UserConfig& user,
                                       bool depth_from_viewport, bool host_scissor,
-                                      bool color_unused) {
+                                      bool color_unused, u32 rows_from_top) {
 
     auto res = curr_disk_cache->UseFragmentShader(regs, user, depth_from_viewport, host_scissor,
-                                                  color_unused);
+                                                  color_unused, rows_from_top);
 
     if (res.has_value()) {
         current_shaders[ProgramType::FS] = (*res).second;

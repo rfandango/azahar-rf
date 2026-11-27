@@ -118,8 +118,11 @@ public:
     /// to the scissor the pipeline is drawn with.
     /// color_unused: the draw writes no colour and no test reads it, so the shader need not
     /// compute it (see Pica::Shader::FSConfig::KeepDepthOnly)
+    /// rows_from_top: a bit for each texture unit whose bound texture has its rows from the top
+    /// (an ETC1 texture kept in its blocks); the shader turns t over for those units only
     void UseFragmentShader(const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
-                           bool depth_from_viewport, bool host_scissor, bool color_unused);
+                           bool depth_from_viewport, bool host_scissor, bool color_unused,
+                           u32 rows_from_top);
 
     /// Queries which channels need min/max blend emulation in the fragment shader
     void QueryBlendEmulation(const Pica::RegsInternal& regs, bool& rgb_emulation,

@@ -198,6 +198,11 @@ struct TextureConfig {
         /// console's formula for it by hand buys nothing, and that takes a round of derivative
         /// operations on the GPU's texture unit for every sample.
         BitField<20, 1, u32> hardware_lod;
+        /// A bit for each texture unit whose texture has its rows from the top: an ETC1 texture
+        /// the Vulkan renderer keeps in its blocks (VideoCore::SurfaceBase::keeps_etc_blocks).
+        /// Set by the renderer from the surface it binds, not from the registers; the shader
+        /// turns t over for those units only.
+        BitField<21, 3, u32> rows_from_top;
     };
     std::array<TextureBorder, 3> texture_border_color{};
     std::array<TevStageConfigRaw, 6> tev_stages{};
@@ -237,6 +242,7 @@ struct TextureConfig {
                                    FIELD_HASH(combiner_buffer_input), FIELD_HASH(fog_mode),
                                    FIELD_HASH(fog_flip), FIELD_HASH(shadow_texture_orthographic),
                                    FIELD_HASH(single_level), FIELD_HASH(hardware_lod),
+                                   FIELD_HASH(rows_from_top),
                                    FIELD_HASH(texture_border_color), FIELD_HASH(tev_stages),
                                    FIELD_HASH(requested_wrap),
 

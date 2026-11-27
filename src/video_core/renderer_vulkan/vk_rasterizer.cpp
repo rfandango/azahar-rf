@@ -1303,17 +1303,19 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         (alpha_test.enable == 0 || alpha_test.func == Pica::FramebufferRegs::CompareFunc::Always) &&
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyColourlessShader) == 0;
     if (site_matches && site->has_fs && site->fs_depth_from_viewport == depth_range.has_value() &&
-        site->fs_host_scissor == host_scissor && site->fs_color_unused == color_unused) {
+        site->fs_host_scissor == host_scissor && site->fs_color_unused == color_unused &&
+        site->fs_rows_from_top == rows_from_top) {
         pipeline_cache.RestoreShader(ProgramType::FS, site->fs);
     } else {
         pipeline_cache.UseFragmentShader(regs, user_config, depth_range.has_value(), host_scissor,
-                                         color_unused);
+                                         color_unused, rows_from_top);
         if (site) {
             site->fs = pipeline_cache.ChosenFor(ProgramType::FS);
             site->has_fs = true;
             site->fs_depth_from_viewport = depth_range.has_value();
             site->fs_host_scissor = host_scissor;
             site->fs_color_unused = color_unused;
+            site->fs_rows_from_top = static_cast<u8>(rows_from_top);
         }
     }
     pipeline_info.dynamic_info.depth_min = depth_range ? depth_range->min_depth : 0.f;
@@ -1460,6 +1462,7 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
         (Common::TraceMarkers::Experiments() & Common::TraceMarkers::LegacyAttachments) == 0;
 
     const auto pica_textures = regs.texturing.GetTextures();
+    rows_from_top = 0;
 
     // What each binding of the set is to hold is gathered first. Most draws ask for what the
     // draw before them had, and then that draw's set is used again instead of a new one being
@@ -1566,12 +1569,10 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
                 pixels * VideoCore::GetFormatBpp(surface.pixel_format) / 8, first);
         }
         // The fragment shader works the level of detail out from the size of the host texture,
-        // which it is told instead of asking the texture for it at every fragment. A texture
-        // of ETC1 blocks has its rows from the top: the shader turns the coordinate over (z).
+        // which it is told instead of asking the texture for it at every fragment
         const auto extent = surface.RealExtent();
         const Common::Vec4f tex_size{static_cast<f32>(extent.width),
-                                     static_cast<f32>(extent.height),
-                                     surface.keeps_etc_blocks ? 1.f : 0.f, 0.f};
+                                     static_cast<f32>(extent.height), 0.f, 0.f};
         if (fs_data.tex_size[texture_index] != tex_size) {
             fs_data.tex_size[texture_index] = tex_size;
             fs_data_dirty = true;
@@ -1584,6 +1585,11 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
             Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
             bind(texture_index, null_surface.ImageView(), sampler.Handle());
             continue;
+        }
+        if (surface.keeps_etc_blocks) {
+            // Its rows go from the top: the fragment shader chosen for the draw turns t over
+            // for this unit (FSConfig's rows_from_top)
+            rows_from_top |= 1u << texture_index;
         }
         if (swapped_color_view && surface_view == swapped_color_view) {
             // Another unit samples the colour target as well

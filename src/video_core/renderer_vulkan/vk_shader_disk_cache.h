@@ -36,7 +36,7 @@ public:
         bool wide_top_screen);
     std::optional<std::pair<u64, Shader* const>> UseFragmentShader(
         const Pica::RegsInternal& regs, const Pica::Shader::UserConfig& user,
-        bool depth_from_viewport, bool host_scissor, bool color_unused);
+        bool depth_from_viewport, bool host_scissor, bool color_unused, u32 rows_from_top);
     std::optional<std::pair<u64, Shader* const>> UseFixedGeometryShader(
         const Pica::RegsInternal& regs);
 
