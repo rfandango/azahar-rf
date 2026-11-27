@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <optional>
+#include <string>
 #include <vector>
 #include "common/common_types.h"
 #include "common/math_util.h"
@@ -69,22 +70,32 @@ struct PresentUniformData {
     Common::Vec4f image_size;
     int screen_id_l = 0;
     int screen_id_r = 0;
+    /// The pixels of the frame the screen is drawn on, along its 240 and along its length
     float output_rows = 0.0f;
     int reverse_interlaced = 0;
     /// Of the upscalers, from 0 to 2
     float edge_sharpness = 0.0f;
+    float output_columns = 0.0f;
+    /// For a post-processing shader: 1 for the second of the two pictures of a side by side
+    /// mode, 0 otherwise
+    int layer = 0;
 };
-static_assert(sizeof(PresentUniformData) == 116,
+static_assert(sizeof(PresentUniformData) == 124,
               "PresentUniformData does not structure in shader!");
 
 class RendererVulkan : public VideoCore::RendererBase {
-    static constexpr std::size_t PRESENT_PIPELINES = 7;
+    static constexpr std::size_t PRESENT_PIPELINES = 9;
     /// Of those, the ones that enlarge a screen with Snapdragon Game Super Resolution
     static constexpr u32 SGSR_PIPELINE = 3;
     static constexpr u32 SGSR_EDGE_PIPELINE = 4;
     /// and the lighter ones
     static constexpr u32 LIGHT_PIPELINE = 5;
     static constexpr u32 CUBIC_PIPELINE = 6;
+    /// The post-processing shader of the user's choice, and the one for anaglyph 3D (from the
+    /// "shaders" folder of the user directory, see VideoCore::GetPostProcessingShaderList). Without
+    /// one, or where it does not compile, their pipelines are null.
+    static constexpr u32 CUSTOM_PIPELINE = 7;
+    static constexpr u32 CUSTOM_ANAGLYPH_PIPELINE = 8;
 
 public:
     explicit RendererVulkan(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window,
@@ -105,10 +116,16 @@ public:
     void TryPresent(int timeout_ms, bool is_secondary) override {}
 
 private:
-    void ReloadPipeline(Settings::StereoRenderOption render_3d);
+    /// The pipeline the screens are drawn with in that 3D mode, where nothing enlarges them
+    u32 PipelineFor(Settings::StereoRenderOption render_3d) const;
+    /// Compiles the post-processing shaders the settings name, where they changed
+    void LoadCustomShaders();
     void CompileShaders();
     void BuildLayouts();
     void BuildPipelines();
+    /// A pipeline that draws a screen with that fragment shader. Null where the driver cannot
+    /// make it.
+    vk::Pipeline BuildPresentPipeline(vk::ShaderModule fragment_shader, bool blends) const;
     void ConfigureFramebufferTexture(TextureInfo& texture,
                                      const Pica::FramebufferConfig& framebuffer);
     void ConfigureRenderPipeline();
@@ -204,6 +221,10 @@ private:
     std::array<vk::Sampler, 2> present_samplers;
     vk::ShaderModule present_vertex_shader;
     u32 current_pipeline = 0;
+    /// The names of the post-processing shaders that were loaded (or not found or failed), for
+    /// CUSTOM_PIPELINE and CUSTOM_ANAGLYPH_PIPELINE; empty for the built-in ones. And their text.
+    std::array<std::string, 2> custom_shader_names;
+    std::array<std::string, 2> custom_shader_sources;
 
     std::array<ScreenInfo, 3> screen_infos{};
     PresentUniformData draw_info{};

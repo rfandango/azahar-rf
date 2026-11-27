@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <memory>
+#include <string>
 #include <SPIRV/GlslangToSpv.h>
 #include <glslang/Include/ResourceLimits.h>
 #include <glslang/Public/ShaderLang.h>
@@ -175,11 +176,18 @@ std::vector<u32> CompileGLSL(std::string_view code, vk::ShaderStageFlagBits stag
     const char* pass_source_code = code.data();
     int pass_source_code_length = static_cast<int>(code.size());
 
+    // glslang puts the preamble right before the code, without a line break between: a code that
+    // begins with a directive (#version) would be read as part of the preamble's last line
+    std::string preamble_lines{premable};
+    if (!preamble_lines.empty() && preamble_lines.back() != '\n') {
+        preamble_lines += '\n';
+    }
+
     auto shader = std::make_unique<glslang::TShader>(lang);
     shader->setEnvTarget(glslang::EShTargetSpv,
                          glslang::EShTargetLanguageVersion::EShTargetSpv_1_3);
     shader->setStringsWithLengths(&pass_source_code, &pass_source_code_length, 1);
-    shader->setPreamble(premable.data());
+    shader->setPreamble(preamble_lines.c_str());
 
     glslang::TShader::ForbidIncluder includer;
     if (!shader->parse(&DefaultTBuiltInResource, default_version, profile, false, true, messages,

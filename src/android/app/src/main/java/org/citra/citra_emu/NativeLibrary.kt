@@ -232,6 +232,12 @@ object NativeLibrary {
     external fun getHitchOverlayText(): String
 
     /**
+     * Returns the names of the post-processing shaders in the "shaders" folder of the user
+     * directory: its files ending in ".glsl", without that ending.
+     */
+    external fun getPostProcessingShaders(): Array<String>
+
+    /**
      * Notifies the core emulation that the layout should be updated
      */
     external fun updateFramebuffer(isPortrait: Boolean)

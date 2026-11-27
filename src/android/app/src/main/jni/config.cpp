@@ -232,6 +232,7 @@ void Config::ReadValues() {
         default_shader = "Horizontal (builtin)";
     Settings::values.pp_shader_name =
         GetSettingFromKey<std::string>("Renderer", "pp_shader_name", default_shader);
+    ReadSetting("Renderer", Settings::values.anaglyph_shader_name);
     ReadSetting("Renderer", Settings::values.filter_mode);
     ReadSetting("Renderer", Settings::values.screen_upscaling);
     ReadSetting("Renderer", Settings::values.screen_upscaling_sharpness);

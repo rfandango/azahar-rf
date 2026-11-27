@@ -17,6 +17,7 @@
 #include "core/frontend/emu_window.h"
 #include "video_core/gpu.h"
 #include "video_core/pica/pica_core.h"
+#include "video_core/post_processing.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_memory_util.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -98,6 +99,156 @@ constexpr static std::array<vk::DescriptorSetLayoutBinding, 1> PRESENT_BINDINGS 
 }};
 
 namespace {
+
+/// What a post-processing shader is written against: the interface of the OpenGL renderer (see
+/// post_processing_opengl.cpp, after Dolphin's), here with the screen's values from the push
+/// constants (PresentUniformData, under names of their own) and its picture from the array of
+/// screens. Names of the OpenGL renderer that stand for something else here are macros.
+constexpr std::string_view POST_PROCESSING_HEADER = R"(#version 450 core
+
+// hlsl to glsl types
+#define float2 vec2
+#define float3 vec3
+#define float4 vec4
+#define uint2 uvec2
+#define uint3 uvec3
+#define uint4 uvec4
+#define int2 ivec2
+#define int3 ivec3
+#define int4 ivec4
+
+// hlsl to glsl function translation
+#define frac fract
+#define lerp mix
+
+// Output variable
+layout (location = 0) out float4 color;
+// Input coordinates
+layout (location = 0) in float2 frag_tex_coord;
+
+layout (push_constant, std140) uniform PostProcessingInfo {
+    mat4 pp_modelview_matrix;
+    vec4 pp_screen_area;
+    // Resolution: of the image the screen is in, and of one of its pixels
+    vec4 i_resolution;
+    int pp_screen_id_l;
+    int pp_screen_id_r;
+    float pp_output_rows;
+    int pp_reverse_interlaced;
+    float pp_edge_sharpness;
+    float pp_output_columns;
+    // Layer
+    int layer;
+};
+
+// Resolution the screen is drawn at, and of one of its pixels
+#define o_resolution float4(pp_output_rows, pp_output_columns, \
+                            1.0 / pp_output_rows, 1.0 / pp_output_columns)
+
+layout (set = 0, binding = 0) uniform sampler2D pp_screens[3];
+
+#ifdef ARRAY_DYNAMIC_INDEX
+#define color_texture pp_screens[pp_screen_id_l]
+#define color_texture_r pp_screens[pp_screen_id_r]
+
+float4 PPSample(int screen_id, float2 location)
+{
+    return texture(pp_screens[screen_id], location);
+}
+
+#define SampleOffset(offset) textureOffset(color_texture, frag_tex_coord, offset)
+#else
+// Without indexing by a value, color_texture and color_texture_r cannot be had: a shader that uses
+// them fails to compile with these names in the log, and the built-in one is drawn with
+#define color_texture color_texture_needs_a_gpu_that_indexes_sampler_arrays_use_Sample
+#define color_texture_r color_texture_r_needs_a_gpu_that_indexes_sampler_arrays_use_SampleLayer
+float4 PPSample(int screen_id, float2 location)
+{
+    switch (screen_id) {
+    case 0:
+        return texture(pp_screens[0], location);
+    case 1:
+        return texture(pp_screens[1], location);
+    default:
+        return texture(pp_screens[2], location);
+    }
+}
+
+#define SampleOffset(offset)                                         \
+    (pp_screen_id_l == 0 ? textureOffset(pp_screens[0], frag_tex_coord, offset) : \
+     pp_screen_id_l == 1 ? textureOffset(pp_screens[1], frag_tex_coord, offset) : \
+                           textureOffset(pp_screens[2], frag_tex_coord, offset))
+#endif
+
+// Interfacing functions
+float4 Sample()
+{
+    return PPSample(pp_screen_id_l, frag_tex_coord);
+}
+
+float4 SampleLocation(float2 location)
+{
+    return PPSample(pp_screen_id_l, location);
+}
+
+float4 SampleLayer(int layer)
+{
+    return PPSample(layer == 0 ? pp_screen_id_l : pp_screen_id_r, frag_tex_coord);
+}
+
+float2 GetResolution()
+{
+    return i_resolution.xy;
+}
+
+float2 GetInvResolution()
+{
+    return i_resolution.zw;
+}
+
+float2 GetIResolution()
+{
+    return i_resolution.xy;
+}
+
+float2 GetIInvResolution()
+{
+    return i_resolution.zw;
+}
+
+float2 GetWindowResolution()
+{
+  return o_resolution.xy;
+}
+
+float2 GetInvWindowResolution()
+{
+  return o_resolution.zw;
+}
+
+float2 GetOResolution()
+{
+    return o_resolution.xy;
+}
+
+float2 GetOInvResolution()
+{
+    return o_resolution.zw;
+}
+
+float2 GetCoordinates()
+{
+    return frag_tex_coord;
+}
+
+void SetOutput(float4 color_in)
+{
+    color = color_in;
+}
+
+#line 1
+)";
+
 static bool IsLowRefreshRate() {
 #if (defined(__APPLE__) || defined(ENABLE_SDL2)) && !defined(HAVE_LIBRETRO)
     if (!Settings::values.use_display_refresh_rate_detection) {
@@ -167,6 +318,7 @@ RendererVulkan::RendererVulkan(Core::System& system, Pica::PicaCore& pica_,
     CompileShaders();
     BuildLayouts();
     BuildPipelines();
+    LoadCustomShaders();
     if (secondary_window) {
         secondary_present_window_ptr = std::make_unique<PresentWindow>(
             *secondary_window, instance, scheduler, IsLowRefreshRate());
@@ -309,10 +461,12 @@ std::optional<std::vector<vk::ClearRect>> RendererVulkan::UncoveredParts(
 
 void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& layout, bool clear,
                                  std::vector<vk::ClearRect> parts_to_clear) {
-    // (Snapdragon Game Super Resolution starts from the filtered picture)
+    // (Snapdragon Game Super Resolution starts from the filtered picture. A post-processing shader
+    // or a 3D mode takes the place of the upscalers, see ChoosePresentPipeline.)
     const bool linear =
         Settings::values.filter_mode.GetValue() ||
-        Settings::values.screen_upscaling.GetValue() != Settings::ScreenUpscaling::Filter;
+        (Settings::values.screen_upscaling.GetValue() != Settings::ScreenUpscaling::Filter &&
+         current_pipeline == 0);
     const auto sampler = present_samplers[!linear];
     const auto present_set = present_heap.Commit();
     for (u32 index = 0; index < screen_infos.size(); index++) {
@@ -398,13 +552,15 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
     // The screens are drawn as large as they are in the game's own pixels, and the display's
     // hardware enlarges the picture, as the console sends its pictures to its displays. Not where
     // the enlarging is done here: by an upscaler, in steps of whole pixels or without filtering
-    // (the display filters), or for a stereo mode. (The swapchain is made anew at the next image
-    // where it asks for another size.)
+    // (the display filters), or for a stereo mode. Nor with a post-processing shader, which is
+    // written for the size the screens are shown at. (The swapchain is made anew at the next
+    // image where it asks for another size.)
     const bool native =
         Settings::values.screen_upscaling.GetValue() == Settings::ScreenUpscaling::Filter &&
         Settings::values.filter_mode.GetValue() &&
         !Settings::values.use_integer_scaling.GetValue() &&
         layout.render_3d_mode == Settings::StereoRenderOption::Off &&
+        PipelineFor(layout.render_3d_mode) == 0 &&
         (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyFullSizeOutput) == 0;
     window.SetNativeScale(native ? NativeScale(layout) : 0.f);
 #endif
@@ -561,7 +717,8 @@ void RendererVulkan::BuildLayouts() {
     cursor_pipeline_layout = instance.GetDevice().createPipelineLayoutUnique(cursor_layout_info);
 }
 
-void RendererVulkan::BuildPipelines() {
+vk::Pipeline RendererVulkan::BuildPresentPipeline(vk::ShaderModule fragment_shader,
+                                                  bool blends) const {
     const vk::VertexInputBindingDescription binding = {
         .binding = 0,
         .stride = sizeof(ScreenRectVertex),
@@ -609,8 +766,8 @@ void RendererVulkan::BuildPipelines() {
         .sampleShadingEnable = false,
     };
 
-    vk::PipelineColorBlendAttachmentState colorblend_attachment = {
-        .blendEnable = true,
+    const vk::PipelineColorBlendAttachmentState colorblend_attachment = {
+        .blendEnable = blends,
         .srcColorBlendFactor = vk::BlendFactor::eConstantAlpha,
         .dstColorBlendFactor = vk::BlendFactor::eOneMinusConstantAlpha,
         .colorBlendOp = vk::BlendOp::eAdd,
@@ -655,40 +812,53 @@ void RendererVulkan::BuildPipelines() {
         .stencilTestEnable = false,
     };
 
-    for (u32 i = 0; i < PRESENT_PIPELINES; i++) {
-        const std::array shader_stages = {
-            vk::PipelineShaderStageCreateInfo{
-                .stage = vk::ShaderStageFlagBits::eVertex,
-                .module = present_vertex_shader,
-                .pName = "main",
-            },
-            vk::PipelineShaderStageCreateInfo{
-                .stage = vk::ShaderStageFlagBits::eFragment,
-                .module = present_shaders[i],
-                .pName = "main",
-            },
-        };
+    const std::array shader_stages = {
+        vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eVertex,
+            .module = present_vertex_shader,
+            .pName = "main",
+        },
+        vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eFragment,
+            .module = fragment_shader,
+            .pName = "main",
+        },
+    };
 
-        const vk::GraphicsPipelineCreateInfo pipeline_info = {
-            .stageCount = static_cast<u32>(shader_stages.size()),
-            .pStages = shader_stages.data(),
-            .pVertexInputState = &vertex_input_info,
-            .pInputAssemblyState = &input_assembly,
-            .pViewportState = &viewport_info,
-            .pRasterizationState = &raster_state,
-            .pMultisampleState = &multisampling,
-            .pDepthStencilState = &depth_info,
-            .pColorBlendState = &color_blending,
-            .pDynamicState = &dynamic_info,
-            .layout = *present_pipeline_layout,
-            .renderPass = main_present_window.Renderpass(),
-        };
+    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+        .stageCount = static_cast<u32>(shader_stages.size()),
+        .pStages = shader_stages.data(),
+        .pVertexInputState = &vertex_input_info,
+        .pInputAssemblyState = &input_assembly,
+        .pViewportState = &viewport_info,
+        .pRasterizationState = &raster_state,
+        .pMultisampleState = &multisampling,
+        .pDepthStencilState = &depth_info,
+        .pColorBlendState = &color_blending,
+        .pDynamicState = &dynamic_info,
+        .layout = *present_pipeline_layout,
+        .renderPass = main_present_window.Renderpass(),
+    };
 
+    try {
+        const auto [result, pipeline] =
+            instance.GetDevice().createGraphicsPipeline({}, pipeline_info);
+        if (result == vk::Result::eSuccess) {
+            return pipeline;
+        }
+        LOG_ERROR(Render_Vulkan, "A present pipeline could not be made: {}", vk::to_string(result));
+    } catch (const vk::SystemError& err) {
+        LOG_ERROR(Render_Vulkan, "A present pipeline could not be made: {}", err.what());
+    }
+    return {};
+}
+
+void RendererVulkan::BuildPipelines() {
+    // (The post-processing shaders' ones are made when they are loaded)
+    for (u32 i = 0; i < CUSTOM_PIPELINE; i++) {
         for (const bool blends : {true, false}) {
-            colorblend_attachment.blendEnable = blends;
-            const auto [result, pipeline] =
-                instance.GetDevice().createGraphicsPipeline({}, pipeline_info);
-            ASSERT_MSG(result == vk::Result::eSuccess, "Unable to build present pipelines");
+            const vk::Pipeline pipeline = BuildPresentPipeline(present_shaders[i], blends);
+            ASSERT_MSG(pipeline, "Unable to build present pipelines");
             (blends ? present_pipelines : opaque_present_pipelines)[i] = pipeline;
         }
     }
@@ -936,19 +1106,92 @@ void RendererVulkan::FillScreen(Common::Vec3<u8> color, const TextureInfo& textu
     });
 }
 
-void RendererVulkan::ReloadPipeline(Settings::StereoRenderOption render_3d) {
+u32 RendererVulkan::PipelineFor(Settings::StereoRenderOption render_3d) const {
     switch (render_3d) {
     case Settings::StereoRenderOption::Anaglyph:
-        current_pipeline = 1;
-        break;
+        return present_pipelines[CUSTOM_ANAGLYPH_PIPELINE] ? CUSTOM_ANAGLYPH_PIPELINE : 1;
     case Settings::StereoRenderOption::Interlaced:
     case Settings::StereoRenderOption::ReverseInterlaced:
-        current_pipeline = 2;
-        draw_info.reverse_interlaced = render_3d == Settings::StereoRenderOption::ReverseInterlaced;
-        break;
+        return 2;
     default:
-        current_pipeline = 0;
-        break;
+        // (As with OpenGL: also for the two pictures of the side by side modes)
+        return present_pipelines[CUSTOM_PIPELINE] ? CUSTOM_PIPELINE : 0;
+    }
+}
+
+void RendererVulkan::LoadCustomShaders() {
+    // ("None (builtin)", "Dubois (builtin)", and on Android "Horizontal (builtin)" where the mono
+    // one is read while a 3D mode is set)
+    const auto custom = [](const std::string& name) {
+        return name.empty() || name.ends_with("(builtin)") ? std::string{} : name;
+    };
+    const std::array<std::string, 2> wanted = {
+        custom(Settings::values.pp_shader_name.GetValue()),
+        custom(Settings::values.anaglyph_shader_name.GetValue()),
+    };
+    const vk::Device device = instance.GetDevice();
+    for (u32 k = 0; k < wanted.size(); k++) {
+        const u32 index = CUSTOM_PIPELINE + k;
+        const bool anaglyph = index == CUSTOM_ANAGLYPH_PIPELINE;
+        // (Read again each time: a shader that is being written is taken anew once it is saved)
+        const std::string source =
+            wanted[k].empty() ? std::string{}
+                              : VideoCore::GetPostProcessingShaderSource(anaglyph, wanted[k]);
+        if (wanted[k] == custom_shader_names[k] && source == custom_shader_sources[k]) {
+            continue;
+        }
+        custom_shader_names[k] = wanted[k];
+        custom_shader_sources[k] = source;
+
+        // The one before may still be drawn with by what is on its way to the GPU
+        if (present_shaders[index]) {
+            scheduler.Finish();
+            device.destroyPipeline(present_pipelines[index]);
+            device.destroyPipeline(opaque_present_pipelines[index]);
+            device.destroyShaderModule(present_shaders[index]);
+            present_pipelines[index] = vk::Pipeline{};
+            opaque_present_pipelines[index] = vk::Pipeline{};
+            present_shaders[index] = vk::ShaderModule{};
+        }
+        if (wanted[k].empty()) {
+            continue;
+        }
+        if (source.empty()) {
+            LOG_ERROR(Render_Vulkan,
+                      "Post-processing shader {}.glsl not found in {}, the built-in one is used",
+                      wanted[k], anaglyph ? "shaders/anaglyph" : "shaders");
+            continue;
+        }
+        const std::string code = fmt::format("{}{}", POST_PROCESSING_HEADER, source);
+        const std::string_view preamble =
+            instance.IsImageArrayDynamicIndexSupported() ? "#define ARRAY_DYNAMIC_INDEX" : "";
+        const std::vector<u32> spirv =
+            CompileGLSL(code, vk::ShaderStageFlagBits::eFragment, preamble);
+        const vk::ShaderModule module =
+            spirv.empty() ? vk::ShaderModule{} : CompileSPV(spirv, device);
+        if (!module) {
+            LOG_ERROR(Render_Vulkan,
+                      "Post-processing shader {} could not be compiled (see the shader's log "
+                      "above), the built-in one is used",
+                      wanted[k]);
+            continue;
+        }
+        const vk::Pipeline blending = BuildPresentPipeline(module, true);
+        const vk::Pipeline opaque = BuildPresentPipeline(module, false);
+        if (!blending || !opaque) {
+            device.destroyPipeline(blending);
+            device.destroyPipeline(opaque);
+            device.destroyShaderModule(module);
+            LOG_ERROR(Render_Vulkan,
+                      "Post-processing shader {} cannot be drawn with, the built-in one is used",
+                      wanted[k]);
+            continue;
+        }
+        present_shaders[index] = module;
+        present_pipelines[index] = blending;
+        opaque_present_pipelines[index] = opaque;
+        LOG_INFO(Render_Vulkan, "Post-processing shader {} loaded{}", wanted[k],
+                 anaglyph ? " for anaglyph 3D" : "");
     }
 }
 
@@ -1052,7 +1295,10 @@ void RendererVulkan::DrawSingleScreen(u32 screen_id, float x, float y, float w, 
     vertex_buffer.Commit(size);
 
     draw_info.output_rows = h * output_scale;
+    draw_info.output_columns = w * output_scale;
     draw_info.screen_id_l = screen_id;
+    // (A post-processing shader's second layer is the same picture here)
+    draw_info.screen_id_r = screen_id;
 
     scheduler.Record([this, offset = offset, info = draw_info,
                       pipeline = (layer_blends ? present_pipelines
@@ -1122,8 +1368,14 @@ void RendererVulkan::DrawSingleScreenStereo(u32 screen_id_l, u32 screen_id_r, fl
     vertex_buffer.Commit(size);
 
     draw_info.output_rows = h * output_scale;
+    draw_info.output_columns = w * output_scale;
     draw_info.screen_id_l = screen_id_l;
     draw_info.screen_id_r = screen_id_r;
+    // (For a post-processing shader's i_resolution)
+    const float image_width = static_cast<float>(std::max(screen_info_l.image_width, 1u));
+    const float image_height = static_cast<float>(std::max(screen_info_l.image_height, 1u));
+    draw_info.image_size =
+        Common::MakeVec(image_width, image_height, 1.0f / image_width, 1.0f / image_height);
 
     scheduler.Record([this, offset = offset, info = draw_info,
                       pipeline = (layer_blends ? present_pipelines
@@ -1165,6 +1417,7 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
 
     const auto orientation = layout.is_rotated ? Layout::DisplayOrientation::Landscape
                                                : Layout::DisplayOrientation::Portrait;
+    draw_info.layer = 0;
     switch (layout.render_3d_mode) {
     case Settings::StereoRenderOption::Off: {
         const int eye = static_cast<int>(Settings::values.mono_render_option.GetValue());
@@ -1175,6 +1428,7 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::SideBySide: {
         DrawSingleScreen(leftside, top_screen_left / 2, top_screen_top, top_screen_width / 2,
                          top_screen_height, orientation);
+        draw_info.layer = 1;
         DrawSingleScreen(rightside, static_cast<float>((top_screen_left / 2) + (layout.width / 2)),
                          top_screen_top, top_screen_width / 2, top_screen_height, orientation);
         break;
@@ -1182,6 +1436,7 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::SideBySideFull: {
         DrawSingleScreen(leftside, top_screen_left, top_screen_top, top_screen_width,
                          top_screen_height, orientation);
+        draw_info.layer = 1;
         DrawSingleScreen(rightside, top_screen_left + layout.width / 2, top_screen_top,
                          top_screen_width, top_screen_height, orientation);
         break;
@@ -1189,6 +1444,7 @@ void RendererVulkan::DrawTopScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::CardboardVR: {
         DrawSingleScreen(leftside, top_screen_left, top_screen_top, top_screen_width,
                          top_screen_height, orientation);
+        draw_info.layer = 1;
         DrawSingleScreen(
             rightside,
             static_cast<float>(layout.cardboard.top_screen_right_eye + (layout.width / 2)),
@@ -1219,6 +1475,7 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
     const auto orientation = layout.is_rotated ? Layout::DisplayOrientation::Landscape
                                                : Layout::DisplayOrientation::Portrait;
 
+    draw_info.layer = 0;
     switch (layout.render_3d_mode) {
     case Settings::StereoRenderOption::Off: {
         DrawSingleScreen(2, bottom_screen_left, bottom_screen_top, bottom_screen_width,
@@ -1230,6 +1487,7 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
     {
         DrawSingleScreen(2, bottom_screen_left / 2, bottom_screen_top, bottom_screen_width / 2,
                          bottom_screen_height, orientation);
+        draw_info.layer = 1;
         DrawSingleScreen(2, static_cast<float>((bottom_screen_left / 2) + (layout.width / 2)),
                          bottom_screen_top, bottom_screen_width / 2, bottom_screen_height,
                          orientation);
@@ -1238,6 +1496,7 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::SideBySideFull: {
         DrawSingleScreen(2, bottom_screen_left, bottom_screen_top, bottom_screen_width,
                          bottom_screen_height, orientation);
+        draw_info.layer = 1;
         DrawSingleScreen(2, bottom_screen_left + layout.width / 2, bottom_screen_top,
                          bottom_screen_width, bottom_screen_height, orientation);
         break;
@@ -1245,6 +1504,7 @@ void RendererVulkan::DrawBottomScreen(const Layout::FramebufferLayout& layout,
     case Settings::StereoRenderOption::CardboardVR: {
         DrawSingleScreen(2, bottom_screen_left, bottom_screen_top, bottom_screen_width,
                          bottom_screen_height, orientation);
+        draw_info.layer = 1;
         DrawSingleScreen(
             2, static_cast<float>(layout.cardboard.bottom_screen_right_eye + (layout.width / 2)),
             bottom_screen_top, bottom_screen_width, bottom_screen_height, orientation);
@@ -1268,8 +1528,12 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
         clear_color.float32[2] = Settings::values.bg_blue.GetValue();
     }
     if (settings.shader_update_requested.exchange(false)) {
-        ReloadPipeline(layout.render_3d_mode);
+        LoadCustomShaders();
     }
+    // (For each window: the second display may show another 3D mode)
+    current_pipeline = PipelineFor(layout.render_3d_mode);
+    draw_info.reverse_interlaced =
+        layout.render_3d_mode == Settings::StereoRenderOption::ReverseInterlaced;
 
     auto uncovered = UncoveredParts(*frame, layout);
     const bool clear = !uncovered.has_value();

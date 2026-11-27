@@ -305,6 +305,9 @@
     <string name="output_resolution_value">Output Resolution: %1$d%%</string>
     <string name="linear_filtering">Linear Filtering</string>
     <string name="linear_filtering_description">Enables linear filtering, which causes game visuals to appear smoother.</string>
+    <string name="post_processing_shader">Post-Processing Shader</string>
+    <string name="post_processing_shader_description">Draws the screens with a shader of your own: a .glsl file in the shaders folder of the Azahar folder. Takes the place of Screen Upscaling.</string>
+    <string name="post_processing_shader_none">None</string>
     <string name="use_integer_scaling">Integer Scaling</string>
     <string name="use_integer_scaling_description">Scales the screens with an integer multiplier of the original 3DS screen. For layouts with two different screen sizes, the largest screen is integer-scaled.</string>
     <string name="texture_filter_name">Texture Filter</string>

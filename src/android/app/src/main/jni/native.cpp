@@ -77,6 +77,7 @@
 #include "multiplayer.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/gpu.h"
+#include "video_core/post_processing.h"
 #include "video_core/renderer_base.h"
 
 namespace {
@@ -1127,6 +1128,11 @@ void Java_org_citra_citra_1emu_NativeLibrary_setHitchOverlayEnabled([[maybe_unus
 jstring Java_org_citra_citra_1emu_NativeLibrary_getHitchOverlayText(JNIEnv* env,
                                                                     [[maybe_unused]] jobject obj) {
     return ToJString(env, Common::Hitches::OverlayText());
+}
+
+jobjectArray Java_org_citra_citra_1emu_NativeLibrary_getPostProcessingShaders(
+    JNIEnv* env, [[maybe_unused]] jobject obj) {
+    return ToJStringArray(env, VideoCore::GetPostProcessingShaderList(false));
 }
 
 void Java_org_citra_citra_1emu_NativeLibrary_run__Ljava_lang_String_2(JNIEnv* env,

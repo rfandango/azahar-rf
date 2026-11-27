@@ -9,9 +9,7 @@
 #include "common/resolution_scale.h"
 #include "common/settings.h"
 #include "ui_configure_enhancements.h"
-#ifdef ENABLE_OPENGL
-#include "video_core/renderer_opengl/post_processing_opengl.h"
-#endif
+#include "video_core/post_processing.h"
 
 namespace {
 
@@ -139,14 +137,12 @@ void ConfigureEnhancements::updateShaders(Settings::StereoRenderOption stereo_op
 
     ui->shader_combobox->setCurrentIndex(0);
 
-#ifdef ENABLE_OPENGL
-    for (const auto& shader : OpenGL::GetPostProcessingShaderList(
+    for (const auto& shader : VideoCore::GetPostProcessingShaderList(
              stereo_option == Settings::StereoRenderOption::Anaglyph)) {
         ui->shader_combobox->addItem(QString::fromStdString(shader));
         if (current_shader == shader)
             ui->shader_combobox->setCurrentIndex(ui->shader_combobox->count() - 1);
     }
-#endif
 }
 
 QString ConfigureEnhancements::ResolutionName(int index) const {

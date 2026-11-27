@@ -6,19 +6,15 @@
 
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace OpenGL {
-
-// Returns a vector of the names of the shaders available in the
-// "shaders" directory in citra's data directory
-std::vector<std::string> GetPostProcessingShaderList(bool anaglyph);
 
 // Returns the shader code for the shader named "shader_name"
 // with the appropriate header prepended to it
 // If anaglyph is true, it searches the shaders/anaglyph directory rather than
 // the shaders directory
 // If the shader cannot be loaded, an empty string is returned
+// (The list of shaders is VideoCore::GetPostProcessingShaderList)
 std::string GetPostProcessingShaderCode(bool anaglyph, std::string_view shader_name);
 
 } // namespace OpenGL

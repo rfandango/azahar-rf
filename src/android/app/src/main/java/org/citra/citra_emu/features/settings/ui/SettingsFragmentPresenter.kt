@@ -18,6 +18,7 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlin.math.roundToInt
 import org.citra.citra_emu.BuildConfig
 import org.citra.citra_emu.CitraApplication
+import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.R
 import org.citra.citra_emu.display.ScreenLayout
 import org.citra.citra_emu.display.StereoMode
@@ -1019,6 +1020,26 @@ class SettingsFragmentPresenter(
                     R.string.linear_filtering_description,
                     BooleanSetting.LINEAR_FILTERING.key,
                     BooleanSetting.LINEAR_FILTERING.defaultValue
+                )
+            )
+            // The ".glsl" files in the "shaders" folder of the Azahar folder
+            val postProcessingShaders = NativeLibrary.getPostProcessingShaders()
+            add(
+                StringSingleChoiceSetting(
+                    editingSettings,
+                    StringSetting.PP_SHADER_NAME,
+                    R.string.post_processing_shader,
+                    R.string.post_processing_shader_description,
+                    arrayOf(settingsActivity.getString(R.string.post_processing_shader_none)) +
+                        postProcessingShaders,
+                    arrayOf(StringSetting.PP_SHADER_NAME.defaultValue) + postProcessingShaders,
+                    StringSetting.PP_SHADER_NAME.key,
+                    StringSetting.PP_SHADER_NAME.defaultValue,
+                    // (The config file may have it empty: that is none too)
+                    getValue = {
+                        editingSettings.get(StringSetting.PP_SHADER_NAME)
+                            .ifEmpty { StringSetting.PP_SHADER_NAME.defaultValue }
+                    }
                 )
             )
             add(
