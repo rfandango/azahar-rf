@@ -943,6 +943,73 @@ std::string Summarize(Clock::time_point now) {
                            of(PixelMove::SecondImage), of(PixelMove::Clear), of(PixelMove::Spared));
         }
     }
+    {
+        // What the draws sample, by format: the console's formats other than RGBA8 and the
+        // 16-bit ones are held by the host as RGBA8, and the host's texture caches see that
+        std::string line;
+        for (auto& use : Detail::TextureUses()) {
+            const u64 binds = use.binds.exchange(0, std::memory_order_relaxed);
+            const u32 distinct = use.distinct.exchange(0, std::memory_order_relaxed);
+            const u64 host = use.host_bytes.exchange(0, std::memory_order_relaxed);
+            const u64 guest = use.guest_bytes.exchange(0, std::memory_order_relaxed);
+            const char* const name = use.name.load(std::memory_order_relaxed);
+            if (binds == 0 || !name) {
+                continue;
+            }
+            fmt::format_to(std::back_inserter(line), "{}{} {:.1f} ({} textures, {:.2f} MiB, {:.2f} on the console)",
+                           line.empty() ? "" : ", ", name,
+                           static_cast<double>(binds) / counted_vblanks, distinct,
+                           static_cast<double>(host) / (1 << 20),
+                           static_cast<double>(guest) / (1 << 20));
+        }
+        Detail::SummaryNumber().fetch_add(1, std::memory_order_relaxed);
+        if (!line.empty()) {
+            fmt::format_to(out, "\ntextures sampled, by format: draws a vblank (textures since the "
+                                "last summary, their size as held, as on the console): {}",
+                           line);
+        }
+        auto& lit = Detail::Lighting();
+        const u32 lit_draws = lit.draws.exchange(0, std::memory_order_relaxed);
+        const u32 lights = lit.lights.exchange(0, std::memory_order_relaxed);
+        const u32 colourless = lit.colourless.exchange(0, std::memory_order_relaxed);
+        const u32 with_colourless = lit.draws_with_colourless.exchange(0, std::memory_order_relaxed);
+        if (lit_draws != 0) {
+            fmt::format_to(out,
+                           "\nlit draws: {:.1f} a vblank with {:.1f} lights each; {:.1f} of the "
+                           "lights a draw have no colour (in {:.0f}% of the lit draws)",
+                           static_cast<double>(lit_draws) / counted_vblanks,
+                           static_cast<double>(lights) / lit_draws,
+                           static_cast<double>(colourless) / lit_draws,
+                           100.0 * with_colourless / lit_draws);
+        }
+        auto& clears = Detail::Clears();
+        const u32 clear_draws = clears.draws.exchange(0, std::memory_order_relaxed);
+        const u64 clear_pixels = clears.pixels.exchange(0, std::memory_order_relaxed);
+        if (clear_draws != 0) {
+            fmt::format_to(out, "\ndraws done as clears: {:.1f} a vblank, {:.2f} million pixels",
+                           static_cast<double>(clear_draws) / counted_vblanks,
+                           static_cast<double>(clear_pixels) / 1e6 / counted_vblanks);
+        }
+        static constexpr std::array<const char*, 16> WHY = {
+            "taken",        "fog or another mode", "alpha test",    "stencil test",
+            "depth test",   "depth write",         "write mask",    "scissor excludes",
+            "blending",     "logic operation",     "combiner op",   "vertex colour",
+            "texture",      "other source",        "",              ""};
+        std::string area_line;
+        for (std::size_t i = 0; i < clears.full_area.size(); i++) {
+            const u32 n = clears.full_area[i].exchange(0, std::memory_order_relaxed);
+            if (n != 0) {
+                fmt::format_to(std::back_inserter(area_line), "{}{} {:.1f}",
+                               area_line.empty() ? "" : ", ", WHY[i],
+                               static_cast<double>(n) / counted_vblanks);
+            }
+        }
+        if (!area_line.empty()) {
+            fmt::format_to(out, "\ndraws covering all of their area, a vblank, by why they are "
+                                "not a clear: {}",
+                           area_line);
+        }
+    }
     if (shared.host_gpu.load >= 0.0f) {
         fmt::format_to(out,
                        "\nhost gpu: at work {:.0f}% of the time ({:.1f} ms a vblank), waited "
@@ -1341,6 +1408,26 @@ std::array<std::atomic<u32>, static_cast<std::size_t>(PixelMove::Count)>&
 Detail::PixelMoveCounts() {
     static std::array<std::atomic<u32>, static_cast<std::size_t>(PixelMove::Count)> counts{};
     return counts;
+}
+
+std::array<Detail::TextureUse, Detail::TEXTURE_FORMATS>& Detail::TextureUses() {
+    static std::array<TextureUse, TEXTURE_FORMATS> uses{};
+    return uses;
+}
+
+std::atomic<u32>& Detail::SummaryNumber() {
+    static std::atomic<u32> number{};
+    return number;
+}
+
+Detail::LitDraws& Detail::Lighting() {
+    static LitDraws lit{};
+    return lit;
+}
+
+Detail::DrawsAsClears& Detail::Clears() {
+    static DrawsAsClears clears{};
+    return clears;
 }
 
 std::array<std::atomic<u32>, static_cast<std::size_t>(GpuCall::Count)>& Detail::GpuCalls() {

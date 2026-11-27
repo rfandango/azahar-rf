@@ -7,13 +7,20 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform highp texture2D depth;
+#ifdef STENCIL_BYTES
+// The stencil, copied into a buffer a byte a texel (an image whose stencil is sampled could not
+// be compressed on every GPU)
+layout(set = 0, binding = 3) uniform lowp utextureBuffer stencil_bytes;
+#else
 layout(set = 0, binding = 1) uniform lowp utexture2D stencil;
+#endif
 layout(set = 0, binding = 2, rgba8) uniform highp writeonly image2D color;
 
 layout(push_constant, std140) uniform ComputeInfo {
     mediump ivec2 src_offset;
     mediump ivec2 dst_offset;
     mediump ivec2 extent;
+    highp ivec2 stencil_at; // first byte of the stencil copy, its row length
 };
 
 void main() {
@@ -24,7 +31,12 @@ void main() {
     ivec2 dst_coord = dst_offset + ivec2(gl_GlobalInvocationID.xy);
     highp uint depth_val =
         uint(texelFetch(depth, src_coord, 0).x * (exp2(32.0) - 1.0));
+#ifdef STENCIL_BYTES
+    lowp uint stencil_val =
+        texelFetch(stencil_bytes, stencil_at.x + src_coord.y * stencil_at.y + src_coord.x).x;
+#else
     lowp uint stencil_val = texelFetch(stencil, src_coord, 0).x;
+#endif
     highp uvec4 components =
         uvec4(stencil_val, (uvec3(depth_val) >> uvec3(24u, 16u, 8u)) & 0x000000FFu);
     imageStore(color, dst_coord, vec4(components) / (exp2(8.0) - 1.0));

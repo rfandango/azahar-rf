@@ -7,8 +7,11 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <string>
+#include <tuple>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 #include <vulkan/vulkan.hpp>
@@ -19,6 +22,8 @@
 #include "video_core/renderer_vulkan/vk_descriptor_update_queue.h"
 #include "video_core/renderer_vulkan/vk_stream_buffer.h"
 
+#include <fmt/format.h>
+#include "common/alignment.h"
 #include "common/literals.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
@@ -227,6 +232,100 @@ vk::ImageSubresourceRange MakeSubresourceRange(vk::ImageAspectFlags aspect, u32 
 constexpr u64 UPLOAD_BUFFER_SIZE = 512_MiB;
 constexpr u64 DOWNLOAD_BUFFER_SIZE = 16_MiB;
 
+/// The colour format a plain image of a depth format's size is measured with, see
+/// ReportCompression
+vk::Format PlainTwinFormat(vk::Format format) {
+    switch (format) {
+    case vk::Format::eD16Unorm:
+        return vk::Format::eR16Uint;
+    case vk::Format::eD32SfloatS8Uint:
+        return vk::Format::eR32G32Uint;
+    default:
+        return vk::Format::eR32Uint;
+    }
+}
+
+/// Says in the log, once for each kind of render target, whether the driver compresses it. The
+/// kind is probed at 1024x1024, where compression's metadata (about a 256th of the pixels'
+/// bytes) is clearly more than what sizes are rounded to. A colour image is held against the
+/// same image with views of any format, which a driver cannot compress. A depth image keeps
+/// its compression that way (it has no other format to be viewed as), so it is held against a
+/// plain colour image of as many bytes a pixel, plus the buffer Turnip keeps with every depth
+/// image for its early depth test (LRZ: 16 bits for each 8x8 block, rows and columns in 32s).
+/// The depth buffer's compression on the Adreno 610 is what this is for: unknown for both
+/// drivers there.
+void ReportCompression(const Instance& instance, const vk::ImageCreateInfo& info) {
+    if (info.mipLevels != 1 || info.samples != vk::SampleCountFlagBits::e1 ||
+        !(info.usage & (vk::ImageUsageFlagBits::eColorAttachment |
+                        vk::ImageUsageFlagBits::eDepthStencilAttachment))) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::vector<std::tuple<vk::Format, vk::ImageUsageFlags, vk::ImageCreateFlags, bool>>
+        seen;
+    std::scoped_lock lock{mutex};
+    const auto kind = std::make_tuple(info.format, info.usage, info.flags, info.pNext != nullptr);
+    if (seen.size() >= 16 || std::ranges::find(seen, kind) != seen.end()) {
+        return;
+    }
+    seen.push_back(kind);
+    const vk::Device device = instance.GetDevice();
+    constexpr u32 SIDE = 1024;
+    const auto measure = [&](vk::ImageCreateInfo probe) -> vk::DeviceSize {
+        probe.extent = vk::Extent3D{SIDE, SIDE, 1};
+        try {
+            const vk::Image image = device.createImage(probe);
+            const vk::DeviceSize size = device.getImageMemoryRequirements(image).size;
+            device.destroyImage(image);
+            return size;
+        } catch (const vk::SystemError&) {
+            return 0;
+        }
+    };
+    const bool depth = static_cast<bool>(info.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment);
+    const vk::DeviceSize size = measure(info);
+    vk::ImageCreateInfo plain_info = info;
+    plain_info.pNext = nullptr;
+    plain_info.flags |= vk::ImageCreateFlagBits::eMutableFormat;
+    vk::DeviceSize plain = 0;
+    vk::DeviceSize extra = 0;
+    if (depth) {
+        plain_info.format = PlainTwinFormat(info.format);
+        plain_info.usage = vk::ImageUsageFlagBits::eColorAttachment |
+                           vk::ImageUsageFlagBits::eTransferSrc |
+                           vk::ImageUsageFlagBits::eTransferDst;
+        plain = measure(plain_info);
+        if (instance.GetDriverID() == vk::DriverIdKHR::eMesaTurnip) {
+            const auto blocks = [](u32 pixels) { return Common::AlignUp((pixels + 7) / 8, 32u); };
+            extra = vk::DeviceSize{blocks(SIDE)} * blocks(SIDE) * 2;
+        }
+    } else {
+        plain = measure(plain_info);
+    }
+    // What is left of a depth image without compression is what the depth-test buffer's own
+    // bookkeeping and the rounding to pages come to (4 KiB at most); compression's metadata at
+    // this size is 8 KiB or more
+    constexpr vk::DeviceSize LEFT_WITH_METADATA = 6 * 1024;
+    const char* verdict = "not known";
+    if (size != 0 && plain != 0 && !depth) {
+        verdict = size > plain ? "compressed" : "not compressed";
+    } else if (size != 0 && plain != 0 && extra != 0) {
+        const vk::DeviceSize left = size > plain + extra ? size - plain - extra : 0;
+        verdict = left >= LEFT_WITH_METADATA ? "compressed" : "not compressed";
+    } else if (depth && size != 0 && plain != 0) {
+        verdict = "see the sizes (the depth-test buffer of this driver is not known)";
+    }
+    LOG_INFO(Render_Vulkan,
+             "Images: {} targets like one of {}x{} ({}{}): at 1024x1024 {} KiB, a plain image {} "
+             "KiB{}: {}",
+             vk::to_string(info.format), info.extent.width, info.extent.height,
+             vk::to_string(info.usage),
+             info.pNext ? ", with its stencil's own use or a list of view formats" : "",
+             size / 1024, plain / 1024,
+             extra != 0 ? fmt::format(" and {} KiB for the early depth test", extra / 1024) : "",
+             verdict);
+}
+
 } // Anonymous namespace
 
 void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::Format format,
@@ -300,6 +399,7 @@ void Handle::Create(u32 width, u32 height, u32 levels, TextureType type, vk::For
     }
 
     image = vk::Image{unsafe_image};
+    ReportCompression(instance, image_info);
 
     const vk::ImageViewCreateInfo view_info = {
         .image = image,
@@ -371,7 +471,11 @@ TextureRuntime::TextureRuntime(const Instance& instance, Scheduler& scheduler,
                       vk::BufferUsageFlagBits::eTransferDst |
                           vk::BufferUsageFlagBits::eStorageBuffer,
                       DOWNLOAD_BUFFER_SIZE, BufferType::Download},
-      num_swapchain_images{num_swapchain_images_} {}
+      num_swapchain_images{num_swapchain_images_},
+      etc_block_traits{(Common::TraceMarkers::Experiments4() &
+                        Common::TraceMarkers::LegacyEtcTextures) == 0
+                           ? instance.GetEtcBlockTraits()
+                           : nullptr} {}
 
 TextureRuntime::~TextureRuntime() = default;
 
@@ -383,6 +487,10 @@ VideoCore::StagingData TextureRuntime::FindStaging(u32 size, bool upload) {
         .offset = offset,
         .mapped = std::span{data, size},
     };
+}
+
+void TextureRuntime::InvalidateStaging(const VideoCore::StagingData& staging) {
+    download_buffer.Invalidate(staging.offset, staging.size);
 }
 
 u64 TextureRuntime::GetResourceTick() {
@@ -483,6 +591,11 @@ bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
 }
 
 bool TextureRuntime::ClearTexture(Surface& surface, const VideoCore::TextureClear& clear) {
+    if (surface.keeps_etc_blocks) [[unlikely]] {
+        // (A fill of an ETC1 texture goes through guest memory, see SurfaceBase::CanFill)
+        LOG_ERROR(Render_Vulkan, "A clear of an image of ETC1 blocks was left out");
+        return false;
+    }
     if (HasPendingBlits() && clear.texture_level == 0 && clear.texture_layer == 0 &&
         clear.texture_rect == surface.GetScaledRect()) {
         DropBlitInto(surface.SerialIfAny());
@@ -685,6 +798,21 @@ std::function<void()> TextureRuntime::ClearWithRenderpass(Surface& surface,
 
 bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
                                   std::span<const VideoCore::TextureCopy> copies) {
+    // Images of ETC1 blocks have their rows from the top (SurfaceBase::keeps_etc_blocks)
+    boost::container::small_vector<VideoCore::TextureCopy, 8> etc_copies;
+    if (source.keeps_etc_blocks || dest.keeps_etc_blocks) [[unlikely]] {
+        if (!source.keeps_etc_blocks || !dest.keeps_etc_blocks) {
+            return CopyFromEtcBlocks(source, dest, copies);
+        }
+        for (VideoCore::TextureCopy copy : copies) {
+            copy.src_offset.y = std::max(1u, source.height >> copy.src_level) -
+                                copy.src_offset.y - copy.extent.height;
+            copy.dst_offset.y = std::max(1u, dest.height >> copy.dst_level) - copy.dst_offset.y -
+                                copy.extent.height;
+            etc_copies.push_back(copy);
+        }
+        copies = etc_copies;
+    }
     if (HasPendingBlits() && &source != &dest) {
         const PendingBlit* into = FindBlitInto(source.SerialIfAny());
         const bool level_zero = std::ranges::all_of(copies, [](const auto& copy) {
@@ -1111,6 +1239,47 @@ bool TextureRuntime::StillNeeded(Surface& surface) {
 
 bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
                                   const VideoCore::TextureBlit& blit) {
+    if (source.keeps_etc_blocks || dest.keeps_etc_blocks) [[unlikely]] {
+        const u32 width = blit.src_rect.GetWidth();
+        const u32 height = blit.src_rect.GetHeight();
+        const bool same_size =
+            width == blit.dst_rect.GetWidth() && height == blit.dst_rect.GetHeight();
+        if (dest.keeps_etc_blocks || !same_size) {
+            // Blocks are only copied, from blocks, at the same size (a texture whose smallest
+            // level is not whole tiles is taken out of a larger one so)
+            if (source.keeps_etc_blocks && dest.keeps_etc_blocks && same_size) {
+                return CopyTextures(
+                    source, dest,
+                    VideoCore::TextureCopy{
+                        .src_level = blit.src_level,
+                        .dst_level = blit.dst_level,
+                        .src_layer = blit.src_layer,
+                        .dst_layer = blit.dst_layer,
+                        .src_offset = {std::min(blit.src_rect.left, blit.src_rect.right),
+                                       std::min(blit.src_rect.bottom, blit.src_rect.top)},
+                        .dst_offset = {std::min(blit.dst_rect.left, blit.dst_rect.right),
+                                       std::min(blit.dst_rect.bottom, blit.dst_rect.top)},
+                        .extent = {width, height},
+                    });
+            }
+            LOG_ERROR(Render_Vulkan, "A blit of {}x{} {} ETC1 blocks was left out", width, height,
+                      dest.keeps_etc_blocks ? "into" : "out of");
+            return false;
+        }
+        return CopyFromEtcBlocks(
+            source, dest,
+            std::array{VideoCore::TextureCopy{
+                .src_level = blit.src_level,
+                .dst_level = blit.dst_level,
+                .src_layer = blit.src_layer,
+                .dst_layer = blit.dst_layer,
+                .src_offset = {std::min(blit.src_rect.left, blit.src_rect.right),
+                               std::min(blit.src_rect.bottom, blit.src_rect.top)},
+                .dst_offset = {std::min(blit.dst_rect.left, blit.dst_rect.right),
+                               std::min(blit.dst_rect.bottom, blit.dst_rect.top)},
+                .extent = {width, height},
+            }});
+    }
     const bool is_depth_stencil = source.type == VideoCore::SurfaceType::DepthStencil;
     const bool whole = blit.dst_level == 0 && blit.dst_layer == 0 &&
                        std::min(blit.dst_rect.left, blit.dst_rect.right) == 0 &&
@@ -1205,6 +1374,50 @@ bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
     return true;
 }
 
+bool TextureRuntime::CopyFromEtcBlocks(Surface& source, Surface& dest,
+                                       std::span<const VideoCore::TextureCopy> copies) {
+    if (!source.keeps_etc_blocks || dest.keeps_etc_blocks || !dest.traits.blit_support ||
+        dest.sample_count > 1) {
+        LOG_ERROR(Render_Vulkan, "A copy from {} pixels into ETC1 blocks was left out",
+                  VideoCore::PixelFormatAsString(source.pixel_format));
+        return false;
+    }
+    dest.NoteAllWritten();
+    renderpass_cache.EndRendering();
+    const RecordParams params = {
+        .aspect = vk::ImageAspectFlagBits::eColor,
+        .filter = vk::Filter::eNearest,
+        .pipeline_flags = source.PipelineStageFlags() | dest.PipelineStageFlags(),
+        .src_access = source.AccessFlags(),
+        .dst_access = dest.AccessFlags(),
+        .src_image = source.Image(),
+        .dst_image = dest.Image(),
+    };
+    for (const VideoCore::TextureCopy& copy : copies) {
+        Common::Hitches::NotePixelsMoved(Common::Hitches::PixelMove::Copy,
+                                         u64{copy.extent.width} * copy.extent.height);
+        // The source's rows go from the top: the blit reads them from the other edge
+        const u32 level_height = std::max(1u, source.height >> copy.src_level);
+        RecordBlit(scheduler, params,
+                   VideoCore::TextureBlit{
+                       .src_level = copy.src_level,
+                       .dst_level = copy.dst_level,
+                       .src_layer = copy.src_layer,
+                       .dst_layer = copy.dst_layer,
+                       .src_rect = Common::Rectangle<u32>{copy.src_offset.x,
+                                                          level_height - copy.src_offset.y -
+                                                              copy.extent.height,
+                                                          copy.src_offset.x + copy.extent.width,
+                                                          level_height - copy.src_offset.y},
+                       .dst_rect = Common::Rectangle<u32>{copy.dst_offset.x,
+                                                          copy.dst_offset.y + copy.extent.height,
+                                                          copy.dst_offset.x + copy.extent.width,
+                                                          copy.dst_offset.y},
+                   });
+    }
+    return true;
+}
+
 void TextureRuntime::GenerateMipmaps(Surface& surface) {
     surface.NoteAllWritten();
     if (VideoCore::IsCustomFormatCompressed(surface.custom_format)) {
@@ -1257,6 +1470,16 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
         traits.needs_conversion = true;
     }
 
+    // An ETC1 texture at the console's size keeps its blocks for the GPU to decode. Not a cube
+    // (its faces are copied in as they are, the other way up to the cube's own) and not one that
+    // is enlarged or filtered (a filter writes pixels).
+    if (pixel_format == VideoCore::PixelFormat::ETC1 && runtime.EtcBlockTraits() &&
+        texture_type == VideoCore::TextureType::Texture2D && res_scale.IsNative() &&
+        sample_count == 1 && False(flags & VideoCore::SurfaceFlagBits::ShadowSource)) {
+        traits = *runtime.EtcBlockTraits();
+        keeps_etc_blocks = true;
+    }
+
     // A shadow map is read through an R32 view and written as a storage image. An image
     // created for that gets no framebuffer compression on some GPUs (an Adreno 6xx leaves it
     // off for an image with storage usage, and for one with a view format of another kind),
@@ -1289,7 +1512,7 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
     auto usage = traits.usage;
     const bool is_color =
         (traits.aspect & vk::ImageAspectFlagBits::eColor) != vk::ImageAspectFlags{};
-    if (is_color) {
+    if (is_color && !keeps_etc_blocks) {
         usage |= vk::ImageUsageFlagBits::eColorAttachment;
     }
     if (is_mutable && traits.storage_support) {
@@ -1345,6 +1568,8 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceBase& surface
       scheduler{runtime_.GetScheduler()}, traits{instance.GetTraits(mat->format)},
       handles{Handle(instance), Handle(instance), Handle(instance), Handle(instance),
               Handle(instance)} {
+    // The pack's texture is pixels, the right way up, whatever the guest's was
+    keeps_etc_blocks = false;
     if (!traits.transfer_support) {
         return;
     }
@@ -1418,8 +1643,13 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
         .src_image = Image(Type::Base),
     };
 
+    // An image of ETC1 blocks has its rows from the top (SurfaceBase::keeps_etc_blocks)
+    const u32 level_height = std::max(1u, height >> upload.texture_level);
+    const s32 row = keeps_etc_blocks
+                        ? static_cast<s32>(level_height - upload.texture_rect.top)
+                        : static_cast<s32>(upload.texture_rect.bottom);
     scheduler.Record([buffer = runtime.upload_buffer.Handle(), format = traits.native, params,
-                      staging, upload](vk::CommandBuffer cmdbuf) {
+                      staging, upload, row](vk::CommandBuffer cmdbuf) {
         boost::container::static_vector<vk::BufferImageCopy, 2> buffer_image_copies;
 
         const auto rect = upload.texture_rect;
@@ -1433,7 +1663,7 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
                 .baseArrayLayer = 0,
                 .layerCount = 1,
             },
-            .imageOffset = {static_cast<s32>(rect.left), static_cast<s32>(rect.bottom), 0},
+            .imageOffset = {static_cast<s32>(rect.left), row, 0},
             .imageExtent = {rect.GetWidth(), rect.GetHeight(), 1},
         });
 
@@ -1660,6 +1890,12 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
 }
 
 void Surface::ScaleUp(Common::ResolutionScale new_scale, u8 new_sample_count) {
+    if (keeps_etc_blocks) [[unlikely]] {
+        // Only a texture at the console's size keeps its blocks, and nothing larger is made of
+        // the same guest pixels while it does (a texture filter enlarges them all)
+        LOG_ERROR(Render_Vulkan, "An image of ETC1 blocks was not enlarged");
+        return;
+    }
     NoteAllWritten();
     // Of the kind the surface's images are, see the constructor
     const bool is_mutable =
@@ -2261,9 +2497,14 @@ vk::ImageView Surface::ImageView(ViewType view_type, Type type) noexcept {
     }
     if (view_type == ViewType::Depth || view_type == ViewType::Stencil) {
         ASSERT(this->type == SurfaceType::DepthStencil);
-        // The two are asked for together, by the conversions and copies done in a shader, which
-        // sample the stencil: the images of the surface change here if theirs cannot be
-        MakeStencilSampleable();
+        // A stencil view is asked for only where the stencil cannot be copied into a buffer for
+        // a shader to read instead (a multisampled image, or one larger than that buffer; see
+        // BlitHelper::CopyStencil): the images of the surface change here if theirs cannot have
+        // it. Their stencil is then not compressed on GPUs that sample it from depth and
+        // stencil as one (the Adreno 610). The depth alone can always be sampled.
+        if (view_type == ViewType::Stencil) {
+            MakeStencilSampleable();
+        }
         aspect = view_type == ViewType::Depth ? vk::ImageAspectFlagBits::eDepth
                                               : vk::ImageAspectFlagBits::eStencil;
     }

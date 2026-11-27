@@ -391,6 +391,9 @@ enum Experiment4 : std::uint32_t {
     /// Vulkan: the GPU is sent what was recorded at the end of every command list, as before, and not
     /// only where it is running out of work (Vulkan::RasterizerVulkan::SubmitPendingWork).
     LegacyListSubmits = 8,
+    /// Vulkan: a draw that fills all of its area with one colour known from the registers is
+    /// drawn, as before, not done as a clear (RasterizerVulkan::Draw, ConstantDrawColour)
+    LegacyQuadClears = 4,
     /// Vulkan: a render target that was given up is used for a new one only when the GPU is done
     /// with all it was used for, as before (VideoCore::RasterizerCache::CreateSurface).
     LegacySurfaceReuse = 16,
@@ -409,6 +412,18 @@ enum Experiment4 : std::uint32_t {
     /// Vulkan, Android: also without an upscaler the screens are drawn at the display's size, as
     /// before, not at the game's own (RendererVulkan::RenderToWindow)
     LegacyFullSizeOutput = 16384,
+    /// Vulkan, Android: without filtering the screens are drawn at the display's size, as before,
+    /// not enlarged by a whole multiple with the display doing the rest
+    /// (RendererVulkan::RenderToWindow)
+    LegacyUnfilteredOutput = 32768,
+    /// Measurement only, the picture is wrong: draws sample an empty texture in place of every
+    /// ETC1 and ETC1A4 one, which shows what sampling those costs the GPU at most (what keeping
+    /// them compressed could save) (RasterizerVulkan::SyncTextureUnits)
+    SkipEtcTextures = 65536,
+    /// Vulkan: ETC1 textures are decoded into RGBA8 on the processor, as before, and not kept
+    /// in their blocks for the GPU to decode (Vulkan::Surface::keeps_etc_blocks). Read when the
+    /// renderer is made.
+    LegacyEtcTextures = 131072,
 };
 
 /// A hold-up of the emulation asked for through `debug.azahar.stall`, as

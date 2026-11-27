@@ -15,6 +15,12 @@ SurfaceBase::SurfaceBase(const SurfaceParams& params, const SurfaceFlagBits& ini
 SurfaceBase::~SurfaceBase() = default;
 
 bool SurfaceBase::CanFill(const SurfaceParams& dest_surface, SurfaceInterval fill_interval) const {
+    // A fill does not come to one colour in ETC1 blocks, and an image of the blocks themselves
+    // cannot be cleared (SurfaceBase::keeps_etc_blocks): the filled bytes are written to guest
+    // memory and the texture is taken from there, block by block
+    if (dest_surface.pixel_format == PixelFormat::ETC1) {
+        return false;
+    }
     if (type == SurfaceType::Fill && IsRegionValid(fill_interval) &&
         boost::icl::first(fill_interval) >= addr &&
         boost::icl::last_next(fill_interval) <= end && // dest_surface is within our fill range

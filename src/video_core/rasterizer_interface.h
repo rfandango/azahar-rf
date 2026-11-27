@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <optional>
 #include "common/common_types.h"
 
 namespace Pica {
@@ -85,6 +86,12 @@ public:
     /// area it is confined to, every pixel of depth and stencil there. A renderer that would
     /// fetch what the area held before it draws need not. Said again, with false, after it.
     virtual void NoteDrawOverwrites([[maybe_unused]] bool color, [[maybe_unused]] bool depth) {}
+
+    /// The colour every vertex of the draw that comes next puts out, where it is the same for
+    /// all of them and close to a byte (as the fragment shader rounds it), else none. Told only
+    /// with a draw that overwrites all of its area. Said again, with none, after it.
+    virtual void NoteDrawVertexColour(
+        [[maybe_unused]] const std::optional<std::array<u8, 4>>& colour) {}
 
     virtual void LoadDefaultDiskResources(
         [[maybe_unused]] const std::atomic_bool& stop_loading,

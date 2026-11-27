@@ -110,4 +110,15 @@ void EncodeTexture(const SurfaceParams& surface_info, PAddr start_addr, PAddr en
 void DecodeTexture(const SurfaceParams& surface_info, PAddr start_addr, PAddr end_addr,
                    std::span<u8> source, std::span<u8> dest, bool convert = false);
 
+/**
+ * Puts tiled ETC1 data into the blocks a GPU decodes (ETC2 RGB8, of which ETC1 is a part), in
+ * rows from the top of the picture (see SurfaceBase::keeps_etc_blocks). Half a byte a pixel.
+ *
+ * @param surface_info The rectangle the data is of, whole tiles from its first.
+ * @param source The tiled ETC1 data.
+ * @param dest Where the blocks go, row by row.
+ */
+void TranscodeETC1(const SurfaceParams& surface_info, std::span<const u8> source,
+                   std::span<u8> dest);
+
 } // namespace VideoCore

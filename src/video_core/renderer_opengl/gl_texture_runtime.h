@@ -74,6 +74,10 @@ public:
     /// Maps an internal staging buffer of the provided size of pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
 
+    /// Makes what the GPU wrote into a download's staging memory visible to the processor
+    /// (nothing to do here: the staging memory is the processor's own)
+    void InvalidateStaging([[maybe_unused]] const VideoCore::StagingData& staging) {}
+
     /// Returns the OpenGL format tuple associated with the provided pixel format
     const FormatTuple& GetFormatTuple(VideoCore::PixelFormat pixel_format) const;
     const FormatTuple& GetFormatTuple(VideoCore::CustomPixelFormat pixel_format);

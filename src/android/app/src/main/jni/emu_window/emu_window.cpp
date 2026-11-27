@@ -316,8 +316,14 @@ void EmuWindow_Android::ReportFrameWork() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(frame_time * TARGET_RATIO);
     if (!performance_hint) {
         performance_hint = std::make_unique<PerformanceHintSession>(target);
+        // The GPU's time goes with the work where the system takes it, for the system to give
+        // the GPU the clock a frame needs (it otherwise goes by the GPU's load alone)
+        if (performance_hint->ReportsGpuTime()) {
+            system.GPU().Renderer().WantGpuTime(true);
+        }
     }
-    performance_hint->ReportWork(system.perf_stats->GetLastSystemFrameTime(), target);
+    performance_hint->ReportWork(system.perf_stats->GetLastSystemFrameTime(), target,
+                                 system.GPU().Renderer().LastVBlankGpuTime());
 }
 
 void EmuWindow_Android::OnFramebufferSizeChanged() {

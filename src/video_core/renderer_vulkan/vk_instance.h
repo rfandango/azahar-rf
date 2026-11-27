@@ -177,6 +177,12 @@ public:
         return separate_stencil_usage;
     }
 
+    /// The traits of an image that holds ETC1 blocks (ETC2 RGB8: sampled, copied, and a blit's
+    /// source), or none where the device cannot (VideoCore::SurfaceBase::keeps_etc_blocks)
+    const FormatTraits* GetEtcBlockTraits() const {
+        return etc_block_traits.native != vk::Format::eUndefined ? &etc_block_traits : nullptr;
+    }
+
     /// Returns true when VK_GOOGLE_display_timing is supported
     bool IsDisplayTimingSupported() const {
         return display_timing;
@@ -358,6 +364,7 @@ protected:
     std::array<FormatTraits, VideoCore::PIXEL_FORMAT_COUNT> format_table;
     std::array<FormatTraits, 10> custom_format_table;
     std::array<FormatTraits, 16> attrib_table;
+    FormatTraits etc_block_traits{};
     std::vector<std::string> available_extensions;
     u32 queue_family_index{0};
     bool triangle_fan_supported{true};

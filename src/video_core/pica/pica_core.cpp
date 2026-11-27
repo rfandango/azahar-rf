@@ -2711,12 +2711,40 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }
     rasterizer->NoteDrawOverwrites(overwrites && may_overwrite_color,
                                    overwrites && may_overwrite_depth);
+    // A draw over all of its area whose colour comes from its vertices can be a clear in all but
+    // name (a quad games clear a target with): the renderer is told the colour where every
+    // vertex has the same one
+    const bool reads_vertex_colour = [this] {
+        using Source = TexturingRegs::TevStageConfig::Source;
+        for (const auto& stage : regs.internal.texturing.GetTevStages()) {
+            for (const Source source : {stage.color_source1.Value(), stage.color_source2.Value(),
+                                        stage.color_source3.Value(), stage.alpha_source1.Value(),
+                                        stage.alpha_source2.Value(), stage.alpha_source3.Value()}) {
+                if (source == Source::PrimaryColor) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }();
+    const bool vertex_colour_told =
+        accelerate_draw && overwrites && may_overwrite_color && reads_vertex_colour &&
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyQuadClears) == 0;
+    if (vertex_colour_told) {
+        rasterizer->NoteDrawVertexColour(VertexColourOfDraw(is_indexed));
+    }
 
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
         rasterizer->NoteDrawOverwrites(false, false);
+        if (vertex_colour_told) {
+            rasterizer->NoteDrawVertexColour(std::nullopt);
+        }
         CITRA_TRACE_COUNT(HwDraws);
         return;
+    }
+    if (vertex_colour_told) {
+        rasterizer->NoteDrawVertexColour(std::nullopt);
     }
 
     CITRA_FRAME_DUMP("  draw: vertex shading on the CPU");
@@ -3481,6 +3509,59 @@ bool PicaCore::SmallDrawOutputHash(bool is_indexed, u64& hash) {
     }
     hash = result;
     return true;
+}
+
+std::optional<std::array<u8, 4>> PicaCore::VertexColourOfDraw(bool is_indexed) {
+    const auto& pipeline = regs.internal.pipeline;
+    const u32 count = pipeline.num_vertices;
+    if (pipeline.use_gs != PipelineRegs::UseGS::No || !primitive_assembler.IsEmpty() || count < 3 ||
+        count > 6) {
+        return std::nullopt;
+    }
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const u8* index_address_8 = memory.GpuRead(
+        base_address + index_info.offset, pipeline.num_vertices * (index_info.format != 0 ? 2 : 1));
+    if (is_indexed && index_address_8 == nullptr) {
+        return std::nullopt;
+    }
+    const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+    const bool index_u16 = index_info.format != 0;
+
+    const VertexLoader loader(memory, pipeline);
+    ShaderUnit shader_unit;
+    ShaderEngine& engine = EngineForFewVertices();
+    std::array<u8, 4> colour{};
+    std::array<f24, 4> first{};
+    for (u32 index = 0; index < count; ++index) {
+        const u32 vertex = is_indexed
+                               ? (index_u16 ? index_address_16[index] : index_address_8[index])
+                               : (index + pipeline.vertex_offset);
+        AttributeBuffer input;
+        loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+        shader_unit.LoadInput(regs.internal.vs, input);
+        engine.Run(vs_setup, shader_unit);
+        AttributeBuffer output;
+        shader_unit.WriteOutput(regs.internal.vs, output);
+        // (Taken as the host's vertex shader takes it: its size, no more than one)
+        const OutputVertex shaded{regs.internal.rasterizer, output};
+        for (u32 c = 0; c < 4; c++) {
+            if (index == 0) {
+                first[c] = shaded.color[c];
+                // The fragment shader rounds it to a byte: only where it is well away from
+                // halfway between two, so that the GPU's interpolation cannot tip it
+                const f32 scaled = shaded.color[c].ToFloat32() * 255.f;
+                const f32 nearest = std::round(scaled);
+                if (!std::isfinite(scaled) || std::abs(scaled - nearest) > 0.25f) {
+                    return std::nullopt;
+                }
+                colour[c] = static_cast<u8>(std::clamp(nearest, 0.f, 255.f));
+            } else if (shaded.color[c].ToFloat32() != first[c].ToFloat32()) {
+                return std::nullopt;
+            }
+        }
+    }
+    return colour;
 }
 
 bool PicaCore::TextureRowsOfDraw(bool is_indexed, VideoCore::DrawTextureRows& rows) {

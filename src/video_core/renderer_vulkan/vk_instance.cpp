@@ -313,6 +313,27 @@ void Instance::CreateFormatTable() {
         const u32 index = static_cast<u32>(pixel_format);
         format_table[index] = traits;
     }
+
+    // ETC1 is a part of ETC2: an image of the guest's blocks, sampled as they are, copied, and
+    // the source of a blit that decodes them into one of pixels (a cube's face)
+    const vk::Format etc_format = vk::Format::eEtc2R8G8B8UnormBlock;
+    const vk::FormatFeatureFlags etc_features =
+        vk::FormatFeatureFlagBits::eSampledImage |
+        vk::FormatFeatureFlagBits::eSampledImageFilterLinear | vk::FormatFeatureFlagBits::eBlitSrc |
+        vk::FormatFeatureFlagBits::eTransferSrc | vk::FormatFeatureFlagBits::eTransferDst;
+    if (features.textureCompressionETC2 &&
+        (physical_device.getFormatProperties(etc_format).optimalTilingFeatures & etc_features) ==
+            etc_features) {
+        etc_block_traits = FormatTraits{
+            .transfer_support = true,
+            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst |
+                     vk::ImageUsageFlagBits::eTransferSrc,
+            .aspect = vk::ImageAspectFlagBits::eColor,
+            .native = etc_format,
+        };
+    }
+    LOG_INFO(Render_Vulkan, "ETC1 textures {}",
+             GetEtcBlockTraits() ? "can be kept in their blocks" : "are decoded (no ETC2)");
 }
 
 void Instance::CreateCustomFormatTable() {
@@ -584,6 +605,8 @@ bool Instance::CreateDevice() {
                 .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
                 .shaderClipDistance = features.shaderClipDistance,
+                // ETC1 textures kept in their blocks (Instance::GetEtcBlockTraits)
+                .textureCompressionETC2 = features.textureCompressionETC2,
             },
         },
         vk::PhysicalDevicePortabilitySubsetFeaturesKHR{},

@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 #include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -420,6 +421,12 @@ private:
     /// draws of two triangles at the most, whose vertices are shaded here to find out.
     /// False if it is none.
     bool TextureRowsOfDraw(bool is_indexed, VideoCore::DrawTextureRows& rows);
+
+    /// The colour every vertex of the draw about to be carried out puts out, as the fragment
+    /// shader takes it (rounded to bytes), where that is the same for all of them and close
+    /// to a byte. Only looks at draws of two triangles at the most, whose vertices are shaded
+    /// here to find out.
+    std::optional<std::array<u8, 4>> VertexColourOfDraw(bool is_indexed);
     /// See VideoCore::DrawFacts::OutputHash
     bool SmallDrawOutputHash(bool is_indexed, u64& hash);
 

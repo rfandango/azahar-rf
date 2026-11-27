@@ -165,6 +165,18 @@ public:
         return modelled_gpu_costs_frames.load(std::memory_order_relaxed);
     }
 
+    /// Asks for the host GPU's time to be measured whatever else wants it, for the frontend to
+    /// pass on to the system (Android's performance hints), see LastVBlankGpuTime
+    void WantGpuTime(bool wanted) noexcept {
+        gpu_time_wanted.store(wanted, std::memory_order_relaxed);
+    }
+
+    /// The time the host's GPU worked on what was sent to it in the last VBlank; zero where it
+    /// is not measured. Any thread.
+    [[nodiscard]] std::chrono::nanoseconds LastVBlankGpuTime() const noexcept {
+        return std::chrono::nanoseconds{last_vblank_gpu_ns.load(std::memory_order_relaxed)};
+    }
+
 protected:
     Core::System& system;
     RendererSettings settings;
@@ -200,6 +212,8 @@ private:
     u64 load_window_game_frames = 0;                  /// The game's frame count at its start
     // See ModelledGpuCostsFrames: the state, and stretches in a row that speak for the other
     std::atomic<bool> modelled_gpu_costs_frames{false};
+    std::atomic<bool> gpu_time_wanted{false};
+    std::atomic<s64> last_vblank_gpu_ns{0};
     u32 model_change_windows = 0;
     // Stretches in a row, see GovernResolution
     u32 overloaded_windows = 0;

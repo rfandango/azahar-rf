@@ -75,6 +75,236 @@ constexpr u32 DRAW_SITE_BITS = 12;
     return std::min(max_size, TEXTURE_BUFFER_SIZE);
 }
 
+/// The colour a draw writes to every pixel it covers, where that is one colour known before it
+/// is drawn and nothing after the combiners changes it: a clear can then stand in for the draw.
+/// Taken only where the generated shader writes exactly these bytes. The combiner stages may
+/// replace, add or subtract (the operations the shader works out exactly in any precision),
+/// from the stages' constants, the vertex colour where every vertex has the same one
+/// (`vertex_colour`, rounded as the shader rounds it), or what the stages before and the
+/// combiner buffer hold of those, through modifiers that pick or invert components, and a
+/// scale; the shader rounds to 8 bits at every stage as this does. Nothing after them: no fog,
+/// alpha test, blending other than a plain copy, logic operation other than copy, partial write
+/// mask, depth or stencil test, depth write, or scissor that excludes its inside. `why` gets
+/// the first reason a draw is not taken (see Common::Hitches::NoteFullAreaDraw).
+[[nodiscard]] std::optional<std::array<u8, 4>> ConstantDrawColour(
+    const Pica::RegsInternal& regs, const std::optional<std::array<u8, 4>>& vertex_colour,
+    u32* why = nullptr) {
+    using Colour = std::array<u8, 4>;
+    using Rgb = std::array<u8, 3>;
+    using Stage = Pica::TexturingRegs::TevStageConfig;
+    const auto no = [why](u32 reason) -> std::optional<Colour> {
+        if (why) {
+            *why = reason;
+        }
+        return std::nullopt;
+    };
+    const auto& merger = regs.framebuffer.output_merger;
+    if (merger.fragment_operation_mode != Pica::FramebufferRegs::FragmentOperationMode::Default ||
+        regs.texturing.fog_mode != Pica::TexturingRegs::FogMode::None) {
+        return no(1);
+    }
+    if (merger.alpha_test.enable &&
+        merger.alpha_test.func != Pica::FramebufferRegs::CompareFunc::Always) {
+        return no(2);
+    }
+    if (merger.stencil_test.enable) {
+        return no(3);
+    }
+    if (merger.depth_test_enable &&
+        merger.depth_test_func != Pica::FramebufferRegs::CompareFunc::Always) {
+        return no(4);
+    }
+    if (merger.depth_write_enable) {
+        return no(5);
+    }
+    if (!merger.red_enable || !merger.green_enable || !merger.blue_enable ||
+        !merger.alpha_enable || regs.framebuffer.framebuffer.allow_color_write == 0) {
+        return no(6);
+    }
+    if (regs.rasterizer.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Exclude) {
+        return no(7);
+    }
+    if (merger.alphablend_enable) {
+        using Equation = Pica::FramebufferRegs::BlendEquation;
+        using Factor = Pica::FramebufferRegs::BlendFactor;
+        const auto& blend = merger.alpha_blending;
+        if (blend.blend_equation_rgb != Equation::Add || blend.blend_equation_a != Equation::Add ||
+            blend.factor_source_rgb != Factor::One || blend.factor_dest_rgb != Factor::Zero ||
+            blend.factor_source_a != Factor::One || blend.factor_dest_a != Factor::Zero) {
+            return no(8);
+        }
+    } else if (merger.logic_op != Pica::FramebufferRegs::LogicOp::Copy) {
+        return no(9);
+    }
+
+    const auto& buffer_colour = regs.texturing.tev_combiner_buffer_color;
+    const auto& buffer_input = regs.texturing.tev_combiner_buffer_input;
+    // As the shader begins: the combiner buffer empty, its next value the buffer colour, and
+    // the output zero
+    Colour output{};
+    Colour buffer{};
+    Colour next{static_cast<u8>(buffer_colour.r), static_cast<u8>(buffer_colour.g),
+                static_cast<u8>(buffer_colour.b), static_cast<u8>(buffer_colour.a)};
+    const auto inverse = [](u8 v) { return static_cast<u8>(255 - v); };
+    const auto stages = regs.texturing.GetTevStages();
+    for (u32 index = 0; index < stages.size(); index++) {
+        const Stage& stage = stages[index];
+        const bool passes_through =
+            stage.color_op == Stage::Operation::Replace &&
+            stage.alpha_op == Stage::Operation::Replace &&
+            stage.color_source1 == Stage::Source::Previous &&
+            stage.alpha_source1 == Stage::Source::Previous &&
+            stage.color_modifier1 == Stage::ColorModifier::SourceColor &&
+            stage.alpha_modifier1 == Stage::AlphaModifier::SourceAlpha &&
+            stage.GetColorMultiplier() == 1 && stage.GetAlphaMultiplier() == 1;
+        if (!passes_through) {
+            const auto exact = [](Stage::Operation op) {
+                return op == Stage::Operation::Replace || op == Stage::Operation::Add ||
+                       op == Stage::Operation::Subtract;
+            };
+            if (!exact(stage.color_op) || !exact(stage.alpha_op)) {
+                return no(10);
+            }
+            // What a source holds. (The first stage's "previous" is its third source, as in
+            // the shader.)
+            Stage::Source unknown{};
+            const auto source = [&](Stage::Source from,
+                                    Stage::Source third) -> std::optional<Colour> {
+                if (index == 0 && from == Stage::Source::Previous) {
+                    from = third;
+                }
+                switch (from) {
+                case Stage::Source::Constant:
+                    return Colour{static_cast<u8>(stage.const_r), static_cast<u8>(stage.const_g),
+                                  static_cast<u8>(stage.const_b), static_cast<u8>(stage.const_a)};
+                case Stage::Source::Previous:
+                    return output;
+                case Stage::Source::PreviousBuffer:
+                    return buffer;
+                case Stage::Source::PrimaryColor:
+                    if (vertex_colour) {
+                        return *vertex_colour;
+                    }
+                    unknown = from;
+                    return std::nullopt;
+                default:
+                    unknown = from;
+                    return std::nullopt;
+                }
+            };
+            const auto colour_operand = [&](Stage::Source from,
+                                            Stage::ColorModifier modifier) -> std::optional<Rgb> {
+                const auto in = source(from, stage.color_source3);
+                if (!in) {
+                    return std::nullopt;
+                }
+                const Colour& c = *in;
+                switch (modifier) {
+                case Stage::ColorModifier::SourceColor:
+                    return Rgb{c[0], c[1], c[2]};
+                case Stage::ColorModifier::OneMinusSourceColor:
+                    return Rgb{inverse(c[0]), inverse(c[1]), inverse(c[2])};
+                case Stage::ColorModifier::SourceAlpha:
+                    return Rgb{c[3], c[3], c[3]};
+                case Stage::ColorModifier::OneMinusSourceAlpha:
+                    return Rgb{inverse(c[3]), inverse(c[3]), inverse(c[3])};
+                case Stage::ColorModifier::SourceRed:
+                    return Rgb{c[0], c[0], c[0]};
+                case Stage::ColorModifier::OneMinusSourceRed:
+                    return Rgb{inverse(c[0]), inverse(c[0]), inverse(c[0])};
+                case Stage::ColorModifier::SourceGreen:
+                    return Rgb{c[1], c[1], c[1]};
+                case Stage::ColorModifier::OneMinusSourceGreen:
+                    return Rgb{inverse(c[1]), inverse(c[1]), inverse(c[1])};
+                case Stage::ColorModifier::SourceBlue:
+                    return Rgb{c[2], c[2], c[2]};
+                case Stage::ColorModifier::OneMinusSourceBlue:
+                    return Rgb{inverse(c[2]), inverse(c[2]), inverse(c[2])};
+                default:
+                    unknown = Stage::Source{};
+                    return std::nullopt;
+                }
+            };
+            const auto alpha_operand = [&](Stage::Source from,
+                                           Stage::AlphaModifier modifier) -> std::optional<u8> {
+                const auto in = source(from, stage.alpha_source3);
+                if (!in) {
+                    return std::nullopt;
+                }
+                const Colour& a = *in;
+                switch (modifier) {
+                case Stage::AlphaModifier::SourceAlpha:
+                    return a[3];
+                case Stage::AlphaModifier::OneMinusSourceAlpha:
+                    return inverse(a[3]);
+                case Stage::AlphaModifier::SourceRed:
+                    return a[0];
+                case Stage::AlphaModifier::OneMinusSourceRed:
+                    return inverse(a[0]);
+                case Stage::AlphaModifier::SourceGreen:
+                    return a[1];
+                case Stage::AlphaModifier::OneMinusSourceGreen:
+                    return inverse(a[1]);
+                case Stage::AlphaModifier::SourceBlue:
+                    return a[2];
+                case Stage::AlphaModifier::OneMinusSourceBlue:
+                    return inverse(a[2]);
+                default:
+                    unknown = Stage::Source{};
+                    return std::nullopt;
+                }
+            };
+            const auto failed = [&]() {
+                const bool texture = unknown >= Stage::Source::Texture0 &&
+                                     unknown <= Stage::Source::Texture3;
+                return no(unknown == Stage::Source::PrimaryColor ? 11 : texture ? 12 : 13);
+            };
+            const auto combine = [](Stage::Operation op, u8 first, u8 second) -> u8 {
+                switch (op) {
+                case Stage::Operation::Add:
+                    return static_cast<u8>(std::min<u32>(u32{first} + second, 255));
+                case Stage::Operation::Subtract:
+                    return static_cast<u8>(first > second ? first - second : 0);
+                default:
+                    return first;
+                }
+            };
+            const auto c1 = colour_operand(stage.color_source1, stage.color_modifier1);
+            const auto c2 = stage.color_op != Stage::Operation::Replace
+                                ? colour_operand(stage.color_source2, stage.color_modifier2)
+                                : std::optional<Rgb>{Rgb{}};
+            if (!c1 || !c2) {
+                return failed();
+            }
+            const auto a1 = alpha_operand(stage.alpha_source1, stage.alpha_modifier1);
+            const auto a2 = stage.alpha_op != Stage::Operation::Replace
+                                ? alpha_operand(stage.alpha_source2, stage.alpha_modifier2)
+                                : std::optional<u8>{u8{0}};
+            if (!a1 || !a2) {
+                return failed();
+            }
+            const auto scaled = [](u8 v, u32 multiplier) {
+                return static_cast<u8>(std::min<u32>(u32{v} * multiplier, 255));
+            };
+            const u32 colour_multiplier = stage.GetColorMultiplier();
+            for (u32 c = 0; c < 3; c++) {
+                output[c] = scaled(combine(stage.color_op, (*c1)[c], (*c2)[c]), colour_multiplier);
+            }
+            output[3] = scaled(combine(stage.alpha_op, *a1, *a2), stage.GetAlphaMultiplier());
+        }
+        buffer = next;
+        if (buffer_input.TevStageUpdatesCombinerBufferColor(index)) {
+            next[0] = output[0];
+            next[1] = output[1];
+            next[2] = output[2];
+        }
+        if (buffer_input.TevStageUpdatesCombinerBufferAlpha(index)) {
+            next[3] = output[3];
+        }
+    }
+    return output;
+}
+
 } // Anonymous namespace
 
 RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore& pica,
@@ -982,6 +1212,36 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         return true;
     }
 
+    // A draw that fills all it covers with one colour that the registers tell is a clear: a
+    // quad most games clear a target with. The clear writes the same bytes without the draw's
+    // shader, pipeline and textures (ConstantDrawColour says when that holds).
+    if (next_draw_overwrites_color && needs_color_fb && !shadow_rendering &&
+        framebuffer->Samples() == 1 && framebuffer->color_level == 0 &&
+        framebuffer->Format(SurfaceType::Color) != VideoCore::PixelFormat::Invalid &&
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyQuadClears) == 0) {
+        u32 why = 0;
+        const auto colour = ConstantDrawColour(regs, draw_vertex_colour, &why);
+        Common::Hitches::NoteFullAreaDraw(why);
+        if (colour) {
+            Common::Rectangle<s32> area{static_cast<s32>(draw_rect.left),
+                                        static_cast<s32>(draw_rect.top),
+                                        static_cast<s32>(draw_rect.right),
+                                        static_cast<s32>(draw_rect.bottom)};
+            if (regs.rasterizer.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Include) {
+                const auto scissor = fb_helper.Scissor();
+                area.left = std::max(area.left, scissor.left);
+                area.bottom = std::max(area.bottom, scissor.bottom);
+                area.right = std::min(area.right, scissor.right);
+                area.top = std::min(area.top, scissor.top);
+            }
+            if (area.right > area.left && area.top > area.bottom) {
+                DrawAsClear(framebuffer, draw_rect, area, *colour);
+                renderpass_cache.SetClearDeferral(false);
+                return true;
+            }
+        }
+    }
+
     pipeline_info.state.attachments.color = framebuffer->Format(SurfaceType::Color);
     pipeline_info.state.attachments.depth = framebuffer->Format(SurfaceType::Depth);
     pipeline_info.state.attachments.sample_count = framebuffer->Samples();
@@ -1004,6 +1264,22 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     SyncTextureUnits(framebuffer, draw_rect, overwrites_color);
     framebuffer = fb_helper.Refresh();
     SyncUtilityTextures(framebuffer);
+    if (Common::Hitches::IsEnabled() && !regs.lighting.disable) [[unlikely]] {
+        // Lights that add no colour, to see what leaving their lookups out would come to
+        const u32 lights = regs.lighting.max_light_index + 1;
+        u32 colourless = 0;
+        for (u32 n = 0; n < lights; n++) {
+            const auto& light = regs.lighting.light[regs.lighting.light_enable.GetNum(n)];
+            const auto none = [](const Pica::LightingRegs::LightColor& colour) {
+                return colour.r == 0 && colour.g == 0 && colour.b == 0;
+            };
+            if (none(light.ambient) && none(light.diffuse) && none(light.specular_0) &&
+                none(light.specular_1)) {
+                colourless++;
+            }
+        }
+        Common::Hitches::NoteLitDraw(lights, colourless);
+    }
 
     // Sync and bind the shader. With Z-buffering the viewport applies the PICA depth range, so
     // the shader does not write depth and the host GPU can reject hidden fragments early.
@@ -1140,6 +1416,35 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     return succeeded;
 }
 
+void RasterizerVulkan::DrawAsClear(const Framebuffer* framebuffer,
+                                   const Common::Rectangle<u32>& draw_rect,
+                                   const Common::Rectangle<s32>& area,
+                                   const std::array<u8, 4>& colour) {
+    // (As a draw would: a pass that begins here does not load the colour it overwrites)
+    renderpass_cache.BeginRendering(framebuffer, draw_rect, true, false);
+    const vk::ClearAttachment attachment = {
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .colorAttachment = 0,
+        .clearValue = vk::ClearValue{.color = vk::ClearColorValue{std::array<float, 4>{
+                                         colour[0] / 255.f, colour[1] / 255.f, colour[2] / 255.f,
+                                         colour[3] / 255.f}}},
+    };
+    const vk::ClearRect rect = {
+        .rect = vk::Rect2D{.offset = {area.left, area.bottom},
+                           .extent = {static_cast<u32>(area.right - area.left),
+                                      static_cast<u32>(area.top - area.bottom)}},
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    scheduler.Record([attachment, rect](vk::CommandBuffer cmdbuf) {
+        cmdbuf.clearAttachments(attachment, rect);
+    });
+    CITRA_FRAME_DUMP("  vk draw done as a clear of {}x{} to {:02X}{:02X}{:02X}{:02X}",
+                     rect.rect.extent.width, rect.rect.extent.height, colour[0], colour[1],
+                     colour[2], colour[3]);
+    Common::Hitches::NoteDrawAsClear(u64{rect.rect.extent.width} * rect.rect.extent.height);
+}
+
 void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
                                         const Common::Rectangle<u32>& draw_rect,
                                         bool overwrites_color) {
@@ -1246,17 +1551,40 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
         // Bind the texture provided by the rasterizer cache
         Surface& surface = res_cache.GetTextureSurface(texture);
         Sampler& sampler = res_cache.GetSampler(texture.config);
+        if (Common::Hitches::IsEnabled()) [[unlikely]] {
+            const u32 summary = Common::Hitches::SummaryNumber();
+            const bool first = surface.sampled_in_summary != summary;
+            surface.sampled_in_summary = summary;
+            const u64 pixels = u64{surface.width} * surface.height;
+            Common::Hitches::NoteTextureSampled(
+                static_cast<u32>(surface.pixel_format),
+                VideoCore::PixelFormatAsString(surface.pixel_format),
+                surface.keeps_etc_blocks ? pixels / 2
+                                         : u64{surface.GetScaledWidth()} *
+                                               surface.GetScaledHeight() *
+                                               surface.GetInternalBytesPerPixel(),
+                pixels * VideoCore::GetFormatBpp(surface.pixel_format) / 8, first);
+        }
         // The fragment shader works the level of detail out from the size of the host texture,
-        // which it is told instead of asking the texture for it at every fragment
+        // which it is told instead of asking the texture for it at every fragment. A texture
+        // of ETC1 blocks has its rows from the top: the shader turns the coordinate over (z).
         const auto extent = surface.RealExtent();
         const Common::Vec4f tex_size{static_cast<f32>(extent.width),
-                                     static_cast<f32>(extent.height), 0.f, 0.f};
+                                     static_cast<f32>(extent.height),
+                                     surface.keeps_etc_blocks ? 1.f : 0.f, 0.f};
         if (fs_data.tex_size[texture_index] != tex_size) {
             fs_data.tex_size[texture_index] = tex_size;
             fs_data_dirty = true;
         }
         const vk::ImageView surface_view = surface.FramebufferView();
         vk::ImageView texture_view;
+        if ((Common::TraceMarkers::Experiments4() & Common::TraceMarkers::SkipEtcTextures) &&
+            (surface.pixel_format == VideoCore::PixelFormat::ETC1 ||
+             surface.pixel_format == VideoCore::PixelFormat::ETC1A4)) [[unlikely]] {
+            Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
+            bind(texture_index, null_surface.ImageView(), sampler.Handle());
+            continue;
+        }
         if (swapped_color_view && surface_view == swapped_color_view) {
             // Another unit samples the colour target as well
             texture_view = swapped_sample_view;
@@ -1314,26 +1642,15 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer,
 
 void RasterizerVulkan::SyncUtilityTextures(const Framebuffer* framebuffer) {
     const bool shadow_writing = regs.framebuffer.IsShadowRendering();
-    bool shadow_reading = regs.lighting.config0.enable_shadow;
-    // Ensure the shadow-texture slot is actually enabled
-    if (shadow_reading) {
-        const u32 shadow_texture_unit = regs.lighting.config0.shadow_selector.Value();
-        const auto shadow_texture = regs.texturing.GetTextures()[shadow_texture_unit];
-        shadow_reading &= shadow_texture.enabled;
-    }
-
     const auto utility_set = pipeline_cache.Acquire(DescriptorHeapType::Utility);
 
-    // Reading and writing are mutually exclusive
-    assert(!(shadow_writing && shadow_reading));
-
+    // Only a shader that renders a shadow map declares this image. Lighting that reads a shadow
+    // samples the texture unit the selector names, which is bound with the others: asking that
+    // texture for a storage view here, as was done, gave its images storage usage for nothing
+    // (an Adreno compresses none with it), and an ETC1 texture kept in its blocks has none to
+    // give (Luigi's Mansion: Dark Moon's lighting reads its shadow from one).
     if (shadow_writing) {
         update_queue.AddStorageImage(utility_set, 0, framebuffer->ImageView(SurfaceType::Color));
-    } else if (shadow_reading) {
-        const u32 shadow_texture_unit = regs.lighting.config0.shadow_selector.Value();
-        const auto shadow_texture = regs.texturing.GetTextures()[shadow_texture_unit];
-        Surface& shadow_surface = res_cache.GetTextureSurface(shadow_texture);
-        update_queue.AddStorageImage(utility_set, 0, shadow_surface.StorageView());
     } else {
         if (instance.IsNullDescriptorSupported()) {
             update_queue.AddStorageImage(utility_set, 0, vk::ImageView{});

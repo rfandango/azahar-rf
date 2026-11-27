@@ -40,6 +40,10 @@ public:
     /// Ensures that "size" bytes of memory are available to the GPU, potentially recording a copy.
     void Commit(u32 size);
 
+    /// A download buffer's: makes what the GPU wrote at [offset, offset + size) visible to the
+    /// processor. Called once the GPU is done writing it; nothing to do in coherent memory.
+    void Invalidate(u32 offset, u32 size);
+
     vk::Buffer Handle() const noexcept {
         return buffer;
     }
@@ -67,6 +71,7 @@ private:
     vk::DeviceMemory memory;  ///< Memory allocation.
     u8* mapped{};             ///< Pointer to the mapped memory
     u64 stream_buffer_size{}; ///< Stream buffer size.
+    u64 memory_size{};        ///< Size of the memory mapped, at least the buffer's
     vk::BufferUsageFlags usage{};
     BufferType type;
 

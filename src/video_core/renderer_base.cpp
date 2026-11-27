@@ -96,7 +96,9 @@ void RendererBase::GovernResolution() {
     const bool governs = Settings::values.dynamic_resolution.GetValue();
     // Also followed for the model of the console's GPU time, see ModelledGpuCostsFrames
     const bool models = Settings::values.simulate_3ds_gpu_timings.GetValue();
-    const auto busy = TakeGpuTime(governs || models || Common::Hitches::IsEnabled());
+    const auto busy = TakeGpuTime(governs || models || Common::Hitches::IsEnabled() ||
+                                  gpu_time_wanted.load(std::memory_order_relaxed));
+    last_vblank_gpu_ns.store(busy ? busy->count() : 0, std::memory_order_relaxed);
     if (!busy) {
         scale_reduction.store(0, std::memory_order_relaxed);
         load_window_open = false;

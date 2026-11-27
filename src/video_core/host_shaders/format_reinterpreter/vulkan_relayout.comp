@@ -12,7 +12,13 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #ifdef DEPTH_SOURCE
 layout(set = 0, binding = 0) uniform highp texture2D depth;
+#ifdef STENCIL_BYTES
+// The stencil, copied into a buffer a byte a texel (an image whose stencil is sampled could not
+// be compressed on every GPU): stencil_at is where the copy begins and its row length
+layout(set = 0, binding = 3) uniform lowp utextureBuffer stencil_bytes;
+#else
 layout(set = 0, binding = 1) uniform lowp utexture2D stencil;
+#endif
 #else
 layout(set = 0, binding = 0) uniform highp texture2D source;
 #endif
@@ -35,6 +41,7 @@ layout(push_constant, std140) uniform RelayoutInfo {
                              // address of the source, in bytes
     highp int first_pixel;   // Destination pixel indices to fill
     highp int end_pixel;
+    highp ivec2 stencil_at;  // DEPTH_SOURCE: first byte of the stencil copy, its row length
 };
 
 // Whole-number division of values that are not negative, done in floating point. The pass runs
@@ -148,7 +155,12 @@ void main() {
 
 #ifdef DEPTH_SOURCE
     highp uint depth_val = uint(texelFetch(depth, src_coord, 0).x * (exp2(32.0) - 1.0));
+#ifdef STENCIL_BYTES
+    lowp uint stencil_val =
+        texelFetch(stencil_bytes, stencil_at.x + src_coord.y * stencil_at.y + src_coord.x).x;
+#else
     lowp uint stencil_val = texelFetch(stencil, src_coord, 0).x;
+#endif
     highp uvec4 components =
         uvec4(stencil_val, (uvec3(depth_val) >> uvec3(24u, 16u, 8u)) & 0x000000FFu);
     imageStore(dest, dst_coord, vec4(components) / (exp2(8.0) - 1.0));

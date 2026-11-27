@@ -116,6 +116,17 @@ public:
     /// made for the old ones, which are destroyed as soon as the GPU is done with them, is not
     /// for these. A framebuffer for one, and that goes for either of its surfaces.
     u32 image_generation{};
+    /// The hitch summary in which a draw last sampled the surface (Common::Hitches::
+    /// NoteTextureSampled), to count each texture once a summary
+    u32 sampled_in_summary = ~0u;
+    /// An ETC1 texture whose image holds the guest's blocks, for the GPU to decode when it
+    /// samples them, and not the pixels they decode to: an eighth of the memory, and of what is
+    /// read for every sample. Its rows are stored from the top, the other way up to those of
+    /// every other surface (a block cannot be turned over exactly: the second colour of one in
+    /// differential mode is not always the first's plus a difference that fits), so its uploads
+    /// and copies count rows from the other end and the fragment shader turns the coordinate
+    /// over. The uploads are of the blocks (TranscodeETC1). Set by the backend that can.
+    bool keeps_etc_blocks{};
     const Material* material = nullptr;
     SurfaceRegions invalid_regions;
     /// What of the surface was valid at some time: the part its image on the host has been

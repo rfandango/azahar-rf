@@ -1070,11 +1070,26 @@ void FragmentModule::DefineTexSampler(u32 texture_unit) {
         AddLabel(not_border_label);
     }
 
+    // A 2D texture whose rows go from the top (an ETC1 texture kept in its blocks) has t turned
+    // over: one minus t, or of a projected coordinate w minus t. The uniform's tex_size z is one
+    // for such a texture and zero for any other. (The border test above is the same either way
+    // up, as are the derivatives' sizes below.)
+    const auto turned = [&](Id t, Id one) {
+        const Id flip{OpCompositeExtract(
+            f32_id, GetShaderDataMember(vec_ids.Get(4), ConstS32(30), ConstU32(texture_unit)),
+            2)};
+        return OpFMix(f32_id, t, OpFSub(f32_id, one, t), flip);
+    };
+    const Id texcoord_2d{OpCompositeInsert(
+        vec_ids.Get(2), turned(OpCompositeExtract(f32_id, texcoord, 1), ConstF32(1.f)), texcoord,
+        1)};
+
     // PICA's LOD formula for 2D textures.
     // This LOD formula is the same as the LOD lower limit defined in OpenGL.
     // f(x, y) >= max{m_u, m_v, m_w}
     // (See OpenGL 4.6 spec, 8.14.1 - Scale Factor and Level-of-Detail)
     const auto sample_lod = [&](Id tex_id) {
+        const Id texcoord{texcoord_2d};
         const Id sampled_image{OpLoad(TypeSampledImage(image2d_id), tex_id)};
         const auto sampled = [this](const auto& sample) {
             relaxed = half_combiners;
@@ -1122,8 +1137,10 @@ void FragmentModule::DefineTexSampler(u32 texture_unit) {
         const Id image_type = !projection ? image_cube_id : image2d_id;
         const Id sampled_image{OpLoad(TypeSampledImage(image_type), tex_id)};
         const Id texcoord0_w{OpLoad(f32_id, texcoord0_w_id)};
+        const Id t{OpCompositeExtract(f32_id, texcoord, 1)};
         const Id coord{OpCompositeConstruct(vec_ids.Get(3), OpCompositeExtract(f32_id, texcoord, 0),
-                                            OpCompositeExtract(f32_id, texcoord, 1), texcoord0_w)};
+                                            projection ? turned(t, texcoord0_w) : t,
+                                            texcoord0_w)};
         relaxed = half_combiners;
         const Id result{projection
                             ? OpImageSampleProjImplicitLod(vec_ids.Get(4), sampled_image, coord)

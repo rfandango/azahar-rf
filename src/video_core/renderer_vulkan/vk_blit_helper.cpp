@@ -39,12 +39,16 @@ namespace {
 struct PushConstants {
     std::array<float, 2> tex_scale;
     std::array<float, 2> tex_offset;
+    /// The depth blit's: where the stencil copy begins and its row length (CopyStencil)
+    std::array<s32, 2> stencil_at;
 };
 
 struct ComputeInfo {
     Common::Vec2i src_offset;
     Common::Vec2i dst_offset;
     Common::Vec2i src_extent;
+    /// Where the stencil copy begins and its row length (CopyStencil)
+    Common::Vec2i stencil_at;
 };
 
 inline constexpr vk::PushConstantRange COMPUTE_PUSH_CONSTANT_RANGE{
@@ -69,6 +73,8 @@ struct RelayoutInfo {
     s32 pixel_delta;
     s32 first_pixel;
     s32 end_pixel;
+    /// A depth source's: where the stencil copy begins and its row length (CopyStencil)
+    Common::Vec2i stencil_at;
 };
 
 inline constexpr vk::PushConstantRange RELAYOUT_PUSH_CONSTANT_RANGE{
@@ -77,22 +83,31 @@ inline constexpr vk::PushConstantRange RELAYOUT_PUSH_CONSTANT_RANGE{
     .size = sizeof(RelayoutInfo),
 };
 
-constexpr std::array<vk::DescriptorSetLayoutBinding, 3> COMPUTE_BINDINGS = {{
+// (The last binding of the first three is the stencil copied into a buffer, see CopyStencil.
+// The one before it stays for the multisampled conversion, which samples the stencil.)
+constexpr std::array<vk::DescriptorSetLayoutBinding, 4> COMPUTE_BINDINGS = {{
     {0, vk::DescriptorType::eSampledImage, 1, vk::ShaderStageFlagBits::eCompute},
     {1, vk::DescriptorType::eSampledImage, 1, vk::ShaderStageFlagBits::eCompute},
     {2, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+    {3, vk::DescriptorType::eUniformTexelBuffer, 1, vk::ShaderStageFlagBits::eCompute},
 }};
 
-constexpr std::array<vk::DescriptorSetLayoutBinding, 3> COMPUTE_BUFFER_BINDINGS = {{
+constexpr std::array<vk::DescriptorSetLayoutBinding, 4> COMPUTE_BUFFER_BINDINGS = {{
     {0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
     {1, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
     {2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+    {3, vk::DescriptorType::eUniformTexelBuffer, 1, vk::ShaderStageFlagBits::eCompute},
 }};
 
-constexpr std::array<vk::DescriptorSetLayoutBinding, 2> TWO_TEXTURES_BINDINGS = {{
+constexpr std::array<vk::DescriptorSetLayoutBinding, 3> TWO_TEXTURES_BINDINGS = {{
     {0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eFragment},
     {1, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eFragment},
+    {2, vk::DescriptorType::eUniformTexelBuffer, 1, vk::ShaderStageFlagBits::eFragment},
 }};
+
+/// The most bytes of stencil copied for the shaders that read it at once (CopyStencil): the
+/// largest depth buffer at the highest scale (1024x1024 at 4x) fits twice
+constexpr u64 STENCIL_BUFFER_SIZE = 32ull << 20;
 
 // Texture filtering descriptor set bindings
 constexpr std::array<vk::DescriptorSetLayoutBinding, 1> SINGLE_TEXTURE_BINDINGS = {{
@@ -320,7 +335,43 @@ BlitHelper::BlitHelper(const Instance& instance_, Scheduler& scheduler_,
     if (instance.IsShaderStencilExportSupported()) {
         blit_depth_stencil_frag = Compile(HostShaders::VULKAN_BLIT_DEPTH_STENCIL_FRAG,
                                           vk::ShaderStageFlagBits::eFragment, device);
-        depth_blit_pipeline = MakeDepthStencilBlitPipeline();
+        depth_blit_pipeline = MakeDepthStencilBlitPipeline(blit_depth_stencil_frag);
+    }
+
+    // The stencil read from a copy of it, as bytes: an image whose stencil is sampled is not
+    // compressed on GPUs that sample it from depth and stencil as one (the Adreno 610)
+    const u64 stencil_size = std::min<u64>(
+        STENCIL_BUFFER_SIZE,
+        instance.GetPhysicalDevice().getProperties().limits.maxTexelBufferElements);
+    stencil_buffer = std::make_unique<StreamBuffer>(
+        instance, scheduler,
+        vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eUniformTexelBuffer,
+        stencil_size, BufferType::Stream);
+    stencil_capacity = stencil_size;
+    stencil_view = device.createBufferView({
+        .buffer = stencil_buffer->Handle(),
+        .format = vk::Format::eR8Uint,
+        .offset = 0,
+        .range = VK_WHOLE_SIZE,
+    });
+    constexpr const char* BYTES = "#define STENCIL_BYTES\n";
+    d24s8_to_rgba8_bytes_comp = Compile(HostShaders::VULKAN_D24S8_TO_RGBA8_COMP,
+                                        vk::ShaderStageFlagBits::eCompute, device, BYTES);
+    depth_to_buffer_bytes_comp = Compile(HostShaders::VULKAN_DEPTH_TO_BUFFER_COMP,
+                                         vk::ShaderStageFlagBits::eCompute, device, BYTES);
+    relayout_depth_bytes_comp =
+        Compile(HostShaders::VULKAN_RELAYOUT_COMP, vk::ShaderStageFlagBits::eCompute, device,
+                "#define DEPTH_SOURCE\n#define STENCIL_BYTES\n");
+    d24s8_to_rgba8_bytes_pipeline =
+        MakeComputePipeline(d24s8_to_rgba8_bytes_comp, compute_pipeline_layout);
+    depth_to_buffer_bytes_pipeline =
+        MakeComputePipeline(depth_to_buffer_bytes_comp, compute_buffer_pipeline_layout);
+    relayout_depth_bytes_pipeline =
+        MakeComputePipeline(relayout_depth_bytes_comp, relayout_pipeline_layout);
+    if (instance.IsShaderStencilExportSupported()) {
+        blit_depth_stencil_bytes_frag = Compile(HostShaders::VULKAN_BLIT_DEPTH_STENCIL_FRAG,
+                                                vk::ShaderStageFlagBits::eFragment, device, BYTES);
+        depth_blit_bytes_pipeline = MakeDepthStencilBlitPipeline(blit_depth_stencil_bytes_frag);
     }
 
     if (instance.HasDebuggingToolAttached()) {
@@ -396,10 +447,26 @@ BlitHelper::~BlitHelper() {
     device.destroyPipeline(depth_blit_pipeline);
     device.destroySampler(linear_sampler);
     device.destroySampler(nearest_sampler);
+    device.destroyBufferView(stencil_view);
+    for (const vk::Pipeline pipeline :
+         {d24s8_to_rgba8_bytes_pipeline, depth_to_buffer_bytes_pipeline,
+          relayout_depth_bytes_pipeline, depth_blit_bytes_pipeline}) {
+        if (pipeline) {
+            device.destroyPipeline(pipeline);
+        }
+    }
+    for (const vk::ShaderModule module :
+         {d24s8_to_rgba8_bytes_comp, depth_to_buffer_bytes_comp, relayout_depth_bytes_comp,
+          blit_depth_stencil_bytes_frag}) {
+        if (module) {
+            device.destroyShaderModule(module);
+        }
+    }
 }
 
 void BindBlitState(vk::CommandBuffer cmdbuf, vk::PipelineLayout layout,
-                   const VideoCore::TextureBlit& blit, const Surface& dest) {
+                   const VideoCore::TextureBlit& blit, const Surface& dest,
+                   Common::Vec2i stencil_at = {}) {
     const vk::Offset2D offset{
         .x = std::min<s32>(blit.dst_rect.left, blit.dst_rect.right),
         .y = std::min<s32>(blit.dst_rect.bottom, blit.dst_rect.top),
@@ -426,12 +493,96 @@ void BindBlitState(vk::CommandBuffer cmdbuf, vk::PipelineLayout layout,
         .tex_scale = {scale_x, scale_y},
         .tex_offset = {static_cast<float>(blit.src_rect.left),
                        static_cast<float>(blit.src_rect.bottom)},
+        .stencil_at = {stencil_at.x, stencil_at.y},
     };
     cmdbuf.setViewport(0, viewport);
     cmdbuf.setScissor(0, scissor);
     cmdbuf.pushConstants(layout,
                          vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
                          sizeof(push_constants), &push_constants);
+}
+
+std::optional<Common::Vec2i> BlitHelper::CopyStencil(Surface& source) {
+    if (!stencil_buffer || source.sample_count > 1) {
+        return std::nullopt;
+    }
+    const vk::Extent2D extent = source.ImageExtent();
+    const u64 size = u64{extent.width} * extent.height;
+    // (Half the buffer at most, so that one copy never waits for the one before it)
+    if (size == 0 || size > stencil_capacity / 2) {
+        return std::nullopt;
+    }
+    const vk::Image image = source.Image();
+    // (A depth and stencil image's copy begins at a multiple of four bytes)
+    const auto [data, offset, wrapped] = stencil_buffer->Map(static_cast<u32>(size), 4);
+    stencil_buffer->Commit(static_cast<u32>(size));
+
+    renderpass_cache.EndRendering();
+    scheduler.Record([image, extent, offset, buffer = stencil_buffer->Handle(),
+                      aspect = source.Aspect(), access = source.AccessFlags(),
+                      stages = source.PipelineStageFlags()](vk::CommandBuffer cmdbuf) {
+        const vk::ImageSubresourceRange range = {
+            .aspectMask = aspect,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        const vk::ImageMemoryBarrier pre_barrier = {
+            .srcAccessMask = access,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = range,
+        };
+        cmdbuf.pipelineBarrier(stages, vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barrier);
+
+        const vk::BufferImageCopy copy = {
+            .bufferOffset = offset,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eStencil,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {extent.width, extent.height, 1},
+        };
+        cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eGeneral, buffer, copy);
+
+        // The copy is read by the shader that follows; the image is written again after it
+        const vk::BufferMemoryBarrier buffer_barrier = {
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer,
+            .offset = offset,
+            .size = u64{extent.width} * extent.height,
+        };
+        const vk::ImageMemoryBarrier post_barrier = {
+            .srcAccessMask = vk::AccessFlagBits::eNone,
+            .dstAccessMask = access,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = range,
+        };
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               stages | vk::PipelineStageFlagBits::eComputeShader |
+                                   vk::PipelineStageFlagBits::eFragmentShader,
+                               vk::DependencyFlagBits::eByRegion, {}, buffer_barrier,
+                               post_barrier);
+    });
+    return Common::Vec2i{static_cast<int>(offset), static_cast<int>(extent.width)};
 }
 
 bool BlitHelper::BlitDepthStencil(Surface& source, Surface& dest,
@@ -446,9 +597,14 @@ bool BlitHelper::BlitDepthStencil(Surface& source, Surface& dest,
         .extent = {dest.GetScaledWidth(), dest.GetScaledHeight()},
     };
 
+    const auto stencil_at = depth_blit_bytes_pipeline ? CopyStencil(source) : std::nullopt;
     const auto descriptor_set = two_textures_provider.Commit();
     update_queue.AddImageSampler(descriptor_set, 0, 0, source.DepthView(), nearest_sampler);
-    update_queue.AddImageSampler(descriptor_set, 1, 0, source.StencilView(), nearest_sampler);
+    if (stencil_at) {
+        update_queue.AddTexelBuffer(descriptor_set, 2, stencil_view);
+    } else {
+        update_queue.AddImageSampler(descriptor_set, 1, 0, source.StencilView(), nearest_sampler);
+    }
 
     const RenderPass depth_pass = {
         .framebuffer = dest.Framebuffer(),
@@ -458,12 +614,13 @@ bool BlitHelper::BlitDepthStencil(Surface& source, Surface& dest,
     };
     renderpass_cache.BeginRendering(depth_pass);
 
-    scheduler.Record([blit, descriptor_set, &dest, this](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([blit, descriptor_set, &dest, this, stencil_at](vk::CommandBuffer cmdbuf) {
         const vk::PipelineLayout layout = two_textures_pipeline_layout;
 
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, depth_blit_pipeline);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                            stencil_at ? depth_blit_bytes_pipeline : depth_blit_pipeline);
         cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 0, descriptor_set, {});
-        BindBlitState(cmdbuf, layout, blit, dest);
+        BindBlitState(cmdbuf, layout, blit, dest, stencil_at.value_or(Common::Vec2i{}));
         cmdbuf.draw(3, 1, 0, 0);
     });
     scheduler.MakeDirty(StateFlags::Pipeline);
@@ -481,20 +638,29 @@ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
                   "Multisampled DS24S8->RGBA8 conversion is not supported on this device");
         return false;
     }
-    const auto pipeline = multisample ? d24s8_to_rgba8_ms_pipeline : d24s8_to_rgba8_pipeline;
+    // (The multisampled image's stencil is sampled: CopyStencil takes single-sampled ones)
+    const auto stencil_at = multisample ? std::nullopt : CopyStencil(source);
+    const auto pipeline = multisample  ? d24s8_to_rgba8_ms_pipeline
+                          : stencil_at ? d24s8_to_rgba8_bytes_pipeline
+                                       : d24s8_to_rgba8_pipeline;
 
     const auto descriptor_set = compute_provider.Commit();
     update_queue.AddImageSampler(descriptor_set, 0, 0, source.ImageView(ViewType::Depth, src_type),
                                  VK_NULL_HANDLE, vk::ImageLayout::eDepthStencilReadOnlyOptimal);
-    update_queue.AddImageSampler(descriptor_set, 1, 0,
-                                 source.ImageView(ViewType::Stencil, src_type), VK_NULL_HANDLE,
-                                 vk::ImageLayout::eDepthStencilReadOnlyOptimal);
+    if (stencil_at) {
+        update_queue.AddTexelBuffer(descriptor_set, 3, stencil_view);
+    } else {
+        update_queue.AddImageSampler(descriptor_set, 1, 0,
+                                     source.ImageView(ViewType::Stencil, src_type), VK_NULL_HANDLE,
+                                     vk::ImageLayout::eDepthStencilReadOnlyOptimal);
+    }
     update_queue.AddStorageImage(descriptor_set, 2, dest.ImageView(ViewType::Sample, src_type));
 
     renderpass_cache.EndRendering();
 
     scheduler.Record([this, pipeline, descriptor_set, copy, src_image = source.Image(src_type),
-                      dst_image = dest.Image(src_type)](vk::CommandBuffer cmdbuf) {
+                      dst_image = dest.Image(src_type),
+                      stencil_at = stencil_at.value_or(Common::Vec2i{})](vk::CommandBuffer cmdbuf) {
         const std::array pre_barriers = {
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
@@ -581,6 +747,7 @@ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
                                         static_cast<int>(copy.dst_offset.y)},
             .src_extent = Common::Vec2i{static_cast<int>(copy.extent.width),
                                         static_cast<int>(copy.extent.height)},
+            .stencil_at = stencil_at,
         };
         cmdbuf.pushConstants(compute_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                              sizeof(info), &info);
@@ -605,7 +772,9 @@ bool BlitHelper::ConvertDS24S8ToRGBA8(Surface& source, Surface& dest,
 bool BlitHelper::Relayout(Surface& source, Surface& dest,
                           const VideoCore::TextureRelayout& relayout) {
     const bool depth_source = source.type == VideoCore::SurfaceType::DepthStencil;
-    const auto pipeline = depth_source ? relayout_depth_pipeline
+    const auto stencil_at = depth_source ? CopyStencil(source) : std::nullopt;
+    const auto pipeline = depth_source ? (stencil_at ? relayout_depth_bytes_pipeline
+                                                     : relayout_depth_pipeline)
                           : source.pixel_format == VideoCore::PixelFormat::RGB8
                               ? relayout_rgb_pipeline
                               : relayout_color_pipeline;
@@ -616,8 +785,13 @@ bool BlitHelper::Relayout(Surface& source, Surface& dest,
     if (depth_source) {
         update_queue.AddImageSampler(descriptor_set, 0, 0, source.ImageView(ViewType::Depth),
                                      VK_NULL_HANDLE, src_layout);
-        update_queue.AddImageSampler(descriptor_set, 1, 0, source.ImageView(ViewType::Stencil),
-                                     VK_NULL_HANDLE, src_layout);
+        if (stencil_at) {
+            update_queue.AddTexelBuffer(descriptor_set, 3, stencil_view);
+        } else {
+            update_queue.AddImageSampler(descriptor_set, 1, 0,
+                                         source.ImageView(ViewType::Stencil), VK_NULL_HANDLE,
+                                         src_layout);
+        }
     } else {
         // The second texture is not used; give it something valid all the same.
         update_queue.AddImageSampler(descriptor_set, 0, 0, source.ImageView(), VK_NULL_HANDLE,
@@ -644,6 +818,7 @@ bool BlitHelper::Relayout(Surface& source, Surface& dest,
         .pixel_delta = relayout.pixel_delta,
         .first_pixel = static_cast<s32>(relayout.first_pixel),
         .end_pixel = static_cast<s32>(relayout.end_pixel),
+        .stencil_at = stencil_at.value_or(Common::Vec2i{}),
     };
 
     renderpass_cache.EndRendering();
@@ -705,17 +880,25 @@ bool BlitHelper::Relayout(Surface& source, Surface& dest,
 
 bool BlitHelper::DepthToBuffer(Surface& source, vk::Buffer buffer,
                                const VideoCore::BufferTextureCopy& copy) {
+    const auto stencil_at = CopyStencil(source);
     const auto descriptor_set = compute_buffer_provider.Commit();
     update_queue.AddImageSampler(descriptor_set, 0, 0, source.DepthView(), nearest_sampler,
                                  vk::ImageLayout::eDepthStencilReadOnlyOptimal);
-    update_queue.AddImageSampler(descriptor_set, 1, 0, source.StencilView(), nearest_sampler,
-                                 vk::ImageLayout::eDepthStencilReadOnlyOptimal);
+    if (stencil_at) {
+        update_queue.AddTexelBuffer(descriptor_set, 3, stencil_view);
+    } else {
+        update_queue.AddImageSampler(descriptor_set, 1, 0, source.StencilView(), nearest_sampler,
+                                     vk::ImageLayout::eDepthStencilReadOnlyOptimal);
+    }
     update_queue.AddBuffer(descriptor_set, 2, buffer, copy.buffer_offset, copy.buffer_size,
                            vk::DescriptorType::eStorageBuffer);
 
     renderpass_cache.EndRendering();
     scheduler.Record([this, descriptor_set, copy, src_image = source.Image(),
-                      extent = source.RealExtent(false)](vk::CommandBuffer cmdbuf) {
+                      extent = source.RealExtent(false),
+                      pipeline = stencil_at ? depth_to_buffer_bytes_pipeline
+                                            : depth_to_buffer_pipeline,
+                      stencil_at = stencil_at.value_or(Common::Vec2i{})](vk::CommandBuffer cmdbuf) {
         const vk::ImageMemoryBarrier pre_barrier = {
             .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
             .dstAccessMask = vk::AccessFlagBits::eShaderRead,
@@ -756,13 +939,14 @@ bool BlitHelper::DepthToBuffer(Surface& source, vk::Buffer buffer,
 
         cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, compute_buffer_pipeline_layout,
                                   0, descriptor_set, {});
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, depth_to_buffer_pipeline);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 
         const ComputeInfo info = {
             .src_offset = Common::Vec2i{static_cast<int>(copy.texture_rect.left),
                                         static_cast<int>(copy.texture_rect.bottom)},
             .src_extent =
                 Common::Vec2i{static_cast<int>(extent.width), static_cast<int>(extent.height)},
+            .stencil_at = stencil_at,
         };
         cmdbuf.pushConstants(compute_buffer_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                              sizeof(ComputeInfo), &info);
@@ -886,8 +1070,8 @@ vk::Pipeline BlitHelper::MakeComputePipeline(vk::ShaderModule shader, vk::Pipeli
     }
 }
 
-vk::Pipeline BlitHelper::MakeDepthStencilBlitPipeline() {
-    const std::array stages = MakeStages(full_screen_vert, blit_depth_stencil_frag);
+vk::Pipeline BlitHelper::MakeDepthStencilBlitPipeline(vk::ShaderModule fragment_shader) {
+    const std::array stages = MakeStages(full_screen_vert, fragment_shader);
     const auto renderpass = renderpass_cache.GetRenderpass(VideoCore::PixelFormat::Invalid,
                                                            VideoCore::PixelFormat::D24S8, false);
     vk::GraphicsPipelineCreateInfo depth_stencil_info = {

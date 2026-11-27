@@ -19,10 +19,12 @@
 // Tracking is off, and costs one atomic load per scope, until SetOverlayEnabled(true). Profiling
 // builds always track.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include "common/common_types.h"
 
 namespace Common::Hitches {
@@ -189,6 +191,89 @@ inline void NotePixelsMoved(PixelMove kind, u64 pixels) {
                                                                        std::memory_order_relaxed);
         Detail::PixelMoveCounts()[static_cast<std::size_t>(kind)].fetch_add(
             1, std::memory_order_relaxed);
+    }
+}
+
+namespace Detail {
+struct TextureUse {
+    std::atomic<u64> binds{};
+    std::atomic<u32> distinct{};
+    std::atomic<u64> host_bytes{};  ///< Of the distinct ones, as the host GPU holds them
+    std::atomic<u64> guest_bytes{}; ///< The same in the console's own format
+    std::atomic<const char*> name{};
+};
+constexpr std::size_t TEXTURE_FORMATS = 32;
+std::array<TextureUse, TEXTURE_FORMATS>& TextureUses();
+std::atomic<u32>& SummaryNumber();
+struct LitDraws {
+    std::atomic<u32> draws{};
+    std::atomic<u32> lights{};
+    std::atomic<u32> colourless{};
+    std::atomic<u32> draws_with_colourless{};
+};
+LitDraws& Lighting();
+struct DrawsAsClears {
+    std::atomic<u32> draws{};
+    std::atomic<u64> pixels{};
+    /// Draws that cover all of their area in colour, by why they are not a clear (0: they are)
+    std::array<std::atomic<u32>, 16> full_area{};
+};
+DrawsAsClears& Clears();
+} // namespace Detail
+
+/// A draw that covers all of its area in colour, and why it is not taken for a clear (zero: it
+/// is). Counted for the summary. Emulation thread.
+inline void NoteFullAreaDraw(u32 why) {
+    if (IsEnabled()) [[unlikely]] {
+        Detail::Clears().full_area[std::min<u32>(why, 15)].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+/// A draw that only filled its area with one colour was done as a clear of so many host pixels
+/// (RasterizerVulkan::DrawAsClear). Counted for the summary. Emulation thread.
+inline void NoteDrawAsClear(u64 pixels) {
+    if (IsEnabled()) [[unlikely]] {
+        auto& clears = Detail::Clears();
+        clears.draws.fetch_add(1, std::memory_order_relaxed);
+        clears.pixels.fetch_add(pixels, std::memory_order_relaxed);
+    }
+}
+
+/// Counts up at every summary: what is counted once a summary keeps the number it was counted in
+inline u32 SummaryNumber() {
+    return Detail::SummaryNumber().load(std::memory_order_relaxed);
+}
+
+/// A texture a draw samples: its guest format (an index below 32, named by `name`, which has to
+/// live for good), its bytes as the host GPU holds it and as the console does, and whether it is
+/// the first time it is sampled since the last summary. What the host's texture caches have to
+/// hold, by format. Counted for the summary. Emulation thread.
+inline void NoteTextureSampled(u32 format, std::string_view name, u64 host_bytes, u64 guest_bytes,
+                               bool first) {
+    if (IsEnabled() && format < Detail::TEXTURE_FORMATS) [[unlikely]] {
+        auto& use = Detail::TextureUses()[format];
+        use.binds.fetch_add(1, std::memory_order_relaxed);
+        use.name.store(name.data(), std::memory_order_relaxed);
+        if (first) {
+            use.distinct.fetch_add(1, std::memory_order_relaxed);
+            use.host_bytes.fetch_add(host_bytes, std::memory_order_relaxed);
+            use.guest_bytes.fetch_add(guest_bytes, std::memory_order_relaxed);
+        }
+    }
+}
+
+/// A draw with lighting on: how many lights it has, and of them how many have no colour at all
+/// (ambient, diffuse and both speculars zero), which add nothing to the colour and still cost
+/// the shader their lookups. Counted for the summary. Emulation thread.
+inline void NoteLitDraw(u32 lights, u32 colourless) {
+    if (IsEnabled()) [[unlikely]] {
+        auto& lit = Detail::Lighting();
+        lit.draws.fetch_add(1, std::memory_order_relaxed);
+        lit.lights.fetch_add(lights, std::memory_order_relaxed);
+        lit.colourless.fetch_add(colourless, std::memory_order_relaxed);
+        if (colourless != 0) {
+            lit.draws_with_colourless.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 

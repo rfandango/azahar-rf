@@ -1576,8 +1576,12 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
                      PixelFormatAsString(surface.pixel_format), load_info.width, load_info.height,
                      surface.res_scale, static_cast<u32>(surface.type), load_info.addr);
 
+    // An ETC1 texture kept in its blocks takes half a byte a pixel (TranscodeETC1)
     const auto staging = runtime.FindStaging(
-        load_info.width * load_info.height * surface.GetInternalBytesPerPixel(), true);
+        surface.keeps_etc_blocks
+            ? load_info.width * load_info.height / 2
+            : load_info.width * load_info.height * surface.GetInternalBytesPerPixel(),
+        true);
 
     MemoryRef source_ptr = memory.GetPhysicalRef(load_info.addr);
     if (!source_ptr) [[unlikely]] {
@@ -1590,8 +1594,12 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
     const std::span<u8> upload_data{
         const_cast<u8*>(memory.GpuRead(load_info.addr, load_info.end - load_info.addr)),
         load_info.end - load_info.addr};
-    DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
-                  runtime.NeedsConversion(surface));
+    if (surface.keeps_etc_blocks) {
+        TranscodeETC1(load_info, upload_data, staging.mapped);
+    } else {
+        DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
+                      runtime.NeedsConversion(surface));
+    }
 
     const bool should_dump = False(surface.flags & SurfaceFlagBits::Custom) &&
                              False(surface.flags & SurfaceFlagBits::RenderTarget);
@@ -1780,6 +1788,7 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
         .texture_level = surface.LevelOf(flush_start),
     };
     surface.Download(download, staging);
+    runtime.InvalidateStaging(staging);
 
     MemoryRef dest_ptr = memory.GetPhysicalRef(flush_start);
     if (!dest_ptr) [[unlikely]] {
@@ -2539,6 +2548,7 @@ void RasterizerCache<T>::ServeLateReadbacks() {
             continue;
         }
         if (entry.pending && runtime.GetResourceFreeTick() >= entry.pending_tick) {
+            runtime.InvalidateStaging(entry.staging);
             std::vector<u8> bytes(entry.info.end - entry.info.addr);
             EncodeTexture(entry.info, entry.info.addr, entry.info.end, entry.staging.mapped, bytes,
                           entry.convert);

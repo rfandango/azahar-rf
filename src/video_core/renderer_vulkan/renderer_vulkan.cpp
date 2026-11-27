@@ -595,18 +595,27 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
 #ifdef ANDROID
     // The screens are drawn as large as they are in the game's own pixels, and the display's
     // hardware enlarges the picture, as the console sends its pictures to its displays. Not where
-    // the enlarging is done here: by an upscaler, in steps of whole pixels or without filtering
-    // (the display filters), or for a stereo mode. Nor with a post-processing shader, which is
-    // written for the size the screens are shown at. (The swapchain is made anew at the next
-    // image where it asks for another size.)
+    // the enlarging is done here: by an upscaler, in steps of whole pixels, or for a stereo mode.
+    // Nor with a post-processing shader, which is written for the size the screens are shown at.
+    // (The swapchain is made anew at the next image where it asks for another size.)
     const bool native =
         Settings::values.screen_upscaling.GetValue() == Settings::ScreenUpscaling::Filter &&
-        Settings::values.filter_mode.GetValue() &&
         !Settings::values.use_integer_scaling.GetValue() &&
         layout.render_3d_mode == Settings::StereoRenderOption::Off &&
         PipelineFor(layout.render_3d_mode) == 0 && !preset_runner->Active() &&
         (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyFullSizeOutput) == 0;
-    window.SetNativeScale(native ? NativeScale(layout) : 0.f);
+    float native_scale = native ? NativeScale(layout) : 0.f;
+    if (native_scale > 0.f && !Settings::values.filter_mode.GetValue() &&
+        (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyUnfilteredOutput) ==
+            0) {
+        // Without filtering the pixels are to stay sharp, and the display's hardware can only
+        // filter: the screens are enlarged here, unfiltered, by the largest whole multiple that
+        // fits, and the display stretches only what is left (less than twice; nothing where the
+        // multiple fits exactly, which is the full size again)
+        const float whole = std::max(1.f, std::floor(1.f / native_scale + 1e-3f));
+        native_scale = std::min(1.f, native_scale * whole);
+    }
+    window.SetNativeScale(native_scale);
 #endif
     if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
         Core::PerfStats::game_frames_updated) {

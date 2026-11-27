@@ -6,7 +6,13 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(binding = 0) uniform highp sampler2D depth;
+#ifdef STENCIL_BYTES
+// The stencil, copied into a buffer a byte a texel of the image depth is sampled from (an image
+// whose stencil is sampled could not be compressed on every GPU)
+layout(binding = 3) uniform lowp usamplerBuffer stencil_bytes;
+#else
 layout(binding = 1) uniform lowp usampler2D stencil;
+#endif
 
 layout(binding = 2) writeonly buffer OutputBuffer{
     uint pixels[];
@@ -16,15 +22,27 @@ layout(push_constant, std140) uniform ComputeInfo {
     mediump ivec2 src_offset;
     mediump ivec2 dst_offset;
     mediump ivec2 extent;
+    highp ivec2 stencil_at; // first byte of the stencil copy, its row length
 };
 
 void main() {
     ivec2 rect = ivec2(gl_NumWorkGroups.xy) * ivec2(8);
     ivec2 dst_coord = ivec2(gl_GlobalInvocationID.xy);
     ivec2 tex_icoord = src_offset + dst_coord;
+#ifdef STENCIL_BYTES
+    // The texel a nearest sample at the corner below would take, in whole numbers, so that
+    // depth and stencil come from the same one (a sample at a texel's corner may fall on
+    // either side of it)
+    highp ivec2 size = textureSize(depth, 0);
+    highp ivec2 texel = min((tex_icoord * size) / extent, size - 1);
+    highp uint depth_val = uint(texelFetch(depth, texel, 0).x * (exp2(24.0) - 1.0));
+    lowp uint stencil_val =
+        texelFetch(stencil_bytes, stencil_at.x + texel.y * stencil_at.y + texel.x).x;
+#else
     highp vec2 tex_coord = vec2(tex_icoord) / vec2(extent);
     highp uint depth_val = uint(texture(depth, tex_coord).x * (exp2(24.0) - 1.0));
     lowp uint stencil_val = texture(stencil, tex_coord).x;
+#endif
     highp uint value = stencil_val | (depth_val << 8);
     staging.pixels[dst_coord.y * rect.x + dst_coord.x] = value;
 }

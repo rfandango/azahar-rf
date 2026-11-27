@@ -173,6 +173,10 @@ public:
     /// Maps an internal staging buffer of the provided size for pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
 
+    /// Makes what the GPU wrote into a download's staging memory visible to the processor, once
+    /// the GPU is done with it: a step only where that memory is cached but not coherent
+    void InvalidateStaging(const VideoCore::StagingData& staging);
+
     /// Attempts to reinterpret a rectangle of source to another rectangle of dest
     bool Reinterpret(Surface& source, Surface& dest, const VideoCore::TextureCopy& copy);
 
@@ -202,6 +206,12 @@ public:
 
     /// Returns true if the provided pixel format needs convertion
     bool NeedsConversion(const Surface& surface) const;
+
+    /// The traits of the images of ETC1 textures kept in their blocks, or none where they are
+    /// decoded (VideoCore::SurfaceBase::keeps_etc_blocks)
+    const FormatTraits* EtcBlockTraits() const noexcept {
+        return etc_block_traits;
+    }
 
     /// Returns true if surfaces may have half the resolution scale along an axis
     bool SupportsHalfScaleTargets() const noexcept {
@@ -246,6 +256,11 @@ private:
     std::function<void()> ClearWithRenderpass(Surface& surface,
                                               const VideoCore::TextureClear& clear);
 
+    /// Copies from a surface that keeps its ETC1 blocks into one that does not (a cube's face):
+    /// a blit that decodes them and turns the rows the right way up
+    bool CopyFromEtcBlocks(Surface& source, Surface& dest,
+                           std::span<const VideoCore::TextureCopy> copies);
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -254,6 +269,7 @@ private:
     StreamBuffer upload_buffer;
     StreamBuffer download_buffer;
     u32 num_swapchain_images;
+    const FormatTraits* etc_block_traits{};
     /// Replaced images and the tick they were last used in, see Retire
     std::vector<std::pair<Handle, u64>> retired;
     /// Guest surfaces that needed storage usage, oldest first, see NoteStorageUse
@@ -319,6 +335,12 @@ public:
     /// The image the surface is in, without carrying out a blit that waits to be put there
     vk::Image RawImage() const noexcept {
         return handles[current].image;
+    }
+
+    /// The size of the image at index (of its first level)
+    vk::Extent2D ImageExtent(Type type = Type::Current) const noexcept {
+        const auto& handle = handles[type == Type::Current ? current : type];
+        return vk::Extent2D{handle.width, handle.height};
     }
 
     /// A number of the surface's own, for what the runtime keeps about it (the cache moves

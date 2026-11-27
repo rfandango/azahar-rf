@@ -5,6 +5,7 @@
 #include <cstring>
 #include <vector>
 #include "common/alignment.h"
+#include "common/swap.h"
 #include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/rasterizer_cache/texture_codec.h"
 #include "video_core/rasterizer_cache/utils.h"
@@ -96,6 +97,36 @@ void DecodeTexture(const SurfaceParams& surface_info, PAddr start_addr, PAddr en
     LOG_ERROR(HW_GPU, "Unimplemented texture decode function for pixel format = {}, tiled = {}",
               func_index, surface_info.is_tiled);
     UNIMPLEMENTED();
+}
+
+void TranscodeETC1(const SurfaceParams& surface_info, std::span<const u8> source,
+                   std::span<u8> dest) {
+    // The guest's tiles of 8x8 pixels come row by row from the top of the picture, and each is
+    // four blocks of 4x4: top left, top right, bottom left, bottom right. A block read as a
+    // little-endian number is the ETC1 block, whose bytes are in the other order, the most
+    // significant first. The blocks go out row by row from the top as well.
+    constexpr u32 TILE_SIZE = 32;
+    const u32 tiles_x = surface_info.width / 8;
+    const u32 blocks_x = surface_info.width / 4;
+    if (tiles_x == 0) {
+        return;
+    }
+    const u32 tiles = std::min<u32>(static_cast<u32>(source.size() / TILE_SIZE),
+                                    tiles_x * (surface_info.height / 8));
+    ASSERT(dest.size() >= std::size_t{tiles} * TILE_SIZE);
+    for (u32 tile = 0; tile < tiles; tile++) {
+        const u32 tile_x = tile % tiles_x;
+        const u32 tile_y = tile / tiles_x;
+        for (u32 i = 0; i < 4; i++) {
+            u64 block;
+            std::memcpy(&block, source.data() + tile * TILE_SIZE + i * 8, sizeof(block));
+            block = Common::swap64(block);
+            const u32 block_x = 2 * tile_x + (i & 1);
+            const u32 block_y = 2 * tile_y + (i >> 1);
+            std::memcpy(dest.data() + (std::size_t{block_y} * blocks_x + block_x) * 8, &block,
+                        sizeof(block));
+        }
+    }
 }
 
 } // namespace VideoCore

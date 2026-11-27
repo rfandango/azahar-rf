@@ -64,6 +64,9 @@ public:
                            u32 pixel_stride, ScreenInfo& screen_info);
     bool AccelerateDrawBatch(bool is_indexed) override;
     void NoteDrawOverwrites(bool color, bool depth) override;
+    void NoteDrawVertexColour(const std::optional<std::array<u8, 4>>& colour) override {
+        draw_vertex_colour = colour;
+    }
 
     /// Switches the disk resources to the specified title
     void SwitchDiskResources(u64 title_id) override;
@@ -101,6 +104,11 @@ private:
 
     /// Generic draw function for DrawTriangles and AccelerateDrawBatch
     bool Draw(bool accelerate, bool is_indexed);
+
+    /// In place of a draw that fills `area` of the colour target with `colour`: the render pass
+    /// for `draw_rect` goes on or begins as for the draw, and clears that area
+    void DrawAsClear(const Framebuffer* framebuffer, const Common::Rectangle<u32>& draw_rect,
+                     const Common::Rectangle<s32>& area, const std::array<u8, 4>& colour);
 
     /// Internal implementation for AccelerateDrawBatch
     bool AccelerateDrawBatchInternal(bool is_indexed);
@@ -274,6 +282,8 @@ private:
                                      Common::ResolutionScale res_scale);
     /// What the draw that comes next overwrites of the area it is confined to
     bool next_draw_overwrites_color{};
+    /// See NoteDrawVertexColour
+    std::optional<std::array<u8, 4>> draw_vertex_colour;
     bool next_draw_overwrites_depth{};
 };
 

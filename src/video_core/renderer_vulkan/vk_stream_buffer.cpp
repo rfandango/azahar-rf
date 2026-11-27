@@ -62,14 +62,22 @@ u32 GetMemoryType(const vk::PhysicalDeviceMemoryProperties& properties, BufferTy
         return *preferred_type;
     }
 
-    // If not found, try removing flags one by one
+    // If not found, try removing flags one by one. What the processor reads back goes before
+    // coherence: uncached memory reads it a word at a time (the Adreno 610 has cached memory only
+    // non-coherent, and a download buffer there was uncached), while non-coherent memory only
+    // needs the range invalidated once the GPU has written it (Invalidate).
     constexpr std::array remove_flags = {
         vk::MemoryPropertyFlagBits::eDeviceLocal,
         vk::MemoryPropertyFlagBits::eHostCached,
         vk::MemoryPropertyFlagBits::eHostCoherent,
     };
+    constexpr std::array remove_flags_download = {
+        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        vk::MemoryPropertyFlagBits::eHostCoherent,
+        vk::MemoryPropertyFlagBits::eHostCached,
+    };
 
-    for (auto remove_flag : remove_flags) {
+    for (auto remove_flag : type == BufferType::Download ? remove_flags_download : remove_flags) {
         if ((flags & remove_flag) == vk::MemoryPropertyFlags{}) {
             continue;
         }
@@ -157,9 +165,8 @@ void StreamBuffer::Commit(u32 size) {
         .size = size,
     };
 
-    if (!is_coherent && type == BufferType::Download) {
-        device.invalidateMappedMemoryRanges(range);
-    } else if (!is_coherent) {
+    // (A download's range is invalidated when it is read, after the GPU wrote it: see Invalidate)
+    if (!is_coherent && type != BufferType::Download) {
         device.flushMappedMemoryRanges(range);
     }
 
@@ -172,6 +179,24 @@ void StreamBuffer::Commit(u32 size) {
     auto& watch = current_watches[current_watch_cursor++];
     watch.upper_bound = offset;
     watch.tick = scheduler.CurrentTick();
+}
+
+void StreamBuffer::Invalidate(u32 at, u32 size) {
+    if (is_coherent || type != BufferType::Download || size == 0) {
+        return;
+    }
+    // Whole atoms only; the stretch may reach past the buffer into the mapped memory's padding
+    const u64 atom = std::max<u64>(instance.NonCoherentAtomSize(), 1);
+    const u64 first = Common::AlignDown<u64>(at, atom);
+    const u64 end = std::min<u64>(Common::AlignUp<u64>(u64{at} + size, atom), memory_size);
+    if (end <= first) {
+        return;
+    }
+    device.invalidateMappedMemoryRanges(vk::MappedMemoryRange{
+        .memory = memory,
+        .offset = first,
+        .size = end == memory_size ? VK_WHOLE_SIZE : end - first,
+    });
 }
 
 void StreamBuffer::CreateBuffers(u64 preferred_size) {
@@ -234,6 +259,7 @@ void StreamBuffer::CreateBuffers(u64 preferred_size) {
                 device.mapMemory(memory, 0, requirements.memoryRequirements.size));
 
             stream_buffer_size = static_cast<u64>(attempt_size);
+            memory_size = requirements.memoryRequirements.size;
 
             LOG_INFO(Render_Vulkan, "Created {} buffer with size {} KiB (flags {})",
                      BufferTypeName(type), stream_buffer_size / 1024,

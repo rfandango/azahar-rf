@@ -4,10 +4,14 @@
 
 #pragma once
 
+#include <memory>
+#include <optional>
 #include <unordered_map>
 
+#include "common/vector_math.h"
 #include "video_core/rasterizer_cache/pixel_format.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "video_core/renderer_vulkan/vk_stream_buffer.h"
 
 namespace VideoCore {
 struct TextureBlit;
@@ -46,8 +50,14 @@ public:
     void ResolveTexture(Surface& surface);
 
 private:
+    /// Copies the stencil of the surface's current image into the stencil buffer, a byte a
+    /// texel, for a shader to read through stencil_view instead of sampling it: an image whose
+    /// stencil is sampled is not compressed on every GPU. Where the copy begins in the buffer
+    /// and its row length, or none where it does not fit (the stencil is then sampled).
+    std::optional<Common::Vec2i> CopyStencil(Surface& source);
+
     vk::Pipeline MakeComputePipeline(vk::ShaderModule shader, vk::PipelineLayout layout);
-    vk::Pipeline MakeDepthStencilBlitPipeline();
+    vk::Pipeline MakeDepthStencilBlitPipeline(vk::ShaderModule fragment_shader);
     vk::Pipeline MakeFilterPipeline(
         vk::ShaderModule fragment_shader, vk::PipelineLayout layout,
         VideoCore::PixelFormat color_format = VideoCore::PixelFormat::RGBA8);
@@ -111,6 +121,20 @@ private:
     vk::Pipeline depth_blit_pipeline;
     vk::Sampler linear_sampler;
     vk::Sampler nearest_sampler;
+
+    /// Stencil copied for the shaders that read it (CopyStencil), and its view of bytes
+    std::unique_ptr<StreamBuffer> stencil_buffer;
+    vk::BufferView stencil_view;
+    u64 stencil_capacity{};
+    /// The shaders that read the stencil from that copy, and their pipelines
+    vk::ShaderModule d24s8_to_rgba8_bytes_comp;
+    vk::ShaderModule depth_to_buffer_bytes_comp;
+    vk::ShaderModule relayout_depth_bytes_comp;
+    vk::ShaderModule blit_depth_stencil_bytes_frag;
+    vk::Pipeline d24s8_to_rgba8_bytes_pipeline;
+    vk::Pipeline depth_to_buffer_bytes_pipeline;
+    vk::Pipeline relayout_depth_bytes_pipeline;
+    vk::Pipeline depth_blit_bytes_pipeline;
 
     /// Cache of texture filter pipelines (keyed by shader+layout+format hash)
     std::unordered_map<std::uint64_t, vk::Pipeline> filter_pipeline_cache;

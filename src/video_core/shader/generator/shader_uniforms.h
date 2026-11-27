@@ -67,8 +67,11 @@ struct FSUniformData {
     alignas(16) Common::Vec4f tex_border_color[3];
     alignas(16) Common::Vec4f blend_color;
     /// Width and height of the host texture of each unit in x and y, for the level of detail
-    /// and for looking up a shadow map, and one divided by them in z and w.
-    /// Vulkan with generated SPIR-V only; the GLSL shaders ask the texture and do not declare it.
+    /// and for looking up a shadow map, and one divided by them in z and w. Vulkan only. The
+    /// GLSL shaders ask the texture for its size; they read z alone, as the SPIR-V ones do: for
+    /// a 2D texture other than a shadow map it is one where the texture's rows go from the top
+    /// (an ETC1 texture kept in its blocks, see VideoCore::SurfaceBase::keeps_etc_blocks) and
+    /// the shader turns t over, zero where they go from the bottom as all others' do.
     alignas(16) Common::Vec4f tex_size[3];
 };
 
