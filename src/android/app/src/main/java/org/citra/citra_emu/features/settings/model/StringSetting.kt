@@ -35,6 +35,7 @@ enum class StringSetting(
         "_back"
     ),
     PP_SHADER_NAME(SettingKeys.pp_shader_name(), CitraSettings.SECTION_RENDERER, "None (builtin)"),
+    SHADER_PRESET(SettingKeys.shader_preset(), CitraSettings.SECTION_RENDERER, ""),
     WEB_API_URL(SettingKeys.web_api_url(), CitraSettings.SECTION_NETWORK, ""),
     NETWORK_TOKEN(SettingKeys.network_token(), CitraSettings.SECTION_NETWORK, "");
 

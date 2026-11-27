@@ -110,6 +110,7 @@ foreach(KEY IN ITEMS
     "output_resolution"
     "pp_shader_name"
     "anaglyph_shader_name"
+    "shader_preset"
     "dump_textures"
     "custom_textures"
     "preload_textures"

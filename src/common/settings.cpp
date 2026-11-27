@@ -111,6 +111,7 @@ void LogSettings() {
     log_setting("Renderer_UseLimitFramesAheadOfGPU",
                 values.use_limit_frames_ahead_of_gpu.GetValue());
     log_setting("Renderer_PostProcessingShader", values.pp_shader_name.GetValue());
+    log_setting("Renderer_ShaderPreset", values.shader_preset.GetValue());
     log_setting("Renderer_FilterMode", values.filter_mode.GetValue());
     log_setting("Renderer_ScreenUpscaling", values.screen_upscaling.GetValue());
     log_setting("Renderer_ScreenUpscalingSharpness", values.screen_upscaling_sharpness.GetValue());
@@ -263,6 +264,7 @@ void RestoreGlobalState(bool is_powered_on) {
     values.output_resolution.SetGlobal(true);
     values.pp_shader_name.SetGlobal(true);
     values.anaglyph_shader_name.SetGlobal(true);
+    values.shader_preset.SetGlobal(true);
     values.dump_textures.SetGlobal(true);
     values.custom_textures.SetGlobal(true);
     values.preload_textures.SetGlobal(true);

@@ -98,6 +98,7 @@ object SettingKeys {
     external fun output_resolution(): String
     external fun pp_shader_name(): String
     external fun anaglyph_shader_name(): String
+    external fun shader_preset(): String
     external fun dump_textures(): String
     external fun custom_textures(): String
     external fun preload_textures(): String

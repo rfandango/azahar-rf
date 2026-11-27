@@ -213,6 +213,8 @@ if (ENABLE_VULKAN)
         renderer_vulkan/vk_render_manager.h
         renderer_vulkan/vk_shader_disk_cache.cpp
         renderer_vulkan/vk_shader_disk_cache.h
+        renderer_vulkan/vk_shader_preset.cpp
+        renderer_vulkan/vk_shader_preset.h
         renderer_vulkan/vk_shader_util.cpp
         renderer_vulkan/vk_shader_util.h
         renderer_vulkan/vk_stream_buffer.cpp

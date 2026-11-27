@@ -46,6 +46,7 @@ object DirectoryInitialization {
                     NativeLibrary.logUserDirectory(userPath.toString())
                     NativeLibrary.createConfigFile()
                     GpuDriverHelper.initializeDriverParameters()
+                    NativeLibrary.setShaderPresetFolder(ShaderPack.folder.path)
                     DirectoryInitializationState.CITRA_DIRECTORIES_INITIALIZED
                 } else {
                     DirectoryInitializationState.CANT_FIND_EXTERNAL_STORAGE

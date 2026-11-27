@@ -238,6 +238,17 @@ object NativeLibrary {
     external fun getPostProcessingShaders(): Array<String>
 
     /**
+     * Sets the folder libretro's shader pack is in (RetroArch shader presets), a path the native
+     * side can read with plain file access.
+     */
+    external fun setShaderPresetFolder(folder: String)
+
+    /**
+     * Returns whether the app can run RetroArch shader presets (librashader is in it).
+     */
+    external fun isShaderPresetSupported(): Boolean
+
+    /**
      * Notifies the core emulation that the layout should be updated
      */
     external fun updateFramebuffer(isPortrait: Boolean)

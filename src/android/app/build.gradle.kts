@@ -28,6 +28,9 @@ val downloadedJniLibsPath = "${layout.buildDirectory.get().asFile.path}/download
 // Filled by gpu_driver.gradle.kts
 val gpuDriverPath = "${layout.buildDirectory.get().asFile.path}/generated/gpuDriver"
 
+// Filled by shader_runtime.gradle.kts
+val shaderRuntimePath = "${layout.buildDirectory.get().asFile.path}/generated/shaderRuntime"
+
 android {
     namespace = "org.citra.citra_emu"
 
@@ -237,6 +240,8 @@ android {
             // And for the GPU driver that is put in, if there is one
             jniLibs.srcDir("$gpuDriverPath/jniLibs")
             assets.srcDir("$gpuDriverPath/assets")
+            // And for librashader, which runs RetroArch shader presets, if it is put in
+            jniLibs.srcDir("$shaderRuntimePath/jniLibs")
         }
     }
 }
@@ -289,6 +294,7 @@ tasks.named("preBuild") {
 }
 
 apply(from = "gpu_driver.gradle.kts")
+apply(from = "shader_runtime.gradle.kts")
 
 ktlint {
     version = "1.8.0"

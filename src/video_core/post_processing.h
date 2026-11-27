@@ -18,4 +18,11 @@ std::vector<std::string> GetPostProcessingShaderList(bool anaglyph);
 /// renderer puts before it. Empty where there is no such shader or it cannot be read.
 std::string GetPostProcessingShaderSource(bool anaglyph, std::string_view shader_name);
 
+/// Sets the folder libretro's shader pack is in, a path of the file system (RetroArch's shader
+/// presets are read with plain file access). Android gives the app's own files folder.
+void SetShaderPresetFolder(std::string folder);
+
+/// That folder, with a separator at the end: by default "shaders/slang" in the user directory
+std::string GetShaderPresetFolder();
+
 } // namespace VideoCore

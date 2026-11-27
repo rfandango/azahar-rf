@@ -57,6 +57,46 @@ struct ScreenRectVertex {
 
 constexpr u32 VERTEX_BUFFER_SIZE = sizeof(ScreenRectVertex) * 8192;
 
+/// The corners of a screen drawn at (x, y) in w x h, with the texture coordinates that turn the
+/// console's image of it, which lies on its side, the way the orientation shows it
+static std::array<ScreenRectVertex, 4> ScreenVertices(const Common::Rectangle<f32>& texcoords,
+                                                      float x, float y, float w, float h,
+                                                      Layout::DisplayOrientation orientation) {
+    switch (orientation) {
+    case Layout::DisplayOrientation::Landscape:
+        return {{
+            ScreenRectVertex(x, y, texcoords.bottom, texcoords.left),
+            ScreenRectVertex(x + w, y, texcoords.bottom, texcoords.right),
+            ScreenRectVertex(x, y + h, texcoords.top, texcoords.left),
+            ScreenRectVertex(x + w, y + h, texcoords.top, texcoords.right),
+        }};
+    case Layout::DisplayOrientation::Portrait:
+        return {{
+            ScreenRectVertex(x, y, texcoords.bottom, texcoords.right),
+            ScreenRectVertex(x + w, y, texcoords.top, texcoords.right),
+            ScreenRectVertex(x, y + h, texcoords.bottom, texcoords.left),
+            ScreenRectVertex(x + w, y + h, texcoords.top, texcoords.left),
+        }};
+    case Layout::DisplayOrientation::LandscapeFlipped:
+        return {{
+            ScreenRectVertex(x, y, texcoords.top, texcoords.right),
+            ScreenRectVertex(x + w, y, texcoords.top, texcoords.left),
+            ScreenRectVertex(x, y + h, texcoords.bottom, texcoords.right),
+            ScreenRectVertex(x + w, y + h, texcoords.bottom, texcoords.left),
+        }};
+    case Layout::DisplayOrientation::PortraitFlipped:
+        return {{
+            ScreenRectVertex(x, y, texcoords.top, texcoords.left),
+            ScreenRectVertex(x + w, y, texcoords.bottom, texcoords.left),
+            ScreenRectVertex(x, y + h, texcoords.top, texcoords.right),
+            ScreenRectVertex(x + w, y + h, texcoords.bottom, texcoords.right),
+        }};
+    default:
+        LOG_ERROR(Render_Vulkan, "Unknown DisplayOrientation: {}", orientation);
+        return {};
+    }
+}
+
 constexpr std::array<f32, 4 * 4> MakeOrthographicMatrix(u32 width, u32 height) {
     // clang-format off
     return { 2.f / width, 0.f,         0.f, -1.f,
@@ -319,6 +359,9 @@ RendererVulkan::RendererVulkan(Core::System& system, Pica::PicaCore& pica_,
     BuildLayouts();
     BuildPipelines();
     LoadCustomShaders();
+    preset_runner = std::make_unique<ShaderPresetRunner>(instance, scheduler,
+                                                         main_present_window.GetSurfaceFormat());
+    LoadShaderPreset();
     if (secondary_window) {
         secondary_present_window_ptr = std::make_unique<PresentWindow>(
             *secondary_window, instance, scheduler, IsLowRefreshRate());
@@ -365,6 +408,7 @@ void RendererVulkan::PrepareRendertarget() {
         const auto color_fill = fb_id == 0 ? regs_lcd.color_fill_top : regs_lcd.color_fill_bottom;
         if (color_fill.is_enabled) {
             screen_infos[i].image_view = texture.image_view;
+            screen_infos[i].image = vk::Image{};
             FillScreen(color_fill.AsVector(), texture);
             continue;
         }
@@ -560,7 +604,7 @@ void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::Framebu
         Settings::values.filter_mode.GetValue() &&
         !Settings::values.use_integer_scaling.GetValue() &&
         layout.render_3d_mode == Settings::StereoRenderOption::Off &&
-        PipelineFor(layout.render_3d_mode) == 0 &&
+        PipelineFor(layout.render_3d_mode) == 0 && !preset_runner->Active() &&
         (Common::TraceMarkers::Experiments4() & Common::TraceMarkers::LegacyFullSizeOutput) == 0;
     window.SetNativeScale(native ? NativeScale(layout) : 0.f);
 #endif
@@ -636,6 +680,7 @@ void RendererVulkan::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
                                       screen_info)) {
         // Reset the screen info's display texture to its own permanent texture
         screen_info.image_view = screen_info.texture.image_view;
+        screen_info.image = vk::Image{};
         screen_info.texcoords = {0.f, 0.f, 1.f, 1.f};
         screen_info.image_width = screen_info.texture.width;
         screen_info.image_height = screen_info.texture.height;
@@ -1246,47 +1291,23 @@ void RendererVulkan::DrawSingleScreen(u32 screen_id, float x, float y, float w, 
     const auto& texcoords = screen_info.texcoords;
     const bool upright = orientation == Layout::DisplayOrientation::Portrait ||
                          orientation == Layout::DisplayOrientation::PortraitFlipped;
-    const u32 pipeline = ChoosePresentPipeline(screen_id, upright ? w : h, upright ? h : w);
 
     std::array<ScreenRectVertex, 4> vertices;
-    switch (orientation) {
-    case Layout::DisplayOrientation::Landscape:
+    u32 pipeline = current_pipeline;
+    if (screen_info.upright) {
+        // A shader preset's picture, already the way the screen is shown and at its size
         vertices = {{
-            ScreenRectVertex(x, y, texcoords.bottom, texcoords.left),
-            ScreenRectVertex(x + w, y, texcoords.bottom, texcoords.right),
-            ScreenRectVertex(x, y + h, texcoords.top, texcoords.left),
-            ScreenRectVertex(x + w, y + h, texcoords.top, texcoords.right),
+            ScreenRectVertex(x, y, 0.f, 0.f),
+            ScreenRectVertex(x + w, y, 1.f, 0.f),
+            ScreenRectVertex(x, y + h, 0.f, 1.f),
+            ScreenRectVertex(x + w, y + h, 1.f, 1.f),
         }};
-        break;
-    case Layout::DisplayOrientation::Portrait:
-        vertices = {{
-            ScreenRectVertex(x, y, texcoords.bottom, texcoords.right),
-            ScreenRectVertex(x + w, y, texcoords.top, texcoords.right),
-            ScreenRectVertex(x, y + h, texcoords.bottom, texcoords.left),
-            ScreenRectVertex(x + w, y + h, texcoords.top, texcoords.left),
-        }};
-        std::swap(h, w);
-        break;
-    case Layout::DisplayOrientation::LandscapeFlipped:
-        vertices = {{
-            ScreenRectVertex(x, y, texcoords.top, texcoords.right),
-            ScreenRectVertex(x + w, y, texcoords.top, texcoords.left),
-            ScreenRectVertex(x, y + h, texcoords.bottom, texcoords.right),
-            ScreenRectVertex(x + w, y + h, texcoords.bottom, texcoords.left),
-        }};
-        break;
-    case Layout::DisplayOrientation::PortraitFlipped:
-        vertices = {{
-            ScreenRectVertex(x, y, texcoords.top, texcoords.left),
-            ScreenRectVertex(x + w, y, texcoords.bottom, texcoords.left),
-            ScreenRectVertex(x, y + h, texcoords.top, texcoords.right),
-            ScreenRectVertex(x + w, y + h, texcoords.bottom, texcoords.right),
-        }};
-        std::swap(h, w);
-        break;
-    default:
-        LOG_ERROR(Render_Vulkan, "Unknown DisplayOrientation: {}", orientation);
-        break;
+    } else {
+        pipeline = ChoosePresentPipeline(screen_id, upright ? w : h, upright ? h : w);
+        vertices = ScreenVertices(texcoords, x, y, w, h, orientation);
+        if (upright) {
+            std::swap(h, w);
+        }
     }
 
     const u64 size = sizeof(ScreenRectVertex) * vertices.size();
@@ -1529,11 +1550,19 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
     }
     if (settings.shader_update_requested.exchange(false)) {
         LoadCustomShaders();
+        LoadShaderPreset();
     }
     // (For each window: the second display may show another 3D mode)
     current_pipeline = PipelineFor(layout.render_3d_mode);
     draw_info.reverse_interlaced =
         layout.render_3d_mode == Settings::StereoRenderOption::ReverseInterlaced;
+
+    std::optional<std::array<ScreenInfo, 3>> before_presets;
+    if (preset_runner->Active() && layout.render_3d_mode == Settings::StereoRenderOption::Off) {
+        before_presets = screen_infos;
+        current_pipeline = 0;
+        RunShaderPresets(*frame, layout);
+    }
 
     auto uncovered = UncoveredParts(*frame, layout);
     const bool clear = !uncovered.has_value();
@@ -1580,6 +1609,113 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
         cmdbuf.endRenderPass();
         draw_meter.End(cmdbuf, kind);
     });
+
+    if (before_presets) {
+        // (The game's images again, for the next window and frame)
+        screen_infos = *before_presets;
+        preset_runner->EndFrame();
+    }
+}
+
+void RendererVulkan::LoadShaderPreset() {
+    const std::string& preset = Settings::values.shader_preset.GetValue();
+    preset_runner->Load(preset.empty() ? std::string{}
+                                       : VideoCore::GetShaderPresetFolder() + preset);
+}
+
+void RendererVulkan::RunShaderPresets(const Frame& frame, const Layout::FramebufferLayout& layout) {
+    // (The presets' passes are render passes of their own)
+    renderpass_cache.EndRendering();
+    const float scale = std::sqrt(
+        static_cast<float>(frame.width) * static_cast<float>(frame.height) /
+        std::max(static_cast<float>(layout.width) * static_cast<float>(layout.height), 1.0f));
+    const auto orientation = layout.is_rotated ? Layout::DisplayOrientation::Landscape
+                                               : Layout::DisplayOrientation::Portrait;
+    // The screens' own images, read by the drawing that turns them upright
+    const auto images = present_heap.Commit();
+    for (u32 index = 0; index < screen_infos.size(); index++) {
+        update_queue.AddImageSampler(images, 0, index, screen_infos[index].image_view,
+                                     present_samplers[1]);
+    }
+    const auto run = [&](u32 preset_screen, u32 screen_id, const Common::Rectangle<u32>& place) {
+        ScreenInfo& info = screen_infos[screen_id];
+        if (!info.image || info.image_width == 0 || info.image_height == 0) {
+            return;
+        }
+        // The screen's own pixels, upright: the image's width lies along the shown screen's
+        // height where the console's image lies on its side (see DrawSingleScreen)
+        const auto& t = info.texcoords;
+        const u32 along_width =
+            static_cast<u32>(std::lround(std::abs(t.top - t.bottom) * info.image_width));
+        const u32 along_height =
+            static_cast<u32>(std::lround(std::abs(t.right - t.left) * info.image_height));
+        const bool portrait = orientation == Layout::DisplayOrientation::Portrait;
+        const u32 source_width = portrait ? along_width : along_height;
+        const u32 source_height = portrait ? along_height : along_width;
+        if (source_width == 0 || source_height == 0) {
+            return;
+        }
+        const ShaderPresetRunner::Target target =
+            preset_runner->Source(preset_screen, source_width, source_height);
+
+        // Drawn as the screen is drawn into the frame, at its own pixels
+        const auto vertices =
+            ScreenVertices(t, 0.f, 0.f, static_cast<float>(source_width),
+                           static_cast<float>(source_height), orientation);
+        const u64 size = sizeof(ScreenRectVertex) * vertices.size();
+        auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
+        std::memcpy(data, vertices.data(), size);
+        vertex_buffer.Commit(size);
+        PresentUniformData info_upright{};
+        info_upright.modelview = MakeOrthographicMatrix(source_width, source_height);
+        info_upright.screen_id_l = static_cast<int>(screen_id);
+        info_upright.screen_id_r = static_cast<int>(screen_id);
+        scheduler.Record([this, target, images, offset = offset, info_upright, source_width,
+                          source_height](vk::CommandBuffer cmdbuf) {
+            const vk::Rect2D area{{0, 0}, {source_width, source_height}};
+            cmdbuf.beginRenderPass(
+                vk::RenderPassBeginInfo{
+                    .renderPass = target.render_pass,
+                    .framebuffer = target.framebuffer,
+                    .renderArea = area,
+                },
+                vk::SubpassContents::eInline);
+            cmdbuf.setViewport(0, vk::Viewport{0.f, 0.f, static_cast<float>(source_width),
+                                               static_cast<float>(source_height), 0.f, 1.f});
+            cmdbuf.setScissor(0, area);
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, opaque_present_pipelines[0]);
+            cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *present_pipeline_layout,
+                                      0, images, {});
+            cmdbuf.pushConstants(*present_pipeline_layout,
+                                 vk::ShaderStageFlagBits::eFragment |
+                                     vk::ShaderStageFlagBits::eVertex,
+                                 0, sizeof(info_upright), &info_upright);
+            cmdbuf.bindVertexBuffers(0, vertex_buffer.Handle(), {0});
+            cmdbuf.draw(4, 1, static_cast<u32>(offset) / sizeof(ScreenRectVertex), 0);
+            cmdbuf.endRenderPass();
+        });
+
+        // Then the preset, at the size the screen is shown at
+        const u32 width = static_cast<u32>(std::lround(place.GetWidth() * scale));
+        const u32 height = static_cast<u32>(std::lround(place.GetHeight() * scale));
+        const vk::ImageView view = preset_runner->Run(preset_screen, width, height);
+        if (!view) {
+            return;
+        }
+        info.image_view = view;
+        info.image_width = width;
+        info.image_height = height;
+        info.texcoords = {0.f, 0.f, 1.f, 1.f};
+        info.image = vk::Image{};
+        info.upright = true;
+    };
+    if (layout.top_screen_enabled) {
+        run(0, static_cast<u32>(Settings::values.mono_render_option.GetValue()),
+            layout.top_screen);
+    }
+    if (layout.bottom_screen_enabled) {
+        run(1, 2, layout.bottom_screen);
+    }
 }
 
 void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {

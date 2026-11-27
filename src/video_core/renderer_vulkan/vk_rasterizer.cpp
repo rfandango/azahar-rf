@@ -1530,6 +1530,8 @@ bool RasterizerVulkan::AccelerateDisplay(const Pica::FramebufferConfig& config,
     screen_info.image_view = src_surface.ImageView();
     screen_info.image_width = scaled_width;
     screen_info.image_height = scaled_height;
+    screen_info.image = src_surface.Image();
+    screen_info.format = src_surface.traits.native;
 
     return true;
 }

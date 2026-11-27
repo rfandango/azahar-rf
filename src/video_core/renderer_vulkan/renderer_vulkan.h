@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_render_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_preset.h"
 
 namespace Core {
 class System;
@@ -60,6 +61,12 @@ struct ScreenInfo {
     /// Pixels of the image the view is of
     u32 image_width{};
     u32 image_height{};
+    /// That image and its format, where it is one of the game's (in the general layout)
+    vk::Image image{};
+    vk::Format format{vk::Format::eUndefined};
+    /// Whether the image is already the way the screen is shown, at the size it is shown at (a
+    /// shader preset's)
+    bool upright{};
 };
 
 struct PresentUniformData {
@@ -179,6 +186,12 @@ private:
 
     void DrawCursor(const Layout::FramebufferLayout& layout);
 
+    /// Loads the RetroArch shader preset the settings name, where it changed
+    void LoadShaderPreset();
+    /// Runs the shader preset over the screens the layout shows, into images of the size they
+    /// are drawn at, and puts those in the screens' place (restored after drawing)
+    void RunShaderPresets(const Frame& frame, const Layout::FramebufferLayout& layout);
+
     void LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuffer, ScreenInfo& screen_info,
                             bool right_eye);
     void FillScreen(Common::Vec3<u8> color, const TextureInfo& texture);
@@ -225,6 +238,8 @@ private:
     /// CUSTOM_PIPELINE and CUSTOM_ANAGLYPH_PIPELINE; empty for the built-in ones. And their text.
     std::array<std::string, 2> custom_shader_names;
     std::array<std::string, 2> custom_shader_sources;
+    /// RetroArch shader presets
+    std::unique_ptr<ShaderPresetRunner> preset_runner;
 
     std::array<ScreenInfo, 3> screen_infos{};
     PresentUniformData draw_info{};

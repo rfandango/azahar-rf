@@ -1135,6 +1135,19 @@ jobjectArray Java_org_citra_citra_1emu_NativeLibrary_getPostProcessingShaders(
     return ToJStringArray(env, VideoCore::GetPostProcessingShaderList(false));
 }
 
+void Java_org_citra_citra_1emu_NativeLibrary_setShaderPresetFolder(JNIEnv* env,
+                                                                   [[maybe_unused]] jobject obj,
+                                                                   jstring j_folder) {
+    VideoCore::SetShaderPresetFolder(GetJString(env, j_folder));
+}
+
+jboolean Java_org_citra_citra_1emu_NativeLibrary_isShaderPresetSupported(
+    [[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject obj) {
+    // librashader, which runs them, is in the app only where it was built with it
+    static const bool supported = dlopen("librashader.so", RTLD_LAZY) != nullptr;
+    return supported;
+}
+
 void Java_org_citra_citra_1emu_NativeLibrary_run__Ljava_lang_String_2(JNIEnv* env,
                                                                       [[maybe_unused]] jobject obj,
                                                                       jstring j_path) {

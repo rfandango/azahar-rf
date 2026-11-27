@@ -3,6 +3,7 @@
 // Refer to the misc/licenses/gplv2.txt file included.
 
 #include <algorithm>
+#include <mutex>
 #include <optional>
 #include "common/common_paths.h"
 #include "common/file_util.h"
@@ -76,6 +77,27 @@ std::string GetPostProcessingShaderSource(bool anaglyph, std::string_view shader
     const std::size_t read = FileUtil::ReadFileToString(false, shader_path, text);
     text.resize(read);
     return text;
+}
+
+namespace {
+std::mutex preset_folder_mutex;
+std::string preset_folder;
+} // Anonymous namespace
+
+void SetShaderPresetFolder(std::string folder) {
+    if (!folder.empty() && folder.back() != '/' && folder.back() != '\\') {
+        folder += DIR_SEP;
+    }
+    std::scoped_lock lock{preset_folder_mutex};
+    preset_folder = std::move(folder);
+}
+
+std::string GetShaderPresetFolder() {
+    std::scoped_lock lock{preset_folder_mutex};
+    if (!preset_folder.empty()) {
+        return preset_folder;
+    }
+    return FileUtil::GetUserPath(FileUtil::UserPath::ShaderDir) + "slang" DIR_SEP;
 }
 
 } // namespace VideoCore

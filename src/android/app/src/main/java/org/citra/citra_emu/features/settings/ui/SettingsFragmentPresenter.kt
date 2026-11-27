@@ -11,15 +11,24 @@ import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.os.Build
+import android.os.SystemClock
 import android.text.TextUtils
+import android.view.View
 import androidx.annotation.StringRes
+import androidx.lifecycle.lifecycleScope
 import androidx.preference.PreferenceManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.citra.citra_emu.BuildConfig
 import org.citra.citra_emu.CitraApplication
 import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.R
+import org.citra.citra_emu.databinding.DialogProgressBarBinding
 import org.citra.citra_emu.display.ScreenLayout
 import org.citra.citra_emu.display.StereoMode
 import org.citra.citra_emu.display.StereoWhichDisplay
@@ -50,6 +59,7 @@ import org.citra.citra_emu.utils.BirthdayMonth
 import org.citra.citra_emu.utils.BuildUtil
 import org.citra.citra_emu.utils.GraphicsUtil
 import org.citra.citra_emu.utils.Log
+import org.citra.citra_emu.utils.ShaderPack
 import org.citra.citra_emu.utils.SystemSaveGame
 import org.citra.citra_emu.utils.ThemeUtil
 
@@ -917,6 +927,182 @@ class SettingsFragmentPresenter(
         }
     }
 
+    /** Whether a 3D mode is set (RetroArch presets are drawn only without one) */
+    private fun stereoscopyOn(): Boolean =
+        editingSettings.get(IntSetting.RENDER_3D_WHICH_DISPLAY) != StereoWhichDisplay.NONE.int &&
+            editingSettings.get(IntSetting.STEREOSCOPIC_3D_MODE) != StereoMode.OFF.int
+
+    /** Whether RetroArch presets can be drawn with these settings and this build */
+    private fun shaderPresetsUsable(): Boolean =
+        NativeLibrary.isShaderPresetSupported() &&
+            editingSettings.get(IntSetting.GRAPHICS_API) == GraphicsAPI.VULKAN.int &&
+            !stereoscopyOn()
+
+    private fun isNoShader(name: String) = name.isEmpty() || name.endsWith("(builtin)")
+
+    /** What the post-processing shader entry shows: the preset or shader set, or none */
+    private fun postProcessingShaderValue(): String {
+        val activity = settingsActivity
+        val preset = editingSettings.get(StringSetting.SHADER_PRESET)
+        if (preset.isNotEmpty() && NativeLibrary.isShaderPresetSupported()) {
+            val name = activity.getString(R.string.shader_folder_retroarch) + "/" +
+                preset.removeSuffix(".slangp")
+            return when {
+                editingSettings.get(IntSetting.GRAPHICS_API) != GraphicsAPI.VULKAN.int ->
+                    activity.getString(R.string.shader_preset_vulkan_only, name)
+
+                stereoscopyOn() -> activity.getString(R.string.shader_preset_3d_off_only, name)
+                else -> name
+            }
+        }
+        val shader = editingSettings.get(StringSetting.PP_SHADER_NAME)
+        return if (isNoShader(shader)) {
+            activity.getString(R.string.post_processing_shader_none)
+        } else {
+            shader
+        }
+    }
+
+    /**
+     * The post-processing shader browser: the user's own shaders and libretro's pack in one;
+     * [folder] is a folder of the pack to open in (null for the current preset's)
+     */
+    private fun openShaderBrowser(folder: String? = null) {
+        val activity = settingsActivity
+        val usable = shaderPresetsUsable()
+        activity.lifecycleScope.launch {
+            val shaders = withContext(Dispatchers.IO) {
+                NativeLibrary.getPostProcessingShaders().toList()
+            }
+            val presets = if (usable && ShaderPack.isDownloaded) {
+                withContext(Dispatchers.IO) { ShaderPack.presets() }
+            } else {
+                null
+            }
+            val preset = editingSettings.get(StringSetting.SHADER_PRESET)
+            val shader = editingSettings.get(StringSetting.PP_SHADER_NAME)
+            ShaderBrowser(
+                activity,
+                shaders,
+                presets,
+                offerDownload = usable && presets == null,
+                // (Where a preset is drawn, the shader set beside it is not)
+                currentShader = if (usable && preset.isNotEmpty()) "" else shader,
+                currentPreset = preset,
+                startFolder = folder,
+                onPicked = { pickedShader, pickedPreset ->
+                    setPostProcessingShader(pickedShader, pickedPreset)
+                },
+                onDownload = { confirmShaderPackDownload() }
+            ).show()
+        }
+    }
+
+    /** Sets the shader or the preset picked, the other cleared (both cleared for none) */
+    private fun setPostProcessingShader(shader: String, preset: String) {
+        var changed = false
+        val shaderValue = shader.ifEmpty { StringSetting.PP_SHADER_NAME.defaultValue }
+        val shaderNow = editingSettings.get(StringSetting.PP_SHADER_NAME)
+        if (shaderNow != shaderValue && !(isNoShader(shaderNow) && isNoShader(shaderValue))) {
+            editingSettings.setBySettingsContext(StringSetting.PP_SHADER_NAME, shaderValue)
+            changed = true
+        }
+        if (editingSettings.get(StringSetting.SHADER_PRESET) != preset) {
+            editingSettings.setBySettingsContext(StringSetting.SHADER_PRESET, preset)
+            changed = true
+        }
+        if (changed) {
+            fragmentView.onSettingChanged()
+        }
+        fragmentView.loadSettingsList()
+    }
+
+    /** Asks before downloading libretro's shader pack (or its newest one), then opens it */
+    private fun confirmShaderPackDownload() {
+        MaterialAlertDialogBuilder(settingsActivity)
+            .setTitle(R.string.shader_pack_download)
+            .setMessage(
+                if (ShaderPack.isDownloaded) {
+                    R.string.shader_pack_update_confirm
+                } else {
+                    R.string.shader_pack_download_first
+                }
+            )
+            .setPositiveButton(R.string.shader_pack_download_button) { _, _ ->
+                downloadShaderPack { openShaderBrowser("") }
+            }
+            .setNegativeButton(android.R.string.cancel) { _, _ -> openShaderBrowser() }
+            .show()
+    }
+
+    /** Downloads libretro's shader pack (again), with its progress shown; [then] after it */
+    private fun downloadShaderPack(then: (() -> Unit)?) {
+        val activity = settingsActivity
+        val binding = DialogProgressBarBinding.inflate(activity.layoutInflater)
+        binding.progressBar.isIndeterminate = true
+        binding.progressText.setText(R.string.shader_pack_connecting)
+        val cancelled = AtomicBoolean(false)
+        val dialog = MaterialAlertDialogBuilder(activity)
+            .setTitle(R.string.shader_pack_downloading)
+            .setView(binding.root)
+            .setCancelable(false)
+            .setNegativeButton(android.R.string.cancel) { _, _ -> cancelled.set(true) }
+            .show()
+        activity.lifecycleScope.launch(Dispatchers.IO) {
+            var shown = 0L
+            val megabyte = 1024L * 1024L
+            val result = runCatching {
+                ShaderPack.download(
+                    { done, total ->
+                        val now = SystemClock.uptimeMillis()
+                        if (done < 0 || now - shown >= 100) {
+                            shown = now
+                            activity.runOnUiThread {
+                                val bar = binding.progressBar
+                                val determinate = done >= 0 && total > 0
+                                if (bar.isIndeterminate == determinate) {
+                                    // (Switched while hidden, as the indicator wants)
+                                    bar.visibility = View.INVISIBLE
+                                    bar.isIndeterminate = !determinate
+                                    bar.visibility = View.VISIBLE
+                                }
+                                if (done < 0) {
+                                    binding.progressText.setText(R.string.shader_pack_unpacking)
+                                } else if (determinate) {
+                                    bar.max = 1000
+                                    bar.progress = (done * 1000 / total).toInt()
+                                    binding.progressText.text =
+                                        "${done / megabyte} / ${total / megabyte} MB"
+                                } else {
+                                    binding.progressText.text = "${done / megabyte} MB"
+                                }
+                            }
+                        }
+                    },
+                    { cancelled.get() || !isActive }
+                )
+                // (Its list of presets, for the browser)
+                ShaderPack.presets()
+            }
+            withContext(Dispatchers.Main) {
+                dialog.dismiss()
+                result.onSuccess {
+                    fragmentView.loadSettingsList()
+                    then?.invoke()
+                }
+                result.onFailure { error ->
+                    if (error !is ShaderPack.Cancelled) {
+                        MaterialAlertDialogBuilder(activity)
+                            .setTitle(R.string.shader_pack_download_failed)
+                            .setMessage(error.message ?: error.toString())
+                            .setPositiveButton(android.R.string.ok, null)
+                            .show()
+                    }
+                }
+            }
+        }
+    }
+
     private fun resolutionName(quarters: Int): String = when (quarters) {
         0 -> settingsActivity.getString(R.string.internal_resolution_setting_auto)
 
@@ -1022,24 +1208,21 @@ class SettingsFragmentPresenter(
                     BooleanSetting.LINEAR_FILTERING.defaultValue
                 )
             )
-            // The ".glsl" files in the "shaders" folder of the Azahar folder
-            val postProcessingShaders = NativeLibrary.getPostProcessingShaders()
+            // The ".glsl" files in the "shaders" folder of the Azahar folder and, where the app
+            // was built with librashader, which runs them, RetroArch presets from libretro's
+            // pack the app downloads
             add(
-                StringSingleChoiceSetting(
-                    editingSettings,
-                    StringSetting.PP_SHADER_NAME,
+                RunnableSetting(
                     R.string.post_processing_shader,
-                    R.string.post_processing_shader_description,
-                    arrayOf(settingsActivity.getString(R.string.post_processing_shader_none)) +
-                        postProcessingShaders,
-                    arrayOf(StringSetting.PP_SHADER_NAME.defaultValue) + postProcessingShaders,
-                    StringSetting.PP_SHADER_NAME.key,
-                    StringSetting.PP_SHADER_NAME.defaultValue,
-                    // (The config file may have it empty: that is none too)
-                    getValue = {
-                        editingSettings.get(StringSetting.PP_SHADER_NAME)
-                            .ifEmpty { StringSetting.PP_SHADER_NAME.defaultValue }
-                    }
+                    if (NativeLibrary.isShaderPresetSupported()) {
+                        R.string.post_processing_shader_description_presets
+                    } else {
+                        R.string.post_processing_shader_description
+                    },
+                    true,
+                    0,
+                    { openShaderBrowser() },
+                    { postProcessingShaderValue() }
                 )
             )
             add(

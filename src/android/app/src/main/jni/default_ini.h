@@ -253,6 +253,10 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # Loaded from shaders/anaglyph
 )") DECLARE_KEY(anaglyph_shader_name) BOOST_HANA_STRING(R"(
 
+# A RetroArch shader preset (.slangp) the screens are drawn with, as a path in the folder of
+# libretro's shader pack the app downloads; none where empty. Vulkan only.
+)") DECLARE_KEY(shader_preset) BOOST_HANA_STRING(R"(
+
 # Whether to enable linear filtering or not
 # This is required for some shaders to work correctly
 # 0: Nearest, 1 (default): Linear

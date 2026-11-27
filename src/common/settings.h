@@ -681,6 +681,9 @@ struct Values {
     SwitchableSetting<std::string> pp_shader_name{"None (builtin)", Keys::pp_shader_name};
     SwitchableSetting<std::string> anaglyph_shader_name{"Dubois (builtin)",
                                                         Keys::anaglyph_shader_name};
+    /// A RetroArch shader preset (.slangp) the screens are drawn with, as a path in the folder
+    /// of libretro's shader pack (VideoCore::GetShaderPresetFolder); none where empty. Vulkan only.
+    SwitchableSetting<std::string> shader_preset{"", Keys::shader_preset};
 
     SwitchableSetting<bool> dump_textures{false, Keys::dump_textures};
     SwitchableSetting<bool> custom_textures{false, Keys::custom_textures};
